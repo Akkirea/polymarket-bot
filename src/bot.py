@@ -24,7 +24,7 @@ from . import db
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GAMMA_API    = "https://gamma-api.polymarket.com"
-COINGECKO    = "https://api.coingecko.com/api/v3"
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
 
 INITIAL_BALANCE  = 10_000.0
 BET_SIZE         = 500.0
@@ -160,7 +160,7 @@ class PaperBot:
             entry_price = _side_price(market, direction)
             print(
                 f"[bot] SIGNAL ENTRY: {direction} on {slug} — "
-                f"momentum={signals['momentum']} funding={signals['funding']:.4f} "
+                f"momentum={signals['momentum']} funding={signals['funding']} "
                 f"price={entry_price:.3f}"
             )
             await self._open_position(slug, direction, entry_price, end_ts)
@@ -192,72 +192,44 @@ class PaperBot:
         Returns (direction, signals_dict).
         direction is 'Up', 'Down', or None if signals don't agree.
         """
-        momentum = await self._signal_momentum()
-        funding  = await self._signal_funding()
+        market_signal = self._signal_market(market)
+        funding       = await self._signal_funding()
 
-        signals = {"momentum": momentum, "funding": funding}
+        signals = {"momentum": market_signal, "funding": funding}
 
         # Both must agree and neither can be None/neutral
-        if momentum is None or funding == "neutral":
+        if market_signal is None or funding == "neutral":
             return None, signals
-        if momentum != funding:
-            return None, signals
-
-        direction = momentum
-
-        # Price range filter: our target side must be priced 0.40-0.70
-        price = _side_price(market, direction)
-        signals["price"] = price
-        if not (0.40 <= price <= 0.70):
-            print(f"[bot] SKIP: {direction} price {price:.3f} outside 0.40-0.70 range")
+        if market_signal != funding:
             return None, signals
 
-        return direction, signals
+        return market_signal, signals
 
-    async def _signal_momentum(self) -> Optional[str]:
+    def _signal_market(self, market: dict) -> Optional[str]:
         """
-        Fetch BTC 1-day minute chart from CoinGecko.
-        Take the last 3 candles (4 price points → 3 moves).
-        2 of 3 moves up → 'Up', 2 of 3 down → 'Down', else None.
+        Polymarket-native direction signal from outcomePrices.
+        Up price >= 0.55 → 'Up', Down price >= 0.55 → 'Down', else None.
         """
-        session = await self._get_session()
-        try:
-            async with session.get(
-                f"{COINGECKO}/coins/bitcoin/market_chart",
-                params={"vs_currency": "usd", "days": 1, "interval": "minute"},
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-        except Exception as exc:
-            print(f"[bot] Momentum fetch error: {exc}")
-            return None
+        up_price   = _side_price(market, "Up")
+        down_price = _side_price(market, "Down")
 
-        prices = [p[1] for p in data.get("prices", [])]
-        if len(prices) < 4:
-            return None
-
-        last4 = prices[-4:]
-        moves = ["Up" if last4[i + 1] > last4[i] else "Down" for i in range(3)]
-
-        ups   = moves.count("Up")
-        downs = moves.count("Down")
-
-        if ups >= 2:
+        if up_price >= 0.55:
             return "Up"
-        if downs >= 2:
+        if down_price >= 0.55:
             return "Down"
         return None
 
     async def _signal_funding(self) -> str:
         """
-        Fetch BTC funding rate from CoinGecko derivatives.
+        Fetch BTC funding rate from Binance futures premiumIndex.
         Rate > 0.02% → 'Up' (bullish), < -0.02% → 'Down' (bearish), else 'neutral'.
-        Returns the rate direction string, not a float.
         """
         session = await self._get_session()
         try:
-            async with session.get(f"{COINGECKO}/derivatives") as resp:
+            async with session.get(
+                f"{BINANCE_FAPI}/premiumIndex",
+                params={"symbol": "BTCUSDT"},
+            ) as resp:
                 if resp.status != 200:
                     return "neutral"
                 data = await resp.json()
@@ -265,13 +237,13 @@ class PaperBot:
             print(f"[bot] Funding fetch error: {exc}")
             return "neutral"
 
-        btc = [d for d in data if d.get("base") == "BTC" and d.get("funding_rate") is not None]
-        if not btc:
+        # With symbol= param Binance returns a single object, not a list
+        if isinstance(data, list):
+            data = next((d for d in data if d.get("symbol") == "BTCUSDT"), None)
+        if not data:
             return "neutral"
 
-        # Use the contract with the largest open interest as the representative rate
-        btc.sort(key=lambda d: float(d.get("open_interest_usd") or 0), reverse=True)
-        rate = float(btc[0]["funding_rate"]) * 100  # convert to %
+        rate = float(data.get("lastFundingRate", 0)) * 100  # convert to %
 
         if rate > FUNDING_THRESHOLD:
             return "Up"

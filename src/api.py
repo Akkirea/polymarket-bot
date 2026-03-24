@@ -170,17 +170,19 @@ async def get_funding_rates():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://api.coingecko.com/api/v3/derivatives")
+            r = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
             r.raise_for_status()
             data = r.json()
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected Binance response: {data}")
         filtered = [
             {
-                "symbol": d["base"],
-                "fundingRate": float(d.get("funding_rate", 0)) * 100,
-                "markPrice": float(d.get("last", 0))
+                "symbol": d["symbol"].replace("USDT", ""),
+                "fundingRate": float(d["lastFundingRate"]) * 100,
+                "markPrice": float(d["markPrice"])
             }
             for d in data
-            if d.get("funding_rate") is not None
+            if d["symbol"].endswith("USDT") and "_" not in d["symbol"]
         ]
         filtered.sort(key=lambda x: abs(x["fundingRate"]), reverse=True)
         return filtered[:15]
