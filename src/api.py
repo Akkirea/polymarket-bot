@@ -7,13 +7,38 @@ Run with:
     uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .bot import bot
 from . import db
+from .whale_tracker import WhaleTracker
 
-app = FastAPI(title="SIGNAL/ZERO API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[startup] lifespan begin")
+    db.init_db()
+    print("[startup] db.init_db() done")
+
+    tracker = WhaleTracker()
+    try:
+        print("[startup] running whale_tracker.run_once() ...")
+        results = await tracker.run_once(db_module=db)
+        print(f"[startup] whale_tracker finished — {len(results)} wallets saved")
+    except Exception as exc:
+        print(f"[startup] whale_tracker ERROR: {exc}")
+    finally:
+        await tracker.close()
+
+    print("[startup] lifespan ready")
+    yield
+    print("[shutdown] lifespan end")
+
+
+app = FastAPI(title="SIGNAL/ZERO API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +68,22 @@ def get_whales():
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+@app.get("/api/run-whales")
+async def run_whales():
+    """Manually trigger whale_tracker.run_once() and return results."""
+    print("[run-whales] manual trigger")
+    tracker = WhaleTracker()
+    try:
+        results = await tracker.run_once(db_module=db)
+        print(f"[run-whales] done — {len(results)} wallets saved")
+        return {"ok": True, "wallets_saved": len(results), "wallets": results}
+    except Exception as exc:
+        print(f"[run-whales] ERROR: {exc}")
+        return {"ok": False, "error": str(exc), "wallets_saved": 0}
+    finally:
+        await tracker.close()
 
 
 # ── Bot endpoints ──────────────────────────────────────────────────────────────
