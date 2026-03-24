@@ -45,6 +45,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://localhost:5174",
+        "https://signal-zero-dashboard.vercel.app",
     ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
