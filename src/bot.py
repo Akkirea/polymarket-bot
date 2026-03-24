@@ -178,21 +178,44 @@ class PaperBot:
     # ── Active markets ─────────────────────────────────────────────────────────
 
     async def _fetch_active_markets(self) -> list:
-        session = await self._get_session()
-        try:
-            async with session.get(
-                f"{GAMMA_API}/markets",
-                params={"slug": "btc-updown-5m", "active": "true", "limit": 20},
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-        except Exception as exc:
-            print(f"[bot] Failed to fetch markets: {exc}")
-            return []
+        """
+        Gamma API only supports exact slug lookups — a prefix query returns nothing.
+        BTC 5m market slugs are 'btc-updown-5m-{ts}' where ts is always a
+        multiple of 300, so we compute the current and next windows ourselves
+        and fetch each by exact slug.
+        """
+        now = int(time.time())
+        # Current window closes at the next 5-min boundary; fetch that plus the
+        # following window so we never miss a market that opens while we're polling
+        candidates = [
+            (now // 300 + 1) * 300,
+            (now // 300 + 2) * 300,
+        ]
+        slugs = [f"btc-updown-5m-{ts}" for ts in candidates]
+        print(f"[bot] fetching slugs: {slugs}")
 
-        # Guard: keep only BTC 5m slugs in case the API returns unrelated markets
-        return [m for m in data if "btc-updown-5m" in (m.get("slug") or "")]
+        session = await self._get_session()
+        markets = []
+        for slug in slugs:
+            try:
+                async with session.get(
+                    f"{GAMMA_API}/markets", params={"slug": slug}
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[bot] gamma returned {resp.status} for {slug}")
+                        continue
+                    data = await resp.json()
+                    if data and not data[0].get("closed", True):
+                        markets.append(data[0])
+                        print(f"[bot] found open market: {slug}  closed={data[0].get('closed')}")
+                    elif data:
+                        print(f"[bot] market {slug} is closed — skipping")
+                    else:
+                        print(f"[bot] no gamma result for {slug}")
+            except Exception as exc:
+                print(f"[bot] failed to fetch {slug}: {exc}")
+
+        return markets
 
     # ── Signals ────────────────────────────────────────────────────────────────
 
