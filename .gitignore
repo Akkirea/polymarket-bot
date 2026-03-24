@@ -1,0 +1,20 @@
+# Database
+signal_zero.db
+*.db
+
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment variables
+.env
+.env.*
+
+# OS
+.DS_Store
