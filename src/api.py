@@ -164,3 +164,25 @@ async def stop_bot():
         return {"ok": True, "message": "Already stopped"}
     await bot.stop()
     return {"ok": True, "message": "Bot stopped"}
+
+@app.get("/api/funding-rates")
+async def get_funding_rates():
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+            r.raise_for_status()
+            data = r.json()
+        filtered = [
+            {
+                "symbol": d["symbol"].replace("USDT", ""),
+                "fundingRate": float(d["lastFundingRate"]) * 100,
+                "markPrice": float(d["markPrice"])
+            }
+            for d in data
+            if d["symbol"].endswith("USDT") and "_" not in d["symbol"]
+        ]
+        filtered.sort(key=lambda x: abs(x["fundingRate"]), reverse=True)
+        return filtered[:15]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
