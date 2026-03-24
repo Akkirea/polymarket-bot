@@ -25,7 +25,7 @@ DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
 FETCH_LIMIT  = 500
-FETCH_PAGES  = 3    # pages of FETCH_LIMIT trades to fetch
+FETCH_PAGES  = 10   # pages of FETCH_LIMIT trades to fetch
 TOP_WALLETS  = 20
 
 
