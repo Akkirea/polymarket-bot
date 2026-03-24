@@ -24,8 +24,9 @@ import aiohttp
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-FETCH_LIMIT = 500
-TOP_WALLETS = 20
+FETCH_LIMIT  = 500
+FETCH_PAGES  = 3    # pages of FETCH_LIMIT trades to fetch
+TOP_WALLETS  = 20
 
 
 class WhaleTracker:
@@ -45,28 +46,41 @@ class WhaleTracker:
 
     # ── Data fetching ────────────────────────────────────────────────────────
 
-    async def fetch_btc5m_trades(self, limit: int = FETCH_LIMIT) -> list:
-        """
-        Pull recent trades from the public data API and filter to
-        BTC 5-minute up/down markets (slug prefix btc-updown-5m-).
-        """
+    async def _fetch_page(self, limit: int, offset: int) -> list:
+        """Fetch one page of trades from the data API."""
         session = await self._get_session()
         try:
             async with session.get(
-                f"{DATA_API}/trades", params={"limit": limit}
+                f"{DATA_API}/trades",
+                params={"limit": limit, "offset": offset},
             ) as resp:
                 if resp.status != 200:
-                    print(f"[whale] data-api returned {resp.status}")
+                    print(f"[whale] data-api returned {resp.status} (offset={offset})")
                     return []
-                all_trades = await resp.json()
+                return await resp.json()
         except Exception as exc:
-            print(f"[whale] fetch error: {exc}")
+            print(f"[whale] fetch error (offset={offset}): {exc}")
             return []
 
-        return [
-            t for t in all_trades
-            if "btc-updown-5m" in (t.get("slug") or "")
-        ]
+    async def fetch_btc5m_trades(self, limit: int = FETCH_LIMIT, pages: int = FETCH_PAGES) -> list:
+        """
+        Pull trades from the public data API across `pages` pages and filter
+        to BTC 5-minute up/down markets (slug contains btc-updown-5m).
+        """
+        all_trades: list = []
+        for page in range(pages):
+            offset = page * limit
+            print(f"[whale] Fetching page {page + 1}/{pages} (offset={offset}, limit={limit}) ...")
+            page_trades = await self._fetch_page(limit, offset)
+            print(f"[whale]   → {len(page_trades)} raw trades")
+            all_trades.extend(page_trades)
+            if len(page_trades) < limit:
+                print(f"[whale]   → fewer than limit returned, stopping pagination")
+                break
+
+        btc5m = [t for t in all_trades if "btc-updown-5m" in (t.get("slug") or "")]
+        print(f"[whale] Total: {len(all_trades)} raw trades → {len(btc5m)} BTC 5m trades")
+        return btc5m
 
     async def resolve_market_by_slug(self, slug: str) -> Optional[str]:
         """
@@ -126,12 +140,18 @@ class WhaleTracker:
         # We key on slug (not conditionId) because conditionId is non-unique
         # in the Gamma API — multiple markets can share the same conditionId.
         unique_slugs = {t["slug"] for t in trades if t.get("slug")}
+        print(f"[whale] Resolving {len(unique_slugs)} unique slugs ...")
         resolutions: dict[str, Optional[str]] = {}
         for slug in unique_slugs:
             resolutions[slug] = await self.resolve_market_by_slug(slug)
 
-        resolved_slugs = {s for s, w in resolutions.items() if w is not None}
-        if not resolved_slugs:
+        resolved_slugs   = {s for s, w in resolutions.items() if w is not None}
+        unresolved_slugs = {s for s, w in resolutions.items() if w is None}
+        print(f"[whale] Slugs resolved: {len(resolved_slugs)}  unresolved/live: {len(unresolved_slugs)}")
+        if resolved_slugs:
+            for s in sorted(resolved_slugs):
+                print(f"[whale]   ✓ {s} → {resolutions[s]}")
+        else:
             print("[whale] No resolved BTC 5-min markets found in this batch.")
 
         # Group trades by wallet
@@ -195,13 +215,13 @@ class WhaleTracker:
         Returns the top-N wallet stat dicts (without _raw_trades).
         """
         trades = await self.fetch_btc5m_trades()
-        print(f"[whale] Fetched {len(trades)} BTC 5-min trades")
 
         if not trades:
+            print("[whale] No BTC 5m trades found — aborting")
             return []
 
         wallet_stats = await self.compute_wallet_stats(trades)
-        print(f"[whale] {len(wallet_stats)} wallets with resolved trades")
+        print(f"[whale] {len(wallet_stats)} wallets with at least one resolved trade")
 
         top = wallet_stats[:TOP_WALLETS]
 
