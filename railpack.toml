@@ -1,0 +1,2 @@
+[phases.setup]
+nix_packages = ["python311"]
