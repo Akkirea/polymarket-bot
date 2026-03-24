@@ -7,15 +7,11 @@ Run with:
     uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
 """
 
-import sqlite3
-from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .bot import bot
-
-DB_PATH = Path(__file__).parent.parent / "signal_zero.db"
+from . import db
 
 app = FastAPI(title="SIGNAL/ZERO API")
 
@@ -30,19 +26,12 @@ app.add_middleware(
 )
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
 # ── Whale endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/api/whales")
 def get_whales():
     """Return top 5 whale wallets ranked by win rate."""
-    conn = get_connection()
+    conn = db.get_connection()
     try:
         rows = conn.execute(
             """SELECT address, win_rate, total_trades, pnl
@@ -73,7 +62,7 @@ def get_bot_trades():
 @app.get("/api/bot/stats")
 def get_bot_stats():
     """Aggregate performance stats across all resolved bot_trades."""
-    conn = get_connection()
+    conn = db.get_connection()
     try:
         rows = conn.execute(
             "SELECT pnl, outcome, side, opened_at FROM bot_trades WHERE pnl IS NOT NULL ORDER BY opened_at"

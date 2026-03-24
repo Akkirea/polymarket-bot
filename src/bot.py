@@ -14,50 +14,21 @@ Usage (started automatically by api.py endpoints):
 """
 
 import asyncio
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
+from . import db
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 DATA_API        = "https://data-api.polymarket.com"
 GAMMA_API       = "https://gamma-api.polymarket.com"
-DB_PATH         = Path(__file__).parent.parent / "signal_zero.db"
 
 INITIAL_BALANCE = 10_000.0
 BET_SIZE        = 500.0
 POLL_INTERVAL   = 60    # seconds between whale checks
 RESOLVE_AFTER   = 300   # wait 5 min before first resolution attempt
-
-
-# ── DB helper ──────────────────────────────────────────────────────────────────
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-def _ensure_table():
-    conn = _db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS bot_trades (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            whale_address TEXT    NOT NULL,
-            market_slug   TEXT    NOT NULL,
-            side          TEXT    NOT NULL,
-            size          REAL    NOT NULL,
-            entry_price   REAL,
-            outcome       TEXT,
-            pnl           REAL,
-            opened_at     TEXT    NOT NULL,
-            closed_at     TEXT
-        );
-    """)
-    conn.commit()
-    conn.close()
 
 
 # ── PaperBot ───────────────────────────────────────────────────────────────────
@@ -81,7 +52,7 @@ class PaperBot:
         # tx hashes we've already processed so we don't re-mirror old trades
         self._seen_tx:    set            = set()
         self._seeded:     bool           = False   # first-poll seed done?
-        _ensure_table()
+        db.init_db()
 
     # ── Session ────────────────────────────────────────────────────────────────
 
@@ -131,9 +102,9 @@ class PaperBot:
         }
 
     def get_recent_trades(self, n: int = 5) -> list:
-        conn = _db()
+        conn = db.get_connection()
         rows = conn.execute(
-            "SELECT * FROM bot_trades ORDER BY opened_at DESC LIMIT ?", (n,)
+            "SELECT * FROM bot_trades ORDER BY opened_at DESC LIMIT %s", (n,)
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -172,7 +143,7 @@ class PaperBot:
     # ── Whale DB lookup ────────────────────────────────────────────────────────
 
     def _get_top_whale(self) -> Optional[dict]:
-        conn = _db()
+        conn = db.get_connection()
         row = conn.execute(
             """SELECT address, win_rate, total_trades, resolved_trades
                  FROM whale_wallets
@@ -348,12 +319,12 @@ class PaperBot:
             f"  pnl=${pnl:+.2f}  balance=${self.balance:.2f}"
         )
 
-        conn = _db()
+        conn = db.get_connection()
         conn.execute(
             """INSERT INTO bot_trades
                (whale_address, market_slug, side, size, entry_price,
                 outcome, pnl, opened_at, closed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 pos["whale_address"],
                 pos["market_slug"],
