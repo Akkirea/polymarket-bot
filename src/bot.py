@@ -136,6 +136,11 @@ class PaperBot:
         markets = await self._fetch_active_markets()
         now = time.time()
 
+        if not markets:
+            print("[bot] no active markets found")
+
+        print(f"[bot] found {len(markets)} active BTC 5m markets")
+
         for market in markets:
             slug = market.get("slug", "")
             if not slug or slug in self._entered_slugs:
@@ -146,6 +151,8 @@ class PaperBot:
                 continue
 
             seconds_remaining = end_ts - now
+            print(f"[bot] market {slug} — {seconds_remaining:.1f}s remaining")
+
             if not (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI):
                 continue
 
