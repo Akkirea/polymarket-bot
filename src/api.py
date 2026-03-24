@@ -170,24 +170,24 @@ async def get_funding_rates():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://api.binance.com/api/v3/ticker/24hr")
+            r = await client.get(
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": "linear"},
+            )
             r.raise_for_status()
             data = r.json()
-        if not isinstance(data, list):
-            raise ValueError(f"Unexpected Binance response: {data}")
+        tickers = data.get("result", {}).get("list", [])
         filtered = [
             {
                 "symbol": d["symbol"].replace("USDT", ""),
-                "fundingRate": 0,
+                "fundingRate": float(d["fundingRate"]) * 100,
                 "markPrice": float(d["lastPrice"]),
-                "_vol": float(d["quoteVolume"]),
             }
-            for d in data
+            for d in tickers
             if d["symbol"].endswith("USDT") and "_" not in d["symbol"]
+            and d.get("fundingRate")
         ]
-        filtered.sort(key=lambda x: x["_vol"], reverse=True)
-        for row in filtered:
-            del row["_vol"]
+        filtered.sort(key=lambda x: abs(x["fundingRate"]), reverse=True)
         return filtered[:15]
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
