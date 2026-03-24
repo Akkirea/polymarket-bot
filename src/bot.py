@@ -71,9 +71,9 @@ class PaperBot:
         if self.running:
             return
         self.running = True
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._task = loop.create_task(self._loop())
-        print("[bot] Started")
+        print("[bot] Started — task created")
 
     async def stop(self):
         """Cancel the background loop and close the HTTP session."""
@@ -113,6 +113,7 @@ class PaperBot:
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     async def _loop(self):
+        print("[bot] loop starting")
         while self.running:
             try:
                 await self._tick()
@@ -123,6 +124,7 @@ class PaperBot:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _tick(self):
+        print("[bot] _tick called")
         # If holding a position, try to resolve once the market window has closed
         if self.position:
             end_ts = self.position.get("end_ts", 0)

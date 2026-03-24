@@ -170,7 +170,7 @@ async def get_funding_rates():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+            r = await client.get("https://api.binance.com/api/v3/ticker/24hr")
             r.raise_for_status()
             data = r.json()
         if not isinstance(data, list):
@@ -178,13 +178,16 @@ async def get_funding_rates():
         filtered = [
             {
                 "symbol": d["symbol"].replace("USDT", ""),
-                "fundingRate": float(d["lastFundingRate"]) * 100,
-                "markPrice": float(d["markPrice"])
+                "fundingRate": 0,
+                "markPrice": float(d["lastPrice"]),
+                "_vol": float(d["quoteVolume"]),
             }
             for d in data
             if d["symbol"].endswith("USDT") and "_" not in d["symbol"]
         ]
-        filtered.sort(key=lambda x: abs(x["fundingRate"]), reverse=True)
+        filtered.sort(key=lambda x: x["_vol"], reverse=True)
+        for row in filtered:
+            del row["_vol"]
         return filtered[:15]
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
