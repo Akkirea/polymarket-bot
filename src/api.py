@@ -9,7 +9,7 @@ Run with:
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .bot import bot
@@ -62,7 +62,7 @@ def get_whales():
         rows = conn.execute(
             """SELECT address, win_rate, total_trades, pnl
                  FROM whale_wallets
-                WHERE resolved_trades >= 2
+                WHERE resolved_trades >= 20
                 ORDER BY win_rate DESC, total_trades DESC
                 LIMIT 5"""
         ).fetchall()
@@ -170,17 +170,17 @@ async def get_funding_rates():
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+            r = await client.get("https://api.coingecko.com/api/v3/derivatives")
             r.raise_for_status()
             data = r.json()
         filtered = [
             {
-                "symbol": d["symbol"].replace("USDT", ""),
-                "fundingRate": float(d["lastFundingRate"]) * 100,
-                "markPrice": float(d["markPrice"])
+                "symbol": d["base"],
+                "fundingRate": float(d.get("funding_rate", 0)) * 100,
+                "markPrice": float(d.get("last", 0))
             }
             for d in data
-            if d["symbol"].endswith("USDT") and "_" not in d["symbol"]
+            if d.get("funding_rate") is not None
         ]
         filtered.sort(key=lambda x: abs(x["fundingRate"]), reverse=True)
         return filtered[:15]
