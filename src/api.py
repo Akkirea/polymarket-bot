@@ -62,7 +62,7 @@ def get_whales():
         rows = conn.execute(
             """SELECT address, win_rate, total_trades, pnl
                  FROM whale_wallets
-                WHERE resolved_trades >= 20
+                WHERE resolved_trades >= 10
                 ORDER BY win_rate DESC, total_trades DESC
                 LIMIT 5"""
         ).fetchall()
