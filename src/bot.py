@@ -1,11 +1,11 @@
 """
-SIGNAL/ZERO — Whale-copy paper trading bot.
+SIGNAL/ZERO — Timing-based signal bot.
 
-Watches the #1 ranked whale wallet (highest win rate in whale_wallets),
-mirrors their BTC 5-minute Up/Down trades with $500 paper positions,
-and resolves each position after the market closes (≥5 min).
+Monitors active BTC 5-minute markets and enters a $500 paper position
+in the last 5-12 seconds before close when momentum, funding rate,
+and market price range all agree on direction.
 
-All paper only — no real money, no API keys.
+All paper only — no real money.
 
 Usage (started automatically by api.py endpoints):
     POST http://localhost:8000/api/bot/start
@@ -14,6 +14,7 @@ Usage (started automatically by api.py endpoints):
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,36 +23,36 @@ import aiohttp
 from . import db
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-DATA_API        = "https://data-api.polymarket.com"
-GAMMA_API       = "https://gamma-api.polymarket.com"
+GAMMA_API    = "https://gamma-api.polymarket.com"
+COINGECKO    = "https://api.coingecko.com/api/v3"
 
-INITIAL_BALANCE = 10_000.0
-BET_SIZE        = 500.0
-POLL_INTERVAL   = 60    # seconds between whale checks
-RESOLVE_AFTER   = 300   # wait 5 min before first resolution attempt
+INITIAL_BALANCE  = 10_000.0
+BET_SIZE         = 500.0
+POLL_INTERVAL    = 3     # seconds between ticks
+ENTRY_WINDOW_LO  = 5     # enter when seconds_remaining >= this
+ENTRY_WINDOW_HI  = 12    # enter when seconds_remaining <= this
+FUNDING_THRESHOLD = 0.02  # % — above = bullish, below negative = bearish
+
+STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
 
 # ── PaperBot ───────────────────────────────────────────────────────────────────
 class PaperBot:
     """
-    Mirrors the top whale wallet's BTC 5-min trades with paper money.
-
-    One open position at a time. Resolves via the Gamma API once the
-    5-minute market window has closed and outcomePrices shows a winner.
+    Enters BTC 5-min markets in the last 5-12 s before close when
+    momentum + funding rate agree and market price is in the 0.40-0.70 range.
     """
 
     def __init__(self):
         self.balance:     float          = INITIAL_BALANCE
-        self.position:    Optional[dict] = None   # single open position
+        self.position:    Optional[dict] = None
         self.wins:        int            = 0
         self.losses:      int            = 0
         self.total_pnl:   float          = 0.0
         self.running:     bool           = False
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
-        # tx hashes we've already processed so we don't re-mirror old trades
-        self._seen_tx:    set            = set()
-        self._seeded:     bool           = False   # first-poll seed done?
+        self._entered_slugs: set = set()  # avoid re-entering the same market
         db.init_db()
 
     # ── Session ────────────────────────────────────────────────────────────────
@@ -59,7 +60,7 @@ class PaperBot:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=10)
             )
         return self._session
 
@@ -109,7 +110,7 @@ class PaperBot:
         conn.close()
         return [dict(r) for r in rows]
 
-    # ── Loop ───────────────────────────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────────────────────
 
     async def _loop(self):
         while self.running:
@@ -122,129 +123,177 @@ class PaperBot:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _tick(self):
-        # ── Step 1: try to resolve open position once old enough ────────────
+        # If holding a position, try to resolve once the market window has closed
         if self.position:
-            opened = datetime.fromisoformat(self.position["opened_at"])
-            age = (datetime.now(timezone.utc) - opened).total_seconds()
-            if age >= RESOLVE_AFTER:
+            end_ts = self.position.get("end_ts", 0)
+            if time.time() >= end_ts:
                 await self._try_resolve()
+            return  # one position at a time
 
-        # ── Step 2: if still no open position, look for a trade to mirror ───
-        if not self.position:
-            whale = self._get_top_whale()
-            if not whale:
-                print("[bot] No ranked whale wallets yet — run the whale tracker first")
-                return
-            addr = whale["address"]
-            print(f"[bot] Checking whale {addr[:8]}…{addr[-4:]} "
-                  f"(win rate {whale['win_rate']:.0%})")
-            await self._check_for_new_trade(addr)
+        # Scan active BTC 5m markets for an entry window
+        markets = await self._fetch_active_markets()
+        now = time.time()
 
-    # ── Whale DB lookup ────────────────────────────────────────────────────────
+        for market in markets:
+            slug = market.get("slug", "")
+            if not slug or slug in self._entered_slugs:
+                continue
 
-    def _get_top_whale(self) -> Optional[dict]:
-        conn = db.get_connection()
-        row = conn.execute(
-            """SELECT address, win_rate, total_trades, resolved_trades
-                 FROM whale_wallets
-                WHERE resolved_trades >= 2
-                ORDER BY win_rate DESC, resolved_trades DESC
-                LIMIT 1"""
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else None
+            end_ts = _extract_end_ts(slug)
+            if end_ts is None:
+                continue
 
-    # ── Trade fetching & mirroring ─────────────────────────────────────────────
+            seconds_remaining = end_ts - now
+            if not (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI):
+                continue
 
-    async def _check_for_new_trade(self, address: str):
+            print(f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining — evaluating signals")
+            direction, signals = await self._evaluate_signals(market)
+
+            # Mark slug as seen regardless of outcome so we don't re-evaluate
+            self._entered_slugs.add(slug)
+
+            if direction is None:
+                print(f"[bot] SKIP: signals disagree — {signals}")
+                continue
+
+            entry_price = _side_price(market, direction)
+            print(
+                f"[bot] SIGNAL ENTRY: {direction} on {slug} — "
+                f"momentum={signals['momentum']} funding={signals['funding']:.4f} "
+                f"price={entry_price:.3f}"
+            )
+            await self._open_position(slug, direction, entry_price, end_ts)
+            break  # one position at a time
+
+    # ── Active markets ─────────────────────────────────────────────────────────
+
+    async def _fetch_active_markets(self) -> list:
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{GAMMA_API}/markets",
+                params={"slug": "btc-updown-5m", "active": "true", "limit": 20},
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+        except Exception as exc:
+            print(f"[bot] Failed to fetch markets: {exc}")
+            return []
+
+        # Guard: keep only BTC 5m slugs in case the API returns unrelated markets
+        return [m for m in data if "btc-updown-5m" in (m.get("slug") or "")]
+
+    # ── Signals ────────────────────────────────────────────────────────────────
+
+    async def _evaluate_signals(self, market: dict) -> tuple[Optional[str], dict]:
         """
-        Fetch the whale's 10 most recent trades.
-        On the very first call (self._seeded is False) we just record all
-        tx hashes without acting — this prevents mirroring stale trades
-        that predate the bot starting.
+        Returns (direction, signals_dict).
+        direction is 'Up', 'Down', or None if signals don't agree.
+        """
+        momentum = await self._signal_momentum()
+        funding  = await self._signal_funding()
+
+        signals = {"momentum": momentum, "funding": funding}
+
+        # Both must agree and neither can be None/neutral
+        if momentum is None or funding == "neutral":
+            return None, signals
+        if momentum != funding:
+            return None, signals
+
+        direction = momentum
+
+        # Price range filter: our target side must be priced 0.40-0.70
+        price = _side_price(market, direction)
+        signals["price"] = price
+        if not (0.40 <= price <= 0.70):
+            print(f"[bot] SKIP: {direction} price {price:.3f} outside 0.40-0.70 range")
+            return None, signals
+
+        return direction, signals
+
+    async def _signal_momentum(self) -> Optional[str]:
+        """
+        Fetch BTC 1-day minute chart from CoinGecko.
+        Take the last 3 candles (4 price points → 3 moves).
+        2 of 3 moves up → 'Up', 2 of 3 down → 'Down', else None.
         """
         session = await self._get_session()
         try:
             async with session.get(
-                f"{DATA_API}/trades",
-                params={"user": address, "limit": 10},
+                f"{COINGECKO}/coins/bitcoin/market_chart",
+                params={"vs_currency": "usd", "days": 1, "interval": "minute"},
             ) as resp:
                 if resp.status != 200:
-                    print(f"[bot] data-api returned HTTP {resp.status}")
-                    return
-                trades = await resp.json()
+                    return None
+                data = await resp.json()
         except Exception as exc:
-            print(f"[bot] Failed to fetch trades for {address[:10]}: {exc}")
-            return
+            print(f"[bot] Momentum fetch error: {exc}")
+            return None
 
-        print(f"[bot] Fetched {len(trades)} trades from data-api")
-        if trades:
-            t0 = trades[0]
-            print(f"[bot] Most recent trade: slug={t0.get('slug', '?')}  "
-                  f"ts={t0.get('timestamp', '?')}  side={t0.get('side', '?')}  "
-                  f"outcome={t0.get('outcome', '?')}")
+        prices = [p[1] for p in data.get("prices", [])]
+        if len(prices) < 4:
+            return None
 
-        if not self._seeded:
-            # First call: seed seen set without acting
-            for t in trades:
-                tx = t.get("transactionHash") or str(t.get("id", ""))
-                if tx:
-                    self._seen_tx.add(tx)
-            self._seeded = True
-            print(f"[bot] Seeded {len(self._seen_tx)} existing tx hashes — watching for new trades")
-            return
+        last4 = prices[-4:]
+        moves = ["Up" if last4[i + 1] > last4[i] else "Down" for i in range(3)]
 
-        # Subsequent calls: look for a new BTC 5-min BUY we haven't seen
-        new_count = 0
-        for trade in trades:
-            tx = trade.get("transactionHash") or str(trade.get("id", ""))
-            slug    = trade.get("slug", "")
-            side    = trade.get("side", "")
-            outcome = trade.get("outcome", "")
-            price   = float(trade.get("price") or 0.5)
+        ups   = moves.count("Up")
+        downs = moves.count("Down")
 
-            if not tx or tx in self._seen_tx:
-                print(f"[bot] SKIP (already seen): {slug}  side={side}  tx={tx[:12] if tx else '?'}")
-                continue
+        if ups >= 2:
+            return "Up"
+        if downs >= 2:
+            return "Down"
+        return None
 
-            new_count += 1
-            self._seen_tx.add(tx)
-            print(f"[bot] NEW tx: {tx[:16]}  slug={slug}  side={side}  outcome={outcome}  price={price:.4f}")
+    async def _signal_funding(self) -> str:
+        """
+        Fetch BTC funding rate from CoinGecko derivatives.
+        Rate > 0.02% → 'Up' (bullish), < -0.02% → 'Down' (bearish), else 'neutral'.
+        Returns the rate direction string, not a float.
+        """
+        session = await self._get_session()
+        try:
+            async with session.get(f"{COINGECKO}/derivatives") as resp:
+                if resp.status != 200:
+                    return "neutral"
+                data = await resp.json()
+        except Exception as exc:
+            print(f"[bot] Funding fetch error: {exc}")
+            return "neutral"
 
-            if "btc-updown-5m" not in slug:
-                print(f"[bot] SKIP: not a BTC 5m slug ({slug})")
-                continue
-            if side != "BUY":
-                print(f"[bot] SKIP: side is {side!r}, not BUY")
-                continue
-            if outcome not in ("Up", "Down"):
-                print(f"[bot] SKIP: outcome {outcome!r} not Up/Down")
-                continue
+        btc = [d for d in data if d.get("base") == "BTC" and d.get("funding_rate") is not None]
+        if not btc:
+            return "neutral"
 
-            print(f"[bot] ✓ Mirroring whale trade — {outcome} on {slug} @ {price:.4f}")
-            await self._open_position(address, slug, outcome, price)
-            break  # one position at a time
+        # Use the contract with the largest open interest as the representative rate
+        btc.sort(key=lambda d: float(d.get("open_interest_usd") or 0), reverse=True)
+        rate = float(btc[0]["funding_rate"]) * 100  # convert to %
 
-        if new_count == 0:
-            print(f"[bot] No new trades (all {len(trades)} already seen)")
+        if rate > FUNDING_THRESHOLD:
+            return "Up"
+        if rate < -FUNDING_THRESHOLD:
+            return "Down"
+        return "neutral"
 
     # ── Position lifecycle ─────────────────────────────────────────────────────
 
-    async def _open_position(
-        self, whale_address: str, slug: str, side: str, entry_price: float
-    ):
+    async def _open_position(self, slug: str, side: str, entry_price: float, end_ts: float):
         if self.balance < BET_SIZE:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
             return
 
         self.balance -= BET_SIZE
         self.position = {
-            "whale_address": whale_address,
-            "market_slug":   slug,
-            "side":          side,
-            "size":          BET_SIZE,
-            "entry_price":   entry_price,
-            "opened_at":     datetime.now(timezone.utc).isoformat(),
+            "market_slug": slug,
+            "side":        side,
+            "size":        BET_SIZE,
+            "entry_price": entry_price,
+            "end_ts":      end_ts,
+            "opened_at":   datetime.now(timezone.utc).isoformat(),
         }
         print(
             f"[bot] OPEN  {side:>4}  ${BET_SIZE:.0f}  {slug}"
@@ -253,16 +302,14 @@ class PaperBot:
 
     async def _try_resolve(self):
         slug = self.position["market_slug"]
-        print(f"[bot] Attempting resolution of {slug}")
         winner = await self._resolve_market(slug)
-        print(f"[bot] Resolution result: {winner!r}")
         if winner is None:
-            print(f"[bot] Not resolved yet — will retry next tick")
+            print(f"[bot] {slug} not resolved yet — will retry")
             return
         await self._close_position(winner)
 
     async def _resolve_market(self, slug: str) -> Optional[str]:
-        """Return 'Up' or 'Down' when the market settles, else None."""
+        """Return 'Up' or 'Down' when outcomePrices reaches 0.99, else None."""
         session = await self._get_session()
         try:
             async with session.get(
@@ -275,7 +322,6 @@ class PaperBot:
             return None
 
         if not markets:
-            print(f"[bot] Gamma returned 0 markets for slug={slug}")
             return None
 
         m = markets[0]
@@ -291,7 +337,7 @@ class PaperBot:
         for i, p in enumerate(prices):
             if float(p) >= 0.99:
                 return str(outcomes[i])
-        return None  # still live
+        return None
 
     async def _close_position(self, winner: str):
         pos         = self.position
@@ -302,13 +348,11 @@ class PaperBot:
             entry_price = 0.5
 
         if won:
-            # Shares * $1 payout, minus cost = size*(1/entry_price - 1)
             pnl = size * (1.0 / entry_price - 1.0)
-            self.balance += size + pnl   # return stake + profit
+            self.balance += size + pnl
             self.wins += 1
         else:
             pnl = -size
-            # balance was already deducted at open
             self.losses += 1
 
         self.total_pnl += pnl
@@ -326,7 +370,7 @@ class PaperBot:
                 outcome, pnl, opened_at, closed_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
-                pos["whale_address"],
+                STRATEGY_TAG,
                 pos["market_slug"],
                 pos["side"],
                 pos["size"],
@@ -340,6 +384,31 @@ class PaperBot:
         conn.commit()
         conn.close()
         self.position = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _extract_end_ts(slug: str) -> Optional[float]:
+    """Extract Unix end timestamp from 'btc-updown-5m-1774383000' → 1774383000.0"""
+    try:
+        return float(slug.rsplit("-", 1)[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _side_price(market: dict, side: str) -> float:
+    """
+    Return the current market price for 'Up' or 'Down'.
+    outcomePrices and outcomes come back as JSON strings from the Gamma API.
+    """
+    try:
+        outcomes_raw = market.get("outcomes",      '["Up","Down"]')
+        prices_raw   = market.get("outcomePrices", "[0.5,0.5]")
+        outcomes = eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices   = eval(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
+        return float(prices[outcomes.index(side)])
+    except Exception:
+        return 0.5
 
 
 # ── Module-level singleton used by api.py ─────────────────────────────────────
