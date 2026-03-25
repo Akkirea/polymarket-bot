@@ -186,7 +186,7 @@ class PaperBot:
                 f"source={signals['source']} momentum={signals['momentum']} "
                 f"price={entry_price:.3f}"
             )
-            await self._open_position(slug, direction, entry_price, end_ts)
+            await self._open_position(slug, direction, entry_price, end_ts, price_to_beat)
             break  # one position at a time
 
     # ── Active markets ─────────────────────────────────────────────────────────
@@ -268,16 +268,15 @@ class PaperBot:
                     }
                 print(
                     f"[bot] CHAINLINK: diff ${abs(diff):.2f} < "
-                    f"${PRICE_DIFF_THRESHOLD} threshold — falling back"
+                    f"${PRICE_DIFF_THRESHOLD} threshold — skipping, no trade"
                 )
             else:
-                print("[bot] CHAINLINK: unavailable — falling back to market signal")
+                print("[bot] CHAINLINK: unavailable — skipping, no trade")
         else:
-            print("[bot] CHAINLINK: no start price cached — falling back to market signal")
+            print("[bot] CHAINLINK: no start price cached — skipping, no trade")
 
-        # ── Fallback: outcomePrices ─────────────────────────────────────────────
-        direction = self._signal_market(market)
-        return direction, {"source": "market", "momentum": direction}
+        # No fallback — only trade on a confirmed Chainlink diff
+        return None, {"source": "none", "momentum": None}
 
     def _signal_market(self, market: dict) -> Optional[str]:
         """
@@ -295,19 +294,21 @@ class PaperBot:
 
     # ── Position lifecycle ─────────────────────────────────────────────────────
 
-    async def _open_position(self, slug: str, side: str, entry_price: float, end_ts: float):
+    async def _open_position(self, slug: str, side: str, entry_price: float, end_ts: float,
+                             price_to_beat: Optional[float] = None):
         if self.balance < BET_SIZE:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
             return
 
         self.balance -= BET_SIZE
         self.position = {
-            "market_slug": slug,
-            "side":        side,
-            "size":        BET_SIZE,
-            "entry_price": entry_price,
-            "end_ts":      end_ts,
-            "opened_at":   datetime.now(timezone.utc).isoformat(),
+            "market_slug":   slug,
+            "side":          side,
+            "size":          BET_SIZE,
+            "entry_price":   entry_price,
+            "price_to_beat": price_to_beat,
+            "end_ts":        end_ts,
+            "opened_at":     datetime.now(timezone.utc).isoformat(),
         }
         print(
             f"[bot] OPEN  {side:>4}  ${BET_SIZE:.0f}  {slug}"
@@ -320,7 +321,8 @@ class PaperBot:
         if winner is None:
             print(f"[bot] {slug} not resolved yet — will retry")
             return
-        await self._close_position(winner)
+        resolution_price = await self._get_chainlink_price()
+        await self._close_position(winner, resolution_price)
 
     async def _resolve_market(self, slug: str) -> Optional[str]:
         """Return 'Up' or 'Down' when outcomePrices reaches 0.99, else None."""
@@ -353,7 +355,7 @@ class PaperBot:
                 return str(outcomes[i])
         return None
 
-    async def _close_position(self, winner: str):
+    async def _close_position(self, winner: str, resolution_price: Optional[float] = None):
         pos         = self.position
         won         = pos["side"] == winner
         size        = pos["size"]
@@ -381,14 +383,17 @@ class PaperBot:
         conn.execute(
             """INSERT INTO bot_trades
                (whale_address, market_slug, side, size, entry_price,
+                price_to_beat, resolution_price,
                 outcome, pnl, opened_at, closed_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 STRATEGY_TAG,
                 pos["market_slug"],
                 pos["side"],
                 pos["size"],
                 round(entry_price, 4),
+                round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
+                round(resolution_price, 2) if resolution_price else None,
                 winner,
                 round(pnl, 2),
                 pos["opened_at"],

@@ -174,16 +174,18 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS bot_trades (
-            id            {_PK},
-            whale_address TEXT NOT NULL,
-            market_slug   TEXT NOT NULL,
-            side          TEXT NOT NULL,
-            size          REAL NOT NULL,
-            entry_price   REAL,
-            outcome       TEXT,
-            pnl           REAL,
-            opened_at     TEXT NOT NULL,
-            closed_at     TEXT
+            id               {_PK},
+            whale_address    TEXT NOT NULL,
+            market_slug      TEXT NOT NULL,
+            side             TEXT NOT NULL,
+            size             REAL NOT NULL,
+            entry_price      REAL,
+            price_to_beat    REAL,
+            resolution_price REAL,
+            outcome          TEXT,
+            pnl              REAL,
+            opened_at        TEXT NOT NULL,
+            closed_at        TEXT
         );
 
         CREATE TABLE IF NOT EXISTS bot_state (
@@ -196,6 +198,15 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_whale_trades_wallet   ON whale_trades(wallet_address)
     """)
     conn.commit()
+
+    # Migrate existing bot_trades tables that predate these columns
+    for col, typ in [("price_to_beat", "REAL"), ("resolution_price", "REAL")]:
+        try:
+            conn.execute(f"ALTER TABLE bot_trades ADD COLUMN {col} {typ}")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
     conn.close()
 
 
