@@ -186,6 +186,7 @@ def init_db():
             resolution_price REAL,
             outcome          TEXT,
             pnl              REAL,
+            balance_after    REAL,
             opened_at        TEXT NOT NULL,
             closed_at        TEXT
         );
@@ -213,7 +214,7 @@ def init_db():
     conn.commit()
 
     # Migrate existing bot_trades tables that predate these columns
-    for col, typ in [("price_to_beat", "REAL"), ("resolution_price", "REAL")]:
+    for col, typ in [("price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL")]:
         try:
             conn.execute(f"ALTER TABLE bot_trades ADD COLUMN {col} {typ}")
             conn.commit()

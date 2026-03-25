@@ -363,8 +363,8 @@ class PaperBot:
             """INSERT INTO bot_trades
                (whale_address, market_slug, side, size, entry_price,
                 price_to_beat, resolution_price,
-                outcome, pnl, opened_at, closed_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                outcome, pnl, balance_after, opened_at, closed_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 STRATEGY_TAG,
                 pos["market_slug"],
@@ -372,9 +372,10 @@ class PaperBot:
                 pos["size"],
                 round(pos.get("entry_price") or 0.5, 4),
                 round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
-                None,          # resolution_price unknown
-                "unresolved",  # outcome
-                0.0,           # pnl — neither win nor loss
+                None,
+                "unresolved",
+                0.0,
+                round(self.balance, 2),
                 pos["opened_at"],
                 closed_at,
             ),
@@ -515,8 +516,8 @@ class PaperBot:
             """INSERT INTO bot_trades
                (whale_address, market_slug, side, size, entry_price,
                 price_to_beat, resolution_price,
-                outcome, pnl, opened_at, closed_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                outcome, pnl, balance_after, opened_at, closed_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 STRATEGY_TAG,
                 pos["market_slug"],
@@ -527,6 +528,7 @@ class PaperBot:
                 round(resolution_price, 2) if resolution_price else None,
                 winner,
                 round(pnl, 2),
+                round(self.balance, 2),
                 pos["opened_at"],
                 closed_at,
             ),
