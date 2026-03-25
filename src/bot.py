@@ -326,65 +326,53 @@ class PaperBot:
         await self._close_position(winner, resolution_price, poly_price_to_beat)
 
     async def _resolve_market(self, slug: str) -> tuple[Optional[str], Optional[float], Optional[float]]:
-        """Return (winner, final_price, price_to_beat) when outcomePrices reaches 0.99,
-        else (None, None, None). Both prices come from events[0].eventMetadata —
-        Polymarket's authoritative Chainlink Data Stream values."""
+        """Return (winner, final_price, price_to_beat) when market.closed == True
+        and market.winner is set. Uses Polymarket's authoritative fields directly —
+        no outcomePrices inference."""
         session = await self._get_session()
         try:
             async with session.get(
                 f"{GAMMA_API}/markets", params={"slug": slug}
             ) as resp:
                 if resp.status != 200:
+                    print(f"[bot] resolve: Gamma returned {resp.status} for {slug}", flush=True)
                     return None, None, None
                 markets = await resp.json()
-        except Exception:
+        except Exception as exc:
+            print(f"[bot] resolve: fetch error for {slug}: {exc}", flush=True)
             return None, None, None
 
         if not markets:
             return None, None, None
 
         m = markets[0]
-        try:
-            outcomes_raw = m.get("outcomes",      '["Up","Down"]')
-            prices_raw   = m.get("outcomePrices", "[0.5,0.5]")
-            outcomes = eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-            prices   = eval(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
-        except Exception:
+
+        if not m.get("closed"):
+            print(f"[bot] resolve: {slug} not yet closed", flush=True)
             return None, None, None
 
-        print(f"[bot] outcomePrices for {slug}: {list(zip(outcomes, prices))}", flush=True)
-        winner = None
-        for i, p in enumerate(prices):
-            try:
-                val = float(p)
-            except (ValueError, TypeError):
-                continue
-            if i < len(prices):
-                other_vals = [float(prices[j]) for j in range(len(prices)) if j != i]
-                if val >= 0.99 and all(v <= 0.01 for v in other_vals):
-                    winner = str(outcomes[i])
-                    break
-
-        if winner is None:
+        winner = m.get("winner")
+        if not winner:
+            print(f"[bot] resolve: {slug} closed but winner field empty — waiting", flush=True)
             return None, None, None
 
-        # Extract Polymarket's authoritative open and settlement prices
-        final_price    = None
-        price_to_beat  = None
+        # Pull settlement prices from eventMetadata
+        final_price   = None
+        price_to_beat = None
         try:
             events = m.get("events", [])
             if events:
                 meta = events[0].get("eventMetadata", {})
-                if meta.get("finalPrice")   is not None:
+                if meta.get("finalPrice") is not None:
                     final_price   = float(meta["finalPrice"])
-                if meta.get("priceToBeat")  is not None:
+                if meta.get("priceToBeat") is not None:
                     price_to_beat = float(meta["priceToBeat"])
         except Exception:
             pass
 
         print(
-            f"[bot] resolved {slug} → {winner} "
-            f" priceToBeat={price_to_beat}  finalPrice={final_price}",
+            f"[bot] resolved {slug} → {winner!r} "
+            f"priceToBeat={price_to_beat}  finalPrice={final_price}",
             flush=True,
         )
         return winner, final_price, price_to_beat
