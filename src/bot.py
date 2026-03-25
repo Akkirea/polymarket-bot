@@ -144,8 +144,8 @@ class PaperBot:
         if self.position:
             end_ts = self.position.get("end_ts", 0)
             now_ts = time.time()
-            if now_ts >= end_ts + 600:
-                # 10 minutes past close — winner field never populated; force-close
+            if now_ts >= end_ts + 1200:
+                # 20 minutes past close — finalPrice still not available; force-close
                 print(
                     f"[bot] FORCE-CLOSE: {self.position['market_slug']} "
                     f"— {int(now_ts - end_ts)}s past close with no resolution",
@@ -426,16 +426,22 @@ class PaperBot:
         price_to_beat: Optional[float] = None
         winner:        Optional[str]   = None
 
+        import json as _json
+        events = m.get("events", [])
+        meta   = (events[0].get("eventMetadata") or {}) if events else {}
+        print(
+            f"[bot] resolve raw: slug={slug}  events={len(events)}  "
+            f"meta={_json.dumps(meta)}  winner_field={m.get('winner')!r}  "
+            f"outcomePrices={m.get('outcomePrices')!r}",
+            flush=True,
+        )
         try:
-            events = m.get("events", [])
-            if events:
-                meta = events[0].get("eventMetadata") or {}
-                if meta.get("finalPrice") is not None:
-                    final_price = float(meta["finalPrice"])
-                if meta.get("priceToBeat") is not None:
-                    price_to_beat = float(meta["priceToBeat"])
-        except Exception:
-            pass
+            if meta.get("finalPrice") is not None:
+                final_price = float(meta["finalPrice"])
+            if meta.get("priceToBeat") is not None:
+                price_to_beat = float(meta["priceToBeat"])
+        except Exception as exc:
+            print(f"[bot] resolve: eventMetadata parse error: {exc}", flush=True)
 
         if final_price is not None and price_to_beat is not None:
             winner = "Up" if final_price >= price_to_beat else "Down"
