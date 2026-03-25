@@ -129,7 +129,7 @@ class PaperBot:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _tick(self):
-        print("[bot] _tick called")
+        print(f"[bot] _tick called  position={'HELD' if self.position else 'none'}", flush=True)
         # If holding a position, try to resolve once the market window has closed
         if self.position:
             end_ts = self.position.get("end_ts", 0)
@@ -140,11 +140,8 @@ class PaperBot:
         # Scan active BTC 5m markets for an entry window
         markets = await self._fetch_active_markets()
         now = time.time()
-
-        if not markets:
-            print("[bot] no active markets found")
-
-        print(f"[bot] found {len(markets)} active BTC 5m markets")
+        slugs = [m.get("slug", "?") for m in markets]
+        print(f"[bot] _fetch_active_markets returned {len(markets)} markets: {slugs}", flush=True)
 
         for market in markets:
             slug = market.get("slug", "")
