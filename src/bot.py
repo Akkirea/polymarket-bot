@@ -21,6 +21,7 @@ from typing import Optional
 import aiohttp
 
 from . import db
+from .chainlink import get_btc_price
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -32,7 +33,7 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 2     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum Bybit vs start-price diff to act
+PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff to act (live vs cached start price)
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -159,7 +160,7 @@ class PaperBot:
 
             # Cache Chainlink price on first sight — this becomes price_to_beat
             if slug not in self._market_start_prices:
-                start_price = await self._get_bybit_btc_price()
+                start_price = await self._get_btc_price()
                 if start_price is not None:
                     self._market_start_prices[slug] = start_price
                     print(f"[bot] cached start price for {slug}: ${start_price:,.2f}", flush=True)
@@ -235,22 +236,13 @@ class PaperBot:
 
     # ── Signals ────────────────────────────────────────────────────────────────
 
-    async def _get_bybit_btc_price(self) -> Optional[float]:
-        """Fetch live BTC/USDT spot price from Bybit — no RPC, no web3."""
+    async def _get_btc_price(self) -> Optional[float]:
+        """Fetch live BTC/USD from Chainlink on Polygon — same call as /api/btc-price."""
         try:
-            session = await self._get_session()
-            async with session.get(
-                f"{BYBIT_API}/tickers",
-                params={"category": "spot", "symbol": "BTCUSDT"},
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[bot] Bybit price: HTTP {resp.status}", flush=True)
-                    return None
-                data = await resp.json()
-                price = float(data["result"]["list"][0]["lastPrice"])
-                return price
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, get_btc_price)
         except Exception as exc:
-            print(f"[bot] Bybit price error: {exc}", flush=True)
+            print(f"[bot] BTC price error: {exc}", flush=True)
             return None
 
     async def _evaluate_signals(
@@ -262,31 +254,31 @@ class PaperBot:
         """
         # ── Primary: Chainlink ──────────────────────────────────────────────────
         if price_to_beat is not None:
-            live_price = await self._get_bybit_btc_price()
+            live_price = await self._get_btc_price()
             if live_price is not None:
                 diff = live_price - price_to_beat
                 if abs(diff) >= PRICE_DIFF_THRESHOLD:
                     direction = "Up" if diff > 0 else "Down"
                     print(
-                        f"[bot] BYBIT: current=${live_price:,.2f} "
+                        f"[bot] BTC: current=${live_price:,.2f} "
                         f"vs beat=${price_to_beat:,.2f} diff=${diff:+.2f} → {direction}",
                         flush=True,
                     )
                     return direction, {
-                        "source": "bybit",
+                        "source": "chainlink",
                         "momentum": direction,
                         "live_price": live_price,
                         "price_to_beat": price_to_beat,
                     }
                 print(
-                    f"[bot] BYBIT: diff ${abs(diff):.2f} < "
+                    f"[bot] BTC: diff ${abs(diff):.2f} < "
                     f"${PRICE_DIFF_THRESHOLD} threshold — skipping, no trade",
                     flush=True,
                 )
             else:
-                print("[bot] BYBIT: unavailable — skipping, no trade", flush=True)
+                print("[bot] BTC: unavailable — skipping, no trade", flush=True)
         else:
-            print("[bot] BYBIT: no start price cached — skipping, no trade", flush=True)
+            print("[bot] BTC: no start price cached — skipping, no trade", flush=True)
 
         # No fallback — only trade on a confirmed Chainlink diff
         return None, {"source": "none", "momentum": None}
