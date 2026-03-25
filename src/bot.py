@@ -271,39 +271,58 @@ class PaperBot:
         self, market: dict, price_to_beat: Optional[float]
     ) -> tuple[Optional[str], dict]:
         """
-        Primary: Chainlink latency arb — compare live price to cached start price.
-        Fallback: outcomePrices >= 0.55 if Chainlink is unavailable or diff too small.
+        Enter only when BOTH signals agree:
+        1. abs(live_price - price_to_beat) >= PRICE_DIFF_THRESHOLD  (Chainlink momentum)
+        2. outcomePrices[direction] > 0.50                          (crowd confirmation)
+        Disagreement = skip, no trade.
         """
-        # ── Primary: Chainlink ──────────────────────────────────────────────────
-        if price_to_beat is not None:
-            live_price = await self._get_btc_price()
-            if live_price is not None:
-                diff = live_price - price_to_beat
-                if abs(diff) >= PRICE_DIFF_THRESHOLD:
-                    direction = "Up" if diff > 0 else "Down"
-                    print(
-                        f"[bot] BTC: current=${live_price:,.2f} "
-                        f"vs beat=${price_to_beat:,.2f} diff=${diff:+.2f} → {direction}",
-                        flush=True,
-                    )
-                    return direction, {
-                        "source": "chainlink",
-                        "momentum": direction,
-                        "live_price": live_price,
-                        "price_to_beat": price_to_beat,
-                    }
-                print(
-                    f"[bot] BTC: diff ${abs(diff):.2f} < "
-                    f"${PRICE_DIFF_THRESHOLD} threshold — skipping, no trade",
-                    flush=True,
-                )
-            else:
-                print("[bot] BTC: unavailable — skipping, no trade", flush=True)
-        else:
+        if price_to_beat is None:
             print("[bot] BTC: no start price cached — skipping, no trade", flush=True)
+            return None, {"source": "none", "momentum": None}
 
-        # No fallback — only trade on a confirmed Chainlink diff
-        return None, {"source": "none", "momentum": None}
+        live_price = await self._get_btc_price()
+        if live_price is None:
+            print("[bot] BTC: unavailable — skipping, no trade", flush=True)
+            return None, {"source": "none", "momentum": None}
+
+        diff = live_price - price_to_beat
+        up_price   = _side_price(market, "Up")
+        down_price = _side_price(market, "Down")
+
+        print(
+            f"[bot] signals: diff=${diff:+.2f}  up={up_price:.3f}  down={down_price:.3f}",
+            flush=True,
+        )
+
+        if abs(diff) < PRICE_DIFF_THRESHOLD:
+            print(
+                f"[bot] SKIP: Chainlink diff ${abs(diff):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
+                flush=True,
+            )
+            return None, {"source": "none", "momentum": None}
+
+        chainlink_dir = "Up" if diff > 0 else "Down"
+        crowd_price   = up_price if chainlink_dir == "Up" else down_price
+
+        if crowd_price <= 0.50:
+            print(
+                f"[bot] SKIP: Chainlink says {chainlink_dir} but crowd={crowd_price:.3f} disagrees",
+                flush=True,
+            )
+            return None, {"source": "none", "momentum": None}
+
+        print(
+            f"[bot] ENTRY: Chainlink {chainlink_dir}  diff=${diff:+.2f}  "
+            f"crowd={crowd_price:.3f}  live=${live_price:,.2f}  beat=${price_to_beat:,.2f}",
+            flush=True,
+        )
+        return chainlink_dir, {
+            "source":        "chainlink+crowd",
+            "momentum":      chainlink_dir,
+            "live_price":    live_price,
+            "price_to_beat": price_to_beat,
+            "crowd_price":   crowd_price,
+        }
 
     def _signal_market(self, market: dict) -> Optional[str]:
         """
