@@ -7,7 +7,9 @@ Run with:
     uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
+from .chainlink import get_btc_price
 
 
 @asynccontextmanager
@@ -164,6 +167,20 @@ async def stop_bot():
         return {"ok": True, "message": "Already stopped"}
     await bot.stop()
     return {"ok": True, "message": "Bot stopped"}
+
+@app.get("/api/btc-price")
+async def btc_price():
+    """Return the latest BTC/USD price from the Chainlink feed on Polygon."""
+    try:
+        loop = asyncio.get_running_loop()
+        price = await loop.run_in_executor(None, get_btc_price)
+        return {
+            "price": round(price, 2),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 
 @app.get("/api/funding-rates")
 async def get_funding_rates():
