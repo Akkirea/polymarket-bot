@@ -12,6 +12,7 @@ converts them to ? for SQLite so no query needs two versions.
 import os
 import sqlite3
 from datetime import datetime
+from typing import Optional
 from . import config
 
 # ── Backend detection ──────────────────────────────────────────────────────────
@@ -456,7 +457,7 @@ def save_open_position(pos: dict):
     conn.close()
 
 
-def load_open_position() -> dict | None:
+def load_open_position() -> Optional[dict]:
     """Return the persisted open position, or None if none exists."""
     conn = get_connection()
     row = conn.execute(

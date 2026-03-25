@@ -73,7 +73,8 @@ class PaperBot:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10, connect=5)
+                timeout=aiohttp.ClientTimeout(total=10, connect=5),
+                headers={"User-Agent": "Mozilla/5.0 (compatible; signal-zero-bot/1.0)"},
             )
         return self._session
 
@@ -419,30 +420,56 @@ class PaperBot:
             print(f"[bot] resolve: {slug} not yet closed", flush=True)
             return None, None, None
 
-        winner = m.get("winner")
-        if not winner:
-            print(f"[bot] resolve: {slug} closed but winner field empty — waiting", flush=True)
-            return None, None, None
+        # --- Derive winner from eventMetadata (winner field is never populated
+        #     for BTC 5m markets; finalPrice vs priceToBeat is authoritative) ---
+        final_price:   Optional[float] = None
+        price_to_beat: Optional[float] = None
+        winner:        Optional[str]   = None
 
-        # Pull settlement prices from eventMetadata
-        final_price   = None
-        price_to_beat = None
         try:
             events = m.get("events", [])
             if events:
-                meta = events[0].get("eventMetadata", {})
+                meta = events[0].get("eventMetadata") or {}
                 if meta.get("finalPrice") is not None:
-                    final_price   = float(meta["finalPrice"])
+                    final_price = float(meta["finalPrice"])
                 if meta.get("priceToBeat") is not None:
                     price_to_beat = float(meta["priceToBeat"])
         except Exception:
             pass
 
-        print(
-            f"[bot] resolved {slug} → {winner!r} "
-            f"priceToBeat={price_to_beat}  finalPrice={final_price}",
-            flush=True,
-        )
+        if final_price is not None and price_to_beat is not None:
+            winner = "Up" if final_price >= price_to_beat else "Down"
+            print(
+                f"[bot] resolved via eventMetadata: {slug} → {winner}  "
+                f"finalPrice={final_price:.2f}  priceToBeat={price_to_beat:.2f}",
+                flush=True,
+            )
+        else:
+            # Fallback: parse outcomePrices (["1","0"] or ["0","1"])
+            # outcomes[0] == "Up", outcomes[1] == "Down" for this market series
+            try:
+                import json as _json
+                outcomes      = _json.loads(m.get("outcomes", "[]"))
+                outcome_prices = _json.loads(m.get("outcomePrices", "[]"))
+                for label, price_str in zip(outcomes, outcome_prices):
+                    if float(price_str) >= 0.99:
+                        winner = label
+                        break
+            except Exception:
+                pass
+
+            if winner:
+                print(
+                    f"[bot] resolved via outcomePrices: {slug} → {winner}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[bot] resolve: {slug} closed but cannot determine winner yet",
+                    flush=True,
+                )
+                return None, None, None
+
         return winner, final_price, price_to_beat
 
     async def _close_position(self, winner: str, resolution_price: Optional[float] = None,
