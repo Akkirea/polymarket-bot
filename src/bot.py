@@ -350,12 +350,18 @@ class PaperBot:
         except Exception:
             return None, None, None
 
-        print(f"[bot] outcomePrices for {slug}: {list(zip(outcomes, prices))}")
+        print(f"[bot] outcomePrices for {slug}: {list(zip(outcomes, prices))}", flush=True)
         winner = None
         for i, p in enumerate(prices):
-            if str(p).strip() == "1":   # exact final settlement — Polymarket uses "1"/"0"
-                winner = str(outcomes[i])
-                break
+            try:
+                val = float(p)
+            except (ValueError, TypeError):
+                continue
+            if i < len(prices):
+                other_vals = [float(prices[j]) for j in range(len(prices)) if j != i]
+                if val >= 0.99 and all(v <= 0.01 for v in other_vals):
+                    winner = str(outcomes[i])
+                    break
 
         if winner is None:
             return None, None, None
@@ -376,7 +382,8 @@ class PaperBot:
 
         print(
             f"[bot] resolved {slug} → {winner} "
-            f" priceToBeat={price_to_beat}  finalPrice={final_price}"
+            f" priceToBeat={price_to_beat}  finalPrice={final_price}",
+            flush=True,
         )
         return winner, final_price, price_to_beat
 
