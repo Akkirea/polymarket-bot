@@ -23,8 +23,8 @@ import aiohttp
 from . import db
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-GAMMA_API    = "https://gamma-api.polymarket.com"
-BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
+GAMMA_API = "https://gamma-api.polymarket.com"
+BYBIT_API = "https://api.bybit.com/v5/market"
 
 INITIAL_BALANCE  = 10_000.0
 BET_SIZE         = 500.0
@@ -60,7 +60,7 @@ class PaperBot:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10, connect=5)
             )
         return self._session
 
@@ -253,14 +253,14 @@ class PaperBot:
 
     async def _signal_funding(self) -> str:
         """
-        Fetch BTC funding rate from Binance futures premiumIndex.
+        Fetch BTC funding rate from Bybit (accessible from Railway).
         Rate > 0.02% → 'Up' (bullish), < -0.02% → 'Down' (bearish), else 'neutral'.
         """
         session = await self._get_session()
         try:
             async with session.get(
-                f"{BINANCE_FAPI}/premiumIndex",
-                params={"symbol": "BTCUSDT"},
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": "linear", "symbol": "BTCUSDT"},
             ) as resp:
                 if resp.status != 200:
                     return "neutral"
@@ -269,13 +269,12 @@ class PaperBot:
             print(f"[bot] Funding fetch error: {exc}")
             return "neutral"
 
-        # With symbol= param Binance returns a single object, not a list
-        if isinstance(data, list):
-            data = next((d for d in data if d.get("symbol") == "BTCUSDT"), None)
-        if not data:
+        tickers = data.get("result", {}).get("list", [])
+        if not tickers:
             return "neutral"
 
-        rate = float(data.get("lastFundingRate", 0)) * 100  # convert to %
+        rate = float(tickers[0].get("fundingRate", 0)) * 100  # convert to %
+        print(f"[bot] BTC funding rate: {rate:.4f}%")
 
         if rate > FUNDING_THRESHOLD:
             return "Up"
