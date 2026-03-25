@@ -317,28 +317,29 @@ class PaperBot:
 
     async def _try_resolve(self):
         slug = self.position["market_slug"]
-        winner = await self._resolve_market(slug)
+        winner, resolution_price, poly_price_to_beat = await self._resolve_market(slug)
         if winner is None:
             print(f"[bot] {slug} not resolved yet — will retry")
             return
-        resolution_price = await self._get_chainlink_price()
-        await self._close_position(winner, resolution_price)
+        await self._close_position(winner, resolution_price, poly_price_to_beat)
 
-    async def _resolve_market(self, slug: str) -> Optional[str]:
-        """Return 'Up' or 'Down' when outcomePrices reaches 0.99, else None."""
+    async def _resolve_market(self, slug: str) -> tuple[Optional[str], Optional[float], Optional[float]]:
+        """Return (winner, final_price, price_to_beat) when outcomePrices reaches 0.99,
+        else (None, None, None). Both prices come from events[0].eventMetadata —
+        Polymarket's authoritative Chainlink Data Stream values."""
         session = await self._get_session()
         try:
             async with session.get(
                 f"{GAMMA_API}/markets", params={"slug": slug}
             ) as resp:
                 if resp.status != 200:
-                    return None
+                    return None, None, None
                 markets = await resp.json()
         except Exception:
-            return None
+            return None, None, None
 
         if not markets:
-            return None
+            return None, None, None
 
         m = markets[0]
         try:
@@ -347,15 +348,40 @@ class PaperBot:
             outcomes = eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
             prices   = eval(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
         except Exception:
-            return None
+            return None, None, None
 
         print(f"[bot] outcomePrices for {slug}: {list(zip(outcomes, prices))}")
+        winner = None
         for i, p in enumerate(prices):
             if float(p) >= 0.99:
-                return str(outcomes[i])
-        return None
+                winner = str(outcomes[i])
+                break
 
-    async def _close_position(self, winner: str, resolution_price: Optional[float] = None):
+        if winner is None:
+            return None, None, None
+
+        # Extract Polymarket's authoritative open and settlement prices
+        final_price    = None
+        price_to_beat  = None
+        try:
+            events = m.get("events", [])
+            if events:
+                meta = events[0].get("eventMetadata", {})
+                if meta.get("finalPrice")   is not None:
+                    final_price   = float(meta["finalPrice"])
+                if meta.get("priceToBeat")  is not None:
+                    price_to_beat = float(meta["priceToBeat"])
+        except Exception:
+            pass
+
+        print(
+            f"[bot] resolved {slug} → {winner} "
+            f" priceToBeat={price_to_beat}  finalPrice={final_price}"
+        )
+        return winner, final_price, price_to_beat
+
+    async def _close_position(self, winner: str, resolution_price: Optional[float] = None,
+                              poly_price_to_beat: Optional[float] = None):
         pos         = self.position
         won         = pos["side"] == winner
         size        = pos["size"]
@@ -392,7 +418,7 @@ class PaperBot:
                 pos["side"],
                 pos["size"],
                 round(entry_price, 4),
-                round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
+                round(poly_price_to_beat or pos.get("price_to_beat") or 0, 2) or None,
                 round(resolution_price, 2) if resolution_price else None,
                 winner,
                 round(pnl, 2),
