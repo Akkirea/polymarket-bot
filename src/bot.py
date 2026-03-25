@@ -27,7 +27,7 @@ from .chainlink import get_btc_price
 GAMMA_API = "https://gamma-api.polymarket.com"
 BYBIT_API = "https://api.bybit.com/v5/market"
 
-INITIAL_BALANCE      = 10_000.0
+INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 BET_SIZE             = 500.0
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 2     # enter when seconds_remaining >= this
@@ -46,7 +46,9 @@ class PaperBot:
     """
 
     def __init__(self):
-        self.balance:     float          = INITIAL_BALANCE
+        db.init_db()
+        state = db.load_bot_state()
+        self.balance:     float          = state["balance"]
         self.position:    Optional[dict] = None
         self.wins:        int            = 0
         self.losses:      int            = 0
@@ -56,7 +58,7 @@ class PaperBot:
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()         # avoid re-entering the same market
         self._market_start_prices: dict = {}    # slug → chainlink price at market open
-        db.init_db()
+        print(f"[bot] Loaded balance from DB: ${self.balance:.2f}")
 
     # ── Session ────────────────────────────────────────────────────────────────
 
@@ -395,6 +397,8 @@ class PaperBot:
         )
         conn.commit()
         conn.close()
+
+        db.save_bot_state(self.balance)
         self.position = None
 
 

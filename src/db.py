@@ -186,6 +186,12 @@ def init_db():
             closed_at     TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS bot_state (
+            id         INTEGER PRIMARY KEY,
+            balance    REAL NOT NULL DEFAULT 10000,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_whale_wallets_winrate ON whale_wallets(win_rate DESC);
         CREATE INDEX IF NOT EXISTS idx_whale_trades_wallet   ON whale_trades(wallet_address)
     """)
@@ -361,6 +367,37 @@ def get_stats() -> dict:
     stats["signals_traded"] = row["n"]
     conn.close()
     return stats
+
+
+INITIAL_BALANCE = 10_000.0
+
+
+def load_bot_state() -> dict:
+    """Return persisted bot state, or defaults if none exists yet."""
+    conn = get_connection()
+    row = conn.execute("SELECT balance FROM bot_state WHERE id = 1").fetchone()
+    conn.close()
+    if row:
+        return {"balance": float(row["balance"])}
+    return {"balance": INITIAL_BALANCE}
+
+
+def save_bot_state(balance: float):
+    """Upsert the single bot_state row."""
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO bot_state (id, balance, updated_at)
+               VALUES (1, %s, %s)
+           ON CONFLICT(id) DO UPDATE SET
+               balance    = excluded.balance,
+               updated_at = excluded.updated_at"""
+        if _USE_PG else
+        """INSERT OR REPLACE INTO bot_state (id, balance, updated_at)
+               VALUES (1, %s, %s)""",
+        (balance, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_top_whale_wallets(limit: int = 5) -> list:
