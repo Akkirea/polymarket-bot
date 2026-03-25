@@ -163,12 +163,14 @@ class PaperBot:
                 start_price = await self._get_chainlink_price()
                 if start_price is not None:
                     self._market_start_prices[slug] = start_price
-                    print(f"[bot] cached start price for {slug}: ${start_price:,.2f}")
+                    print(f"[bot] cached start price for {slug}: ${start_price:,.2f}", flush=True)
+                else:
+                    print(f"[bot] Chainlink unavailable — cannot cache start price for {slug}", flush=True)
 
             if not (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI):
                 continue
 
-            print(f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining — evaluating signals")
+            print(f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining — evaluating signals", flush=True)
             price_to_beat = self._market_start_prices.get(slug)
             direction, signals = await self._evaluate_signals(market, price_to_beat)
 
@@ -177,14 +179,15 @@ class PaperBot:
             self._market_start_prices.pop(slug, None)  # free memory
 
             if direction is None:
-                print(f"[bot] SKIP: no clear signal — {signals}")
+                print(f"[bot] SKIP: no clear signal — {signals}", flush=True)
                 continue
 
             entry_price = _side_price(market, direction)
             print(
                 f"[bot] SIGNAL ENTRY: {direction} on {slug} — "
                 f"source={signals['source']} momentum={signals['momentum']} "
-                f"price={entry_price:.3f}"
+                f"price={entry_price:.3f}",
+                flush=True,
             )
             await self._open_position(slug, direction, entry_price, end_ts, price_to_beat)
             break  # one position at a time
@@ -268,12 +271,13 @@ class PaperBot:
                     }
                 print(
                     f"[bot] CHAINLINK: diff ${abs(diff):.2f} < "
-                    f"${PRICE_DIFF_THRESHOLD} threshold — skipping, no trade"
+                    f"${PRICE_DIFF_THRESHOLD} threshold — skipping, no trade",
+                    flush=True,
                 )
             else:
-                print("[bot] CHAINLINK: unavailable — skipping, no trade")
+                print("[bot] CHAINLINK: unavailable — skipping, no trade", flush=True)
         else:
-            print("[bot] CHAINLINK: no start price cached — skipping, no trade")
+            print("[bot] CHAINLINK: no start price cached — skipping, no trade", flush=True)
 
         # No fallback — only trade on a confirmed Chainlink diff
         return None, {"source": "none", "momentum": None}
