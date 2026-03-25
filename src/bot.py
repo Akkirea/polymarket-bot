@@ -21,17 +21,19 @@ from typing import Optional
 import aiohttp
 
 from . import db
+from .chainlink import get_btc_price
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
 BYBIT_API = "https://api.bybit.com/v5/market"
 
-INITIAL_BALANCE  = 10_000.0
-BET_SIZE         = 500.0
-POLL_INTERVAL    = 3     # seconds between ticks
-ENTRY_WINDOW_LO  = 5     # enter when seconds_remaining >= this
-ENTRY_WINDOW_HI  = 12    # enter when seconds_remaining <= this
-FUNDING_THRESHOLD = 0.02  # % — above = bullish, below negative = bearish
+INITIAL_BALANCE      = 10_000.0
+BET_SIZE             = 500.0
+POLL_INTERVAL        = 3     # seconds between ticks
+ENTRY_WINDOW_LO      = 2     # enter when seconds_remaining >= this
+ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
+FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
+PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum chainlink vs start-price diff to act
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -52,7 +54,8 @@ class PaperBot:
         self.running:     bool           = False
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
-        self._entered_slugs: set = set()  # avoid re-entering the same market
+        self._entered_slugs: set = set()         # avoid re-entering the same market
+        self._market_start_prices: dict = {}    # slug → chainlink price at market open
         db.init_db()
 
     # ── Session ────────────────────────────────────────────────────────────────
@@ -153,23 +156,32 @@ class PaperBot:
             seconds_remaining = end_ts - now
             print(f"[bot] market {slug} — {seconds_remaining:.1f}s remaining")
 
+            # Cache Chainlink price on first sight — this becomes price_to_beat
+            if slug not in self._market_start_prices:
+                start_price = await self._get_chainlink_price()
+                if start_price is not None:
+                    self._market_start_prices[slug] = start_price
+                    print(f"[bot] cached start price for {slug}: ${start_price:,.2f}")
+
             if not (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI):
                 continue
 
             print(f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining — evaluating signals")
-            direction, signals = await self._evaluate_signals(market)
+            price_to_beat = self._market_start_prices.get(slug)
+            direction, signals = await self._evaluate_signals(market, price_to_beat)
 
             # Mark slug as seen regardless of outcome so we don't re-evaluate
             self._entered_slugs.add(slug)
+            self._market_start_prices.pop(slug, None)  # free memory
 
             if direction is None:
-                print(f"[bot] SKIP: signals disagree — {signals}")
+                print(f"[bot] SKIP: no clear signal — {signals}")
                 continue
 
             entry_price = _side_price(market, direction)
             print(
                 f"[bot] SIGNAL ENTRY: {direction} on {slug} — "
-                f"momentum={signals['momentum']} funding={signals['funding']} "
+                f"source={signals['source']} momentum={signals['momentum']} "
                 f"price={entry_price:.3f}"
             )
             await self._open_position(slug, direction, entry_price, end_ts)
@@ -219,27 +231,55 @@ class PaperBot:
 
     # ── Signals ────────────────────────────────────────────────────────────────
 
-    async def _evaluate_signals(self, market: dict) -> tuple[Optional[str], dict]:
+    async def _get_chainlink_price(self) -> Optional[float]:
+        """Run the synchronous web3 call in a thread so it doesn't block the loop."""
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, get_btc_price)
+        except Exception as exc:
+            print(f"[bot] Chainlink error: {exc}")
+            return None
+
+    async def _evaluate_signals(
+        self, market: dict, price_to_beat: Optional[float]
+    ) -> tuple[Optional[str], dict]:
         """
-        Returns (direction, signals_dict).
-        direction is 'Up', 'Down', or None if signals don't agree.
+        Primary: Chainlink latency arb — compare live price to cached start price.
+        Fallback: outcomePrices >= 0.55 if Chainlink is unavailable or diff too small.
         """
-        market_signal = self._signal_market(market)
-        funding       = await self._signal_funding()
+        # ── Primary: Chainlink ──────────────────────────────────────────────────
+        if price_to_beat is not None:
+            chainlink_price = await self._get_chainlink_price()
+            if chainlink_price is not None:
+                diff = chainlink_price - price_to_beat
+                if abs(diff) >= PRICE_DIFF_THRESHOLD:
+                    direction = "Up" if diff > 0 else "Down"
+                    print(
+                        f"[bot] CHAINLINK: current=${chainlink_price:,.2f} "
+                        f"vs beat=${price_to_beat:,.2f} → {direction}"
+                    )
+                    return direction, {
+                        "source": "chainlink",
+                        "momentum": direction,
+                        "chainlink": chainlink_price,
+                        "price_to_beat": price_to_beat,
+                    }
+                print(
+                    f"[bot] CHAINLINK: diff ${abs(diff):.2f} < "
+                    f"${PRICE_DIFF_THRESHOLD} threshold — falling back"
+                )
+            else:
+                print("[bot] CHAINLINK: unavailable — falling back to market signal")
+        else:
+            print("[bot] CHAINLINK: no start price cached — falling back to market signal")
 
-        signals = {"momentum": market_signal, "funding": funding}
-
-        # Both must agree and neither can be None/neutral
-        if market_signal is None or funding == "neutral":
-            return None, signals
-        if market_signal != funding:
-            return None, signals
-
-        return market_signal, signals
+        # ── Fallback: outcomePrices ─────────────────────────────────────────────
+        direction = self._signal_market(market)
+        return direction, {"source": "market", "momentum": direction}
 
     def _signal_market(self, market: dict) -> Optional[str]:
         """
-        Polymarket-native direction signal from outcomePrices.
+        Polymarket-native fallback: outcomePrices >= 0.55.
         Up price >= 0.55 → 'Up', Down price >= 0.55 → 'Down', else None.
         """
         up_price   = _side_price(market, "Up")
@@ -250,37 +290,6 @@ class PaperBot:
         if down_price >= 0.55:
             return "Down"
         return None
-
-    async def _signal_funding(self) -> str:
-        """
-        Fetch BTC funding rate from Bybit (accessible from Railway).
-        Rate > 0.02% → 'Up' (bullish), < -0.02% → 'Down' (bearish), else 'neutral'.
-        """
-        session = await self._get_session()
-        try:
-            async with session.get(
-                "https://api.bybit.com/v5/market/tickers",
-                params={"category": "linear", "symbol": "BTCUSDT"},
-            ) as resp:
-                if resp.status != 200:
-                    return "neutral"
-                data = await resp.json()
-        except Exception as exc:
-            print(f"[bot] Funding fetch error: {exc}")
-            return "neutral"
-
-        tickers = data.get("result", {}).get("list", [])
-        if not tickers:
-            return "neutral"
-
-        rate = float(tickers[0].get("fundingRate", 0)) * 100  # convert to %
-        print(f"[bot] BTC funding rate: {rate:.4f}%")
-
-        if rate > FUNDING_THRESHOLD:
-            return "Up"
-        if rate < -FUNDING_THRESHOLD:
-            return "Down"
-        return "neutral"
 
     # ── Position lifecycle ─────────────────────────────────────────────────────
 
