@@ -353,7 +353,7 @@ class PaperBot:
         print(f"[bot] outcomePrices for {slug}: {list(zip(outcomes, prices))}")
         winner = None
         for i, p in enumerate(prices):
-            if float(p) >= 0.99:
+            if str(p).strip() == "1":   # exact final settlement — Polymarket uses "1"/"0"
                 winner = str(outcomes[i])
                 break
 
