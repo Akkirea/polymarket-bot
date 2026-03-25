@@ -57,7 +57,6 @@ class PaperBot:
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()         # avoid re-entering the same market
-        self._market_start_prices: dict = {}    # slug → Bybit BTC price at market open
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}")
 
     # ── Session ────────────────────────────────────────────────────────────────
@@ -155,25 +154,24 @@ class PaperBot:
             seconds_remaining = end_ts - now
             print(f"[bot] market {slug} — {seconds_remaining:.1f}s remaining")
 
-            # Cache Chainlink price on first sight — this becomes price_to_beat
-            if slug not in self._market_start_prices:
-                start_price = await self._get_btc_price()
-                if start_price is not None:
-                    self._market_start_prices[slug] = start_price
-                    print(f"[bot] cached start price for {slug}: ${start_price:,.2f}", flush=True)
-                else:
-                    print(f"[bot] Chainlink unavailable — cannot cache start price for {slug}", flush=True)
-
             if not (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI):
                 continue
 
-            print(f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining — evaluating signals", flush=True)
-            price_to_beat = self._market_start_prices.get(slug)
+            # Fetch fresh price right at entry window — this is the signal basis
+            price_to_beat = await self._get_btc_price()
+            if price_to_beat is None:
+                print(f"[bot] BTC price unavailable at entry window — skipping {slug}", flush=True)
+                self._entered_slugs.add(slug)
+                continue
+            print(
+                f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining  "
+                f"price_to_beat=${price_to_beat:,.2f}",
+                flush=True,
+            )
             direction, signals = await self._evaluate_signals(market, price_to_beat)
 
             # Mark slug as seen regardless of outcome so we don't re-evaluate
             self._entered_slugs.add(slug)
-            self._market_start_prices.pop(slug, None)  # free memory
 
             if direction is None:
                 print(f"[bot] SKIP: no clear signal — {signals}", flush=True)
