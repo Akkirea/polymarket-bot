@@ -168,6 +168,19 @@ async def stop_bot():
     await bot.stop()
     return {"ok": True, "message": "Bot stopped"}
 
+
+@app.post("/api/bot/set-balance")
+async def set_balance(body: dict):
+    """Sync both in-memory and DB balance to a given value.
+    Body: { "balance": 10000 }
+    """
+    new_balance = float(body.get("balance", 0))
+    if new_balance < 0:
+        raise HTTPException(status_code=400, detail="Balance must be non-negative")
+    bot.balance = new_balance
+    db.save_bot_state(new_balance)
+    return {"ok": True, "balance": new_balance}
+
 @app.get("/api/btc-price")
 async def btc_price():
     """Return the latest BTC/USD price from the Chainlink feed on Polygon."""

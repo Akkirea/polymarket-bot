@@ -523,7 +523,7 @@ class PaperBot:
                 pos["side"],
                 pos["size"],
                 round(entry_price, 4),
-                round(poly_price_to_beat or pos.get("price_to_beat") or 0, 2) or None,
+                round(pos.get("price_to_beat"), 2) if pos.get("price_to_beat") else None,
                 round(resolution_price, 2) if resolution_price else None,
                 winner,
                 round(pnl, 2),
