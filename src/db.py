@@ -92,6 +92,7 @@ def get_connection() -> _Connection:
 # ── Schema ─────────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables if they don't exist."""
+    print(f"[db] DB: {'PostgreSQL' if _USE_PG else 'SQLite'}")
     conn = get_connection()
     conn.executescript(f"""
         CREATE TABLE IF NOT EXISTS price_ticks (
