@@ -391,6 +391,13 @@ class PaperBot:
 
     async def _close_position(self, winner: str, resolution_price: Optional[float] = None,
                               poly_price_to_beat: Optional[float] = None):
+        import traceback
+        print(
+            f"[bot] _close_position called  winner={winner!r}  "
+            f"resolution_price={resolution_price}  poly_ptb={poly_price_to_beat}",
+            flush=True,
+        )
+        print("[bot] _close_position call stack:\n" + "".join(traceback.format_stack()), flush=True)
         pos         = self.position
         won         = pos["side"] == winner
         size        = pos["size"]
