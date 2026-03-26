@@ -33,7 +33,10 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 2     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff to act (live vs cached start price)
+PRICE_DIFF_THRESHOLD = 60.0  # USD — min diff to act; accounts for ~$45 push/Data-Streams offset
+CROWD_MIN_CONFIDENCE = 0.60  # outcomePrices must show >= 60% for the signal direction
+RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
+RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -56,8 +59,9 @@ class PaperBot:
         self.running:     bool           = False
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
-        self._entered_slugs: set = set()         # avoid re-entering the same market
-        self._market_start_prices: dict = {}    # slug → BTC price at first sight (price_to_beat)
+        self._entered_slugs: set = set()          # avoid re-entering the same market
+        self._market_start_prices: dict = {}     # slug → BTC price at first sight (price_to_beat)
+        self._btc_price_history: list = []       # rolling window of recent BTC prices for ranging filter
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
         if self.position:
             print(
@@ -259,13 +263,24 @@ class PaperBot:
     # ── Signals ────────────────────────────────────────────────────────────────
 
     async def _get_btc_price(self) -> Optional[float]:
-        """Fetch live BTC/USD from Chainlink on Polygon — same call as /api/btc-price."""
+        """Fetch live BTC/USD from Chainlink on Polygon and append to rolling history."""
         try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, get_btc_price)
+            loop  = asyncio.get_running_loop()
+            price = await loop.run_in_executor(None, get_btc_price)
+            self._btc_price_history.append(price)
+            if len(self._btc_price_history) > RANGING_WINDOW:
+                self._btc_price_history.pop(0)
+            return price
         except Exception as exc:
             print(f"[bot] BTC price error: {exc}", flush=True)
             return None
+
+    def _is_ranging(self) -> bool:
+        """Return True if the last RANGING_WINDOW prices are all within RANGING_THRESHOLD of each other."""
+        if len(self._btc_price_history) < RANGING_WINDOW:
+            return False  # not enough data yet — don't filter
+        spread = max(self._btc_price_history) - min(self._btc_price_history)
+        return spread < RANGING_THRESHOLD
 
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float]
@@ -294,6 +309,15 @@ class PaperBot:
             flush=True,
         )
 
+        if self._is_ranging():
+            print(
+                f"[bot] SKIP: ranging market — last {RANGING_WINDOW} prices within "
+                f"${max(self._btc_price_history) - min(self._btc_price_history):.2f} "
+                f"(threshold ${RANGING_THRESHOLD})",
+                flush=True,
+            )
+            return None, {"source": "none", "momentum": None}
+
         if abs(diff) < PRICE_DIFF_THRESHOLD:
             print(
                 f"[bot] SKIP: Chainlink diff ${abs(diff):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
@@ -304,9 +328,10 @@ class PaperBot:
         chainlink_dir = "Up" if diff > 0 else "Down"
         crowd_price   = up_price if chainlink_dir == "Up" else down_price
 
-        if crowd_price <= 0.50:
+        if crowd_price < CROWD_MIN_CONFIDENCE:
             print(
-                f"[bot] SKIP: Chainlink says {chainlink_dir} but crowd={crowd_price:.3f} disagrees",
+                f"[bot] SKIP: Chainlink says {chainlink_dir} but crowd={crowd_price:.3f} "
+                f"< {CROWD_MIN_CONFIDENCE} confidence threshold",
                 flush=True,
             )
             return None, {"source": "none", "momentum": None}
