@@ -33,8 +33,8 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 6     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 60.0  # USD — initial diff required to consider entry
-REVERSAL_THRESHOLD   = 40.0  # USD — diff must still be >= this after 3s re-check
+PRICE_DIFF_THRESHOLD = 100.0  # USD — initial diff required to consider entry
+REVERSAL_THRESHOLD   = 80.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN_CONFIDENCE = 0.60  # kept for reference; crowd filter currently disabled
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
