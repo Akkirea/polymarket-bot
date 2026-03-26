@@ -181,6 +181,19 @@ async def set_balance(body: dict):
     db.save_bot_state(new_balance)
     return {"ok": True, "balance": new_balance}
 
+
+@app.post("/api/bot/reset")
+async def reset_bot():
+    """Reset all in-memory stats to a clean slate and persist to DB.
+    Does not stop the bot or clear open positions.
+    """
+    bot.balance   = db.INITIAL_BALANCE
+    bot.wins      = 0
+    bot.losses    = 0
+    bot.total_pnl = 0.0
+    db.save_bot_state(bot.balance)
+    return {"ok": True, "balance": bot.balance}
+
 @app.get("/api/btc-price")
 async def btc_price():
     """Return the latest BTC/USD price from the Chainlink feed on Polygon."""
