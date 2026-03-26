@@ -75,6 +75,9 @@ class _Connection:
     def commit(self):
         self._raw.commit()
 
+    def rollback(self):
+        self._raw.rollback()
+
     def close(self):
         self._raw.close()
 
@@ -213,13 +216,19 @@ def init_db():
     """)
     conn.commit()
 
-    # Migrate existing bot_trades tables that predate these columns
+    # Migrate existing bot_trades tables that predate these columns.
+    # PostgreSQL: ADD COLUMN IF NOT EXISTS is idempotent — no exception, no broken transaction.
+    # SQLite:     IF NOT EXISTS in ALTER TABLE requires 3.37+; use try/except instead.
     for col, typ in [("price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL")]:
-        try:
-            conn.execute(f"ALTER TABLE bot_trades ADD COLUMN {col} {typ}")
+        if _USE_PG:
+            conn.execute(f"ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS {col} {typ}")
             conn.commit()
-        except Exception:
-            pass  # column already exists
+        else:
+            try:
+                conn.execute(f"ALTER TABLE bot_trades ADD COLUMN {col} {typ}")
+                conn.commit()
+            except Exception:
+                pass  # column already exists
 
     conn.close()
 
