@@ -484,18 +484,17 @@ class PaperBot:
                 flush=True,
             )
         else:
-            # Fallback: parse outcomePrices (["1","0"] or ["0","1"])
-            # outcomes[0] == "Up", outcomes[1] == "Down" for this market series
+            # Fallback: find which outcome index has price >= 0.99, then look up
+            # the label at that index. Order is not assumed — label comes from outcomes[].
             try:
-                import json as _json
-                outcomes      = _json.loads(m.get("outcomes", "[]"))
+                outcomes       = _json.loads(m.get("outcomes", "[]"))
                 outcome_prices = _json.loads(m.get("outcomePrices", "[]"))
-                for label, price_str in zip(outcomes, outcome_prices):
+                for i, price_str in enumerate(outcome_prices):
                     if float(price_str) >= 0.99:
-                        winner = label
+                        winner = outcomes[i]
                         break
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[bot] resolve: outcomePrices parse error: {exc}", flush=True)
 
             if winner:
                 print(
