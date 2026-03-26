@@ -450,9 +450,9 @@ class PaperBot:
             conn.execute(
                 """INSERT INTO bot_trades
                    (whale_address, market_slug, side, size, entry_price,
-                    price_to_beat, resolution_price,
+                    price_to_beat, poly_price_to_beat, resolution_price,
                     outcome, pnl, balance_after, opened_at, closed_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     STRATEGY_TAG,
                     pos["market_slug"],
@@ -460,6 +460,7 @@ class PaperBot:
                     pos["size"],
                     round(pos.get("entry_price") or 0.5, 4),
                     round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
+                    None,
                     None,
                     "unresolved",
                     0.0,
@@ -641,9 +642,9 @@ class PaperBot:
             conn.execute(
                 """INSERT INTO bot_trades
                    (whale_address, market_slug, side, size, entry_price,
-                    price_to_beat, resolution_price,
+                    price_to_beat, poly_price_to_beat, resolution_price,
                     outcome, pnl, balance_after, opened_at, closed_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     STRATEGY_TAG,
                     pos["market_slug"],
@@ -651,6 +652,7 @@ class PaperBot:
                     pos["size"],
                     round(entry_price, 4),
                     round(pos.get("price_to_beat"), 2) if pos.get("price_to_beat") else None,
+                    round(poly_price_to_beat, 2) if poly_price_to_beat else None,
                     round(resolution_price, 2) if resolution_price else None,
                     winner,
                     round(pnl, 2),

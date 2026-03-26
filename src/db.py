@@ -179,19 +179,20 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS bot_trades (
-            id               {_PK},
-            whale_address    TEXT NOT NULL,
-            market_slug      TEXT NOT NULL,
-            side             TEXT NOT NULL,
-            size             REAL NOT NULL,
-            entry_price      REAL,
-            price_to_beat    REAL,
-            resolution_price REAL,
-            outcome          TEXT,
-            pnl              REAL,
-            balance_after    REAL,
-            opened_at        TEXT NOT NULL,
-            closed_at        TEXT
+            id                {_PK},
+            whale_address     TEXT NOT NULL,
+            market_slug       TEXT NOT NULL,
+            side              TEXT NOT NULL,
+            size              REAL NOT NULL,
+            entry_price       REAL,
+            price_to_beat     REAL,
+            poly_price_to_beat REAL,
+            resolution_price  REAL,
+            outcome           TEXT,
+            pnl               REAL,
+            balance_after     REAL,
+            opened_at         TEXT NOT NULL,
+            closed_at         TEXT
         );
 
         CREATE TABLE IF NOT EXISTS bot_state (
@@ -219,7 +220,7 @@ def init_db():
     # Migrate existing bot_trades tables that predate these columns.
     # PostgreSQL: ADD COLUMN IF NOT EXISTS is idempotent — no exception, no broken transaction.
     # SQLite:     IF NOT EXISTS in ALTER TABLE requires 3.37+; use try/except instead.
-    for col, typ in [("price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL")]:
+    for col, typ in [("price_to_beat", "REAL"), ("poly_price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL")]:
         if _USE_PG:
             conn.execute(f"ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS {col} {typ}")
             conn.commit()
