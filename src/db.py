@@ -496,6 +496,18 @@ def clear_open_position():
     conn.close()
 
 
+def update_resolution_price(market_slug: str, resolution_price: float):
+    """Backfill resolution_price on a closed trade where it was not available at close time."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bot_trades SET resolution_price = %s "
+        "WHERE market_slug = %s AND resolution_price IS NULL",
+        (round(resolution_price, 2), market_slug),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_top_whale_wallets(limit: int = 5) -> list:
     """Return top wallets ranked by win rate (requires at least 2 resolved trades)."""
     conn = get_connection()

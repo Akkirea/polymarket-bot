@@ -415,9 +415,49 @@ class PaperBot:
             conn.commit()
             conn.close()
             db.save_bot_state(self.balance)
+            asyncio.create_task(
+                self._backfill_resolution_price(pos["market_slug"], pos["end_ts"])
+            )
         except Exception as exc:
             import traceback
             print(f"[bot] DB write failed after force-close — trade lost but position cleared: {exc}\n{traceback.format_exc()}", flush=True)
+
+    async def _backfill_resolution_price(self, slug: str, end_ts: float):
+        """Background task: wait until ~15 min past close, then fetch finalPrice
+        from eventMetadata and write it to bot_trades if still missing."""
+        wait = max(0.0, (end_ts + 900) - time.time())
+        print(f"[bot] backfill: waiting {wait:.0f}s to fetch finalPrice for {slug}", flush=True)
+        await asyncio.sleep(wait)
+
+        for attempt in range(3):
+            try:
+                session = await self._get_session()
+                async with session.get(
+                    f"{GAMMA_API}/markets", params={"slug": slug}
+                ) as resp:
+                    markets = await resp.json()
+                if not markets:
+                    break
+                m      = markets[0]
+                events = m.get("events", [])
+                meta   = (events[0].get("eventMetadata") or {}) if events else {}
+                final_price = meta.get("finalPrice")
+                if final_price is not None:
+                    db.update_resolution_price(slug, float(final_price))
+                    print(
+                        f"[bot] backfill: {slug} → finalPrice={float(final_price):.2f} written",
+                        flush=True,
+                    )
+                    return
+                print(
+                    f"[bot] backfill: attempt {attempt + 1}/3 — finalPrice not yet available for {slug}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[bot] backfill error ({slug}) attempt {attempt + 1}/3: {exc}", flush=True)
+            await asyncio.sleep(300)  # wait 5 more minutes before next attempt
+
+        print(f"[bot] backfill: gave up on finalPrice for {slug}", flush=True)
 
     async def _try_resolve(self):
         slug = self.position["market_slug"]
@@ -566,6 +606,9 @@ class PaperBot:
             conn.commit()
             conn.close()
             db.save_bot_state(self.balance)
+            asyncio.create_task(
+                self._backfill_resolution_price(pos["market_slug"], pos["end_ts"])
+            )
         except Exception as exc:
             import traceback
             print(f"[bot] DB write failed after close — trade lost but position cleared: {exc}\n{traceback.format_exc()}", flush=True)
