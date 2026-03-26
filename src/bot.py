@@ -33,10 +33,12 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 2     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 60.0  # USD — min diff to act; accounts for ~$45 push/Data-Streams offset
-CROWD_MIN_CONFIDENCE = 0.60  # outcomePrices must show >= 60% for the signal direction
+PRICE_DIFF_THRESHOLD = 60.0  # USD — kept for reference; not used in entry decision
+CROWD_MIN_CONFIDENCE = 0.60  # kept for reference; crowd filter currently disabled
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
+MOMENTUM_SECONDS     = 15.0  # look-back window (seconds) for entry momentum signal
+MOMENTUM_THRESHOLD   = 20.0  # USD — minimum price move in last 15s required to enter
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -61,7 +63,8 @@ class PaperBot:
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()          # avoid re-entering the same market
         self._market_start_prices: dict = {}     # slug → BTC price at first sight (price_to_beat)
-        self._btc_price_history: list = []       # rolling window of recent BTC prices for ranging filter
+        self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
+        self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
         if self.position:
             print(
@@ -263,17 +266,39 @@ class PaperBot:
     # ── Signals ────────────────────────────────────────────────────────────────
 
     async def _get_btc_price(self) -> Optional[float]:
-        """Fetch live BTC/USD from Chainlink on Polygon and append to rolling history."""
+        """Fetch live BTC/USD from Chainlink on Polygon and append to both history stores."""
         try:
             loop  = asyncio.get_running_loop()
             price = await loop.run_in_executor(None, get_btc_price)
+            now   = time.time()
+
+            # Ranging filter — last N readings (no timestamps needed)
             self._btc_price_history.append(price)
             if len(self._btc_price_history) > RANGING_WINDOW:
                 self._btc_price_history.pop(0)
+
+            # Momentum filter — timestamped, keep last 60s
+            self._btc_price_timestamps.append((now, price))
+            cutoff = now - 60
+            self._btc_price_timestamps = [
+                (t, p) for t, p in self._btc_price_timestamps if t >= cutoff
+            ]
+
             return price
         except Exception as exc:
             print(f"[bot] BTC price error: {exc}", flush=True)
             return None
+
+    def _get_price_n_seconds_ago(self, n: float) -> Optional[float]:
+        """Return the Chainlink reading closest to n seconds ago.
+        Returns None if no reading exists within 10s of the target timestamp."""
+        if not self._btc_price_timestamps:
+            return None
+        target = time.time() - n
+        closest_ts, closest_price = min(self._btc_price_timestamps, key=lambda x: abs(x[0] - target))
+        if abs(closest_ts - target) > 10:
+            return None
+        return closest_price
 
     def _is_ranging(self) -> bool:
         """Return True if the last RANGING_WINDOW prices are all within RANGING_THRESHOLD of each other."""
@@ -287,8 +312,9 @@ class PaperBot:
     ) -> tuple[Optional[str], dict]:
         """
         Enter when both conditions pass:
-        1. Market is not ranging (last 3 readings span > $20)
-        2. abs(live_price - price_to_beat) >= PRICE_DIFF_THRESHOLD ($60)
+        1. Market is not ranging  (last 3 readings span > $20)
+        2. 15s momentum >= $20    (abs(price_now - price_15s_ago) >= MOMENTUM_THRESHOLD)
+        price_to_beat (first-sight cache) is passed through for display only.
         """
         if price_to_beat is None:
             print("[bot] BTC: no start price cached — skipping, no trade", flush=True)
@@ -299,13 +325,6 @@ class PaperBot:
             print("[bot] BTC: unavailable — skipping, no trade", flush=True)
             return None, {"source": "none", "momentum": None}
 
-        diff = live_price - price_to_beat
-
-        print(
-            f"[bot] signals: diff=${diff:+.2f}  live=${live_price:,.2f}  beat=${price_to_beat:,.2f}",
-            flush=True,
-        )
-
         if self._is_ranging():
             spread = max(self._btc_price_history) - min(self._btc_price_history)
             print(
@@ -315,23 +334,42 @@ class PaperBot:
             )
             return None, {"source": "none", "momentum": None}
 
-        if abs(diff) < PRICE_DIFF_THRESHOLD:
+        # 15s momentum: how much did price move in the final entry window?
+        price_ago = self._get_price_n_seconds_ago(MOMENTUM_SECONDS)
+        if price_ago is None:
             print(
-                f"[bot] SKIP: diff ${abs(diff):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
+                f"[bot] SKIP: no price reading from ~{MOMENTUM_SECONDS:.0f}s ago yet",
                 flush=True,
             )
             return None, {"source": "none", "momentum": None}
 
-        direction = "Up" if diff > 0 else "Down"
+        momentum = live_price - price_ago
         print(
-            f"[bot] ENTRY: {direction}  diff=${diff:+.2f}  live=${live_price:,.2f}  beat=${price_to_beat:,.2f}",
+            f"[bot] signals: 15s_momentum=${momentum:+.2f}  "
+            f"now=${live_price:,.2f}  ago=${price_ago:,.2f}  "
+            f"beat(first-sight)=${price_to_beat:,.2f}",
+            flush=True,
+        )
+
+        if abs(momentum) < MOMENTUM_THRESHOLD:
+            print(
+                f"[bot] SKIP: 15s momentum ${abs(momentum):.2f} < threshold ${MOMENTUM_THRESHOLD}",
+                flush=True,
+            )
+            return None, {"source": "none", "momentum": None}
+
+        direction = "Up" if momentum > 0 else "Down"
+        print(
+            f"[bot] ENTRY: {direction}  15s_momentum=${momentum:+.2f}  "
+            f"now=${live_price:,.2f}  beat(first-sight)=${price_to_beat:,.2f}",
             flush=True,
         )
         return direction, {
-            "source":        "chainlink",
+            "source":        "chainlink-momentum",
             "momentum":      direction,
             "live_price":    live_price,
             "price_to_beat": price_to_beat,
+            "momentum_usd":  momentum,
         }
 
     def _signal_market(self, market: dict) -> Optional[str]:
