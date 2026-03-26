@@ -30,15 +30,14 @@ BYBIT_API = "https://api.bybit.com/v5/market"
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 BET_SIZE             = 500.0
 POLL_INTERVAL        = 3     # seconds between ticks
-ENTRY_WINDOW_LO      = 2     # enter when seconds_remaining >= this
+ENTRY_WINDOW_LO      = 6     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 60.0  # USD — kept for reference; not used in entry decision
+PRICE_DIFF_THRESHOLD = 60.0  # USD — initial diff required to consider entry
+REVERSAL_THRESHOLD   = 40.0  # USD — diff must still be >= this after 3s re-check
 CROWD_MIN_CONFIDENCE = 0.60  # kept for reference; crowd filter currently disabled
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
-MOMENTUM_SECONDS     = 15.0  # look-back window (seconds) for entry momentum signal
-MOMENTUM_THRESHOLD   = 20.0  # USD — minimum price move in last 15s required to enter
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -311,10 +310,10 @@ class PaperBot:
         self, market: dict, price_to_beat: Optional[float]
     ) -> tuple[Optional[str], dict]:
         """
-        Enter when both conditions pass:
-        1. Market is not ranging  (last 3 readings span > $20)
-        2. 15s momentum >= $20    (abs(price_now - price_15s_ago) >= MOMENTUM_THRESHOLD)
-        price_to_beat (first-sight cache) is passed through for display only.
+        Two-condition reversal guard:
+        1. abs(live_price - price_to_beat) >= PRICE_DIFF_THRESHOLD ($60)
+        2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD ($40)
+        Ranging filter also applied before the diff check.
         """
         if price_to_beat is None:
             print("[bot] BTC: no start price cached — skipping, no trade", flush=True)
@@ -334,42 +333,51 @@ class PaperBot:
             )
             return None, {"source": "none", "momentum": None}
 
-        # 15s momentum: how much did price move in the final entry window?
-        price_ago = self._get_price_n_seconds_ago(MOMENTUM_SECONDS)
-        if price_ago is None:
-            print(
-                f"[bot] SKIP: no price reading from ~{MOMENTUM_SECONDS:.0f}s ago yet",
-                flush=True,
-            )
-            return None, {"source": "none", "momentum": None}
-
-        momentum = live_price - price_ago
+        # Condition a: strong initial move from first-sight price
+        diff_initial = live_price - price_to_beat
         print(
-            f"[bot] signals: 15s_momentum=${momentum:+.2f}  "
-            f"now=${live_price:,.2f}  ago=${price_ago:,.2f}  "
-            f"beat(first-sight)=${price_to_beat:,.2f}",
-            flush=True,
-        )
-
-        if abs(momentum) < MOMENTUM_THRESHOLD:
-            print(
-                f"[bot] SKIP: 15s momentum ${abs(momentum):.2f} < threshold ${MOMENTUM_THRESHOLD}",
-                flush=True,
-            )
-            return None, {"source": "none", "momentum": None}
-
-        direction = "Up" if momentum > 0 else "Down"
-        print(
-            f"[bot] ENTRY: {direction}  15s_momentum=${momentum:+.2f}  "
+            f"[bot] signals: diff_initial=${diff_initial:+.2f}  "
             f"now=${live_price:,.2f}  beat(first-sight)=${price_to_beat:,.2f}",
             flush=True,
         )
+        if abs(diff_initial) < PRICE_DIFF_THRESHOLD:
+            print(
+                f"[bot] SKIP: diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
+                flush=True,
+            )
+            return None, {"source": "none", "momentum": None}
+
+        direction = "Up" if diff_initial > 0 else "Down"
+
+        # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
+        await asyncio.sleep(3)
+        live_price_b = await self._get_btc_price()
+        if live_price_b is None:
+            print("[bot] SKIP: reversal check fetch failed", flush=True)
+            return None, {"source": "none", "momentum": None}
+
+        diff_final = live_price_b - price_to_beat
+        reversed_direction = (diff_final > 0) != (diff_initial > 0)
+        if reversed_direction or abs(diff_final) < REVERSAL_THRESHOLD:
+            print(
+                f"[bot] SKIP: momentum faded/reversed — "
+                f"initial=${diff_initial:+.2f}  now=${diff_final:+.2f}",
+                flush=True,
+            )
+            return None, {"source": "none", "momentum": None}
+
+        print(
+            f"[bot] ENTRY: {direction}  diff_initial=${diff_initial:+.2f}  "
+            f"diff_final=${diff_final:+.2f}  beat=${price_to_beat:,.2f}",
+            flush=True,
+        )
         return direction, {
-            "source":        "chainlink-momentum",
+            "source":        "chainlink-reversal-guard",
             "momentum":      direction,
-            "live_price":    live_price,
+            "live_price":    live_price_b,
             "price_to_beat": price_to_beat,
-            "momentum_usd":  momentum,
+            "diff_initial":  diff_initial,
+            "diff_final":    diff_final,
         }
 
     def _signal_market(self, market: dict) -> Optional[str]:
