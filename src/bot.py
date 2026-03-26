@@ -367,44 +367,47 @@ class PaperBot:
     async def _force_close(self):
         """Close a position that never received a winner from Polymarket.
         Stake is returned to balance — outcome recorded as 'unresolved'."""
-        pos       = self.position
-        closed_at = datetime.now(timezone.utc).isoformat()
+        # Clear position first — prevents re-entry if DB write fails
+        pos           = self.position
+        self.position = None
+        db.clear_open_position()
 
-        # Refund the full stake; no win, no loss
         self.balance += pos["size"]
+        closed_at = datetime.now(timezone.utc).isoformat()
         print(
             f"[bot] FORCE-CLOSE refund ${pos['size']:.0f} → balance=${self.balance:.2f}",
             flush=True,
         )
 
-        conn = db.get_connection()
-        conn.execute(
-            """INSERT INTO bot_trades
-               (whale_address, market_slug, side, size, entry_price,
-                price_to_beat, resolution_price,
-                outcome, pnl, balance_after, opened_at, closed_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (
-                STRATEGY_TAG,
-                pos["market_slug"],
-                pos["side"],
-                pos["size"],
-                round(pos.get("entry_price") or 0.5, 4),
-                round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
-                None,
-                "unresolved",
-                0.0,
-                round(self.balance, 2),
-                pos["opened_at"],
-                closed_at,
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        db.save_bot_state(self.balance)
-        db.clear_open_position()
-        self.position = None
+        try:
+            conn = db.get_connection()
+            conn.execute(
+                """INSERT INTO bot_trades
+                   (whale_address, market_slug, side, size, entry_price,
+                    price_to_beat, resolution_price,
+                    outcome, pnl, balance_after, opened_at, closed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    STRATEGY_TAG,
+                    pos["market_slug"],
+                    pos["side"],
+                    pos["size"],
+                    round(pos.get("entry_price") or 0.5, 4),
+                    round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
+                    None,
+                    "unresolved",
+                    0.0,
+                    round(self.balance, 2),
+                    pos["opened_at"],
+                    closed_at,
+                ),
+            )
+            conn.commit()
+            conn.close()
+            db.save_bot_state(self.balance)
+        except Exception as exc:
+            import traceback
+            print(f"[bot] DB write failed after force-close — trade lost but position cleared: {exc}\n{traceback.format_exc()}", flush=True)
 
     async def _try_resolve(self):
         slug = self.position["market_slug"]
@@ -500,14 +503,11 @@ class PaperBot:
 
     async def _close_position(self, winner: str, resolution_price: Optional[float] = None,
                               poly_price_to_beat: Optional[float] = None):
-        import traceback
-        print(
-            f"[bot] _close_position called  winner={winner!r}  "
-            f"resolution_price={resolution_price}  poly_ptb={poly_price_to_beat}",
-            flush=True,
-        )
-        print("[bot] _close_position call stack:\n" + "".join(traceback.format_stack()), flush=True)
-        pos         = self.position
+        # Snapshot and clear position FIRST — prevents re-entry if DB write fails
+        pos           = self.position
+        self.position = None
+        db.clear_open_position()
+
         won         = pos["side"] == winner
         size        = pos["size"]
         entry_price = pos.get("entry_price", 0.5)
@@ -527,37 +527,39 @@ class PaperBot:
 
         print(
             f"[bot] CLOSE {pos['side']:>4}  winner={winner}"
-            f"  pnl=${pnl:+.2f}  balance=${self.balance:.2f}"
+            f"  pnl=${pnl:+.2f}  balance=${self.balance:.2f}",
+            flush=True,
         )
 
-        conn = db.get_connection()
-        conn.execute(
-            """INSERT INTO bot_trades
-               (whale_address, market_slug, side, size, entry_price,
-                price_to_beat, resolution_price,
-                outcome, pnl, balance_after, opened_at, closed_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (
-                STRATEGY_TAG,
-                pos["market_slug"],
-                pos["side"],
-                pos["size"],
-                round(entry_price, 4),
-                round(pos.get("price_to_beat"), 2) if pos.get("price_to_beat") else None,
-                round(resolution_price, 2) if resolution_price else None,
-                winner,
-                round(pnl, 2),
-                round(self.balance, 2),
-                pos["opened_at"],
-                closed_at,
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        db.save_bot_state(self.balance)
-        db.clear_open_position()
-        self.position = None
+        try:
+            conn = db.get_connection()
+            conn.execute(
+                """INSERT INTO bot_trades
+                   (whale_address, market_slug, side, size, entry_price,
+                    price_to_beat, resolution_price,
+                    outcome, pnl, balance_after, opened_at, closed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    STRATEGY_TAG,
+                    pos["market_slug"],
+                    pos["side"],
+                    pos["size"],
+                    round(entry_price, 4),
+                    round(pos.get("price_to_beat"), 2) if pos.get("price_to_beat") else None,
+                    round(resolution_price, 2) if resolution_price else None,
+                    winner,
+                    round(pnl, 2),
+                    round(self.balance, 2),
+                    pos["opened_at"],
+                    closed_at,
+                ),
+            )
+            conn.commit()
+            conn.close()
+            db.save_bot_state(self.balance)
+        except Exception as exc:
+            import traceback
+            print(f"[bot] DB write failed after close — trade lost but position cleared: {exc}\n{traceback.format_exc()}", flush=True)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
