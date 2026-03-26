@@ -61,6 +61,7 @@ class PaperBot:
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()          # avoid re-entering the same market
+        self._evaluating:    bool = False         # True while reversal guard is mid-sleep
         self._market_start_prices: dict = {}     # slug → BTC price at first sight (price_to_beat)
         self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
@@ -161,6 +162,11 @@ class PaperBot:
             elif now_ts >= end_ts:
                 await self._try_resolve()
             return  # one position at a time
+
+        # Reversal guard in progress — don't scan until it completes
+        if self._evaluating:
+            print("[bot] _tick: reversal check in progress — skipping scan", flush=True)
+            return
 
         # Scan active BTC 5m markets for an entry window
         markets = await self._fetch_active_markets()
@@ -319,66 +325,70 @@ class PaperBot:
             print("[bot] BTC: no start price cached — skipping, no trade", flush=True)
             return None, {"source": "none", "momentum": None}
 
-        live_price = await self._get_btc_price()
-        if live_price is None:
-            print("[bot] BTC: unavailable — skipping, no trade", flush=True)
-            return None, {"source": "none", "momentum": None}
+        self._evaluating = True
+        try:
+            live_price = await self._get_btc_price()
+            if live_price is None:
+                print("[bot] BTC: unavailable — skipping, no trade", flush=True)
+                return None, {"source": "none", "momentum": None}
 
-        if self._is_ranging():
-            spread = max(self._btc_price_history) - min(self._btc_price_history)
+            if self._is_ranging():
+                spread = max(self._btc_price_history) - min(self._btc_price_history)
+                print(
+                    f"[bot] SKIP: ranging market — last {RANGING_WINDOW} readings span ${spread:.2f} "
+                    f"(threshold ${RANGING_THRESHOLD})",
+                    flush=True,
+                )
+                return None, {"source": "none", "momentum": None}
+
+            # Condition a: strong initial move from first-sight price
+            diff_initial = live_price - price_to_beat
             print(
-                f"[bot] SKIP: ranging market — last {RANGING_WINDOW} readings span ${spread:.2f} "
-                f"(threshold ${RANGING_THRESHOLD})",
+                f"[bot] signals: diff_initial=${diff_initial:+.2f}  "
+                f"now=${live_price:,.2f}  beat(first-sight)=${price_to_beat:,.2f}",
                 flush=True,
             )
-            return None, {"source": "none", "momentum": None}
+            if abs(diff_initial) < PRICE_DIFF_THRESHOLD:
+                print(
+                    f"[bot] SKIP: diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
+                    flush=True,
+                )
+                return None, {"source": "none", "momentum": None}
 
-        # Condition a: strong initial move from first-sight price
-        diff_initial = live_price - price_to_beat
-        print(
-            f"[bot] signals: diff_initial=${diff_initial:+.2f}  "
-            f"now=${live_price:,.2f}  beat(first-sight)=${price_to_beat:,.2f}",
-            flush=True,
-        )
-        if abs(diff_initial) < PRICE_DIFF_THRESHOLD:
+            direction = "Up" if diff_initial > 0 else "Down"
+
+            # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
+            await asyncio.sleep(3)
+            live_price_b = await self._get_btc_price()
+            if live_price_b is None:
+                print("[bot] SKIP: reversal check fetch failed", flush=True)
+                return None, {"source": "none", "momentum": None}
+
+            diff_final = live_price_b - price_to_beat
+            reversed_direction = (diff_final > 0) != (diff_initial > 0)
+            if reversed_direction or abs(diff_final) < REVERSAL_THRESHOLD:
+                print(
+                    f"[bot] SKIP: momentum faded/reversed — "
+                    f"initial=${diff_initial:+.2f}  now=${diff_final:+.2f}",
+                    flush=True,
+                )
+                return None, {"source": "none", "momentum": None}
+
             print(
-                f"[bot] SKIP: diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
+                f"[bot] ENTRY: {direction}  diff_initial=${diff_initial:+.2f}  "
+                f"diff_final=${diff_final:+.2f}  beat=${price_to_beat:,.2f}",
                 flush=True,
             )
-            return None, {"source": "none", "momentum": None}
-
-        direction = "Up" if diff_initial > 0 else "Down"
-
-        # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
-        await asyncio.sleep(3)
-        live_price_b = await self._get_btc_price()
-        if live_price_b is None:
-            print("[bot] SKIP: reversal check fetch failed", flush=True)
-            return None, {"source": "none", "momentum": None}
-
-        diff_final = live_price_b - price_to_beat
-        reversed_direction = (diff_final > 0) != (diff_initial > 0)
-        if reversed_direction or abs(diff_final) < REVERSAL_THRESHOLD:
-            print(
-                f"[bot] SKIP: momentum faded/reversed — "
-                f"initial=${diff_initial:+.2f}  now=${diff_final:+.2f}",
-                flush=True,
-            )
-            return None, {"source": "none", "momentum": None}
-
-        print(
-            f"[bot] ENTRY: {direction}  diff_initial=${diff_initial:+.2f}  "
-            f"diff_final=${diff_final:+.2f}  beat=${price_to_beat:,.2f}",
-            flush=True,
-        )
-        return direction, {
-            "source":        "chainlink-reversal-guard",
-            "momentum":      direction,
-            "live_price":    live_price_b,
-            "price_to_beat": price_to_beat,
-            "diff_initial":  diff_initial,
-            "diff_final":    diff_final,
-        }
+            return direction, {
+                "source":        "chainlink-reversal-guard",
+                "momentum":      direction,
+                "live_price":    live_price_b,
+                "price_to_beat": price_to_beat,
+                "diff_initial":  diff_initial,
+                "diff_final":    diff_final,
+            }
+        finally:
+            self._evaluating = False
 
     def _signal_market(self, market: dict) -> Optional[str]:
         """
