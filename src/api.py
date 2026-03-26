@@ -171,15 +171,19 @@ async def stop_bot():
 
 @app.post("/api/bot/set-balance")
 async def set_balance(body: dict):
-    """Sync both in-memory and DB balance to a given value.
-    Body: { "balance": 10000 }
+    """Sync in-memory balance and optionally P&L without a full reset.
+    Body: { "balance": 10000, "pnl": -29.13 }  — pnl is optional.
     """
-    new_balance = float(body.get("balance", 0))
+    if "balance" not in body:
+        raise HTTPException(status_code=400, detail="balance is required")
+    new_balance = float(body["balance"])
     if new_balance < 0:
         raise HTTPException(status_code=400, detail="Balance must be non-negative")
     bot.balance = new_balance
     db.save_bot_state(new_balance)
-    return {"ok": True, "balance": new_balance}
+    if "pnl" in body:
+        bot.total_pnl = float(body["pnl"])
+    return {"ok": True, "balance": bot.balance, "pnl": bot.total_pnl}
 
 
 @app.post("/api/bot/reset")
