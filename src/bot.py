@@ -38,6 +38,10 @@ UP_DIFF_THRESHOLD    = 30.0  # USD — initial diff required for UP entries
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
+CARRY_ENTRY_LO       = 270   # seconds_remaining lower bound for momentum-carry (first 30s)
+CARRY_ENTRY_HI       = 295   # seconds_remaining upper bound for momentum-carry
+CARRY_DIFF_THRESHOLD = 100.0 # min abs(prev_final - prev_beat) to trigger carry
+CARRY_CROWD_MAX      = 0.60  # tighter upper bound for carry (early entry)
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
 
@@ -62,10 +66,12 @@ class PaperBot:
         self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
-        self._entered_slugs: set = set()          # avoid re-entering the same market
-        self._evaluating:    bool = False         # True while reversal guard is mid-sleep
-        self._final_price_cache: dict = {}        # {end_ts: final_price} for recent closed markets
-        self._market_start_prices: dict = {}     # slug → BTC price at first sight (price_to_beat)
+        self._entered_slugs: set = set()           # avoid re-entering the same market
+        self._carry_checked_slugs: set = set()    # slugs already evaluated for momentum-carry
+        self._evaluating:    bool = False          # True while reversal guard is mid-sleep
+        self._final_price_cache:    dict = {}      # {end_ts: finalPrice} for recent closed markets
+        self._price_to_beat_cache:  dict = {}      # {end_ts: priceToBeat} for carry signal
+        self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
@@ -166,14 +172,11 @@ class PaperBot:
             elif now_ts >= end_ts:
                 await self._try_resolve(pos)
 
-        # Entry: skip if at capacity or mid-evaluation
+        # Entry: skip if at capacity
         if len(self.positions) >= 2:
             return
-        if self._evaluating:
-            print("[bot] _tick: reversal check in progress — skipping scan", flush=True)
-            return
 
-        # Scan active BTC 5m markets for an entry window
+        # Scan active BTC 5m markets
         markets = await self._fetch_active_markets()
         now = time.time()
         slugs = [m.get("slug", "?") for m in markets]
@@ -181,7 +184,7 @@ class PaperBot:
 
         for market in markets:
             slug = market.get("slug", "")
-            if not slug or slug in self._entered_slugs:
+            if not slug:
                 continue
 
             end_ts = _extract_end_ts(slug)
@@ -191,8 +194,8 @@ class PaperBot:
             seconds_remaining = end_ts - now
             print(f"[bot] market {slug} — {seconds_remaining:.1f}s remaining")
 
-            # Cache BTC price at first sight — this becomes price_to_beat for comparison
-            if slug not in self._market_start_prices:
+            # Cache BTC price at first sight — used by reversal-guard as baseline
+            if slug not in self._market_start_prices and slug not in self._entered_slugs:
                 start_price = await self._get_btc_price()
                 if start_price is not None:
                     self._market_start_prices[slug] = start_price
@@ -200,49 +203,70 @@ class PaperBot:
                 else:
                     print(f"[bot] BTC price unavailable — cannot cache start price for {slug}", flush=True)
 
-            if not (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI):
-                continue
+            # ── Strategy 1: momentum-carry (first 30s of market)
+            if (CARRY_ENTRY_LO <= seconds_remaining <= CARRY_ENTRY_HI
+                    and slug not in self._entered_slugs
+                    and slug not in self._carry_checked_slugs):
+                self._carry_checked_slugs.add(slug)
+                carry_result = await self._evaluate_carry(market, slug)
+                if carry_result is not None:
+                    direction, entry_price, carry_diff = carry_result
+                    price_to_beat = self._final_price_cache.get(int(slug.split("-")[-1]))
+                    self._entered_slugs.add(slug)
+                    await self._open_position(
+                        slug, direction, entry_price, end_ts,
+                        price_to_beat=price_to_beat,
+                        diff_at_entry=carry_diff,
+                        seconds_remaining=seconds_remaining,
+                        strategy="momentum-carry",
+                    )
+                if len(self.positions) >= 2:
+                    break
 
-            # Use the price cached at first sight as the baseline
-            price_to_beat = self._market_start_prices.get(slug)
-            print(
-                f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining  "
-                f"price_to_beat=${price_to_beat:,.2f}" if price_to_beat else
-                f"[bot] Entry window: {slug}  {seconds_remaining:.1f}s remaining  price_to_beat=None",
-                flush=True,
-            )
-            direction, signals = await self._evaluate_signals(market, price_to_beat)
-
-            # Clean up cached price and mark slug as seen
-            self._market_start_prices.pop(slug, None)
-            self._entered_slugs.add(slug)
-
-            if direction is None:
-                print(f"[bot] SKIP: no clear signal — {signals}", flush=True)
-                continue
-
-            entry_price = _side_price(market, direction)
-            if not (CROWD_MIN <= entry_price <= CROWD_MAX):
+            # ── Strategy 2: chainlink-reversal-guard (last 6-15s of market)
+            if (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI
+                    and slug not in self._entered_slugs):
+                if self._evaluating:
+                    print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
+                    continue
+                price_to_beat = self._market_start_prices.get(slug)
                 print(
-                    f"[bot] SKIP: {direction} price={entry_price:.3f} outside "
-                    f"profitability range [{CROWD_MIN}, {CROWD_MAX}]",
+                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s  "
+                    f"ref=${price_to_beat:,.2f}" if price_to_beat else
+                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s  ref=None",
                     flush=True,
                 )
-                continue
+                direction, signals = await self._evaluate_signals(market, price_to_beat)
+                self._market_start_prices.pop(slug, None)
+                self._entered_slugs.add(slug)
 
-            diff_at_entry = signals.get("diff_initial")
-            print(
-                f"[bot] SIGNAL ENTRY: {direction} on {slug} — "
-                f"source={signals['source']} price={entry_price:.3f} "
-                f"diff=${diff_at_entry:+.2f} secs={seconds_remaining:.1f}",
-                flush=True,
-            )
-            await self._open_position(
-                slug, direction, entry_price, end_ts, price_to_beat,
-                diff_at_entry=diff_at_entry,
-                seconds_remaining=seconds_remaining,
-            )
-            break  # one entry evaluation at a time
+                if direction is None:
+                    print(f"[bot] SKIP: no clear signal — {signals}", flush=True)
+                    continue
+
+                entry_price = _side_price(market, direction)
+                if not (CROWD_MIN <= entry_price <= CROWD_MAX):
+                    print(
+                        f"[bot] SKIP: {direction} price={entry_price:.3f} outside "
+                        f"profitability range [{CROWD_MIN}, {CROWD_MAX}]",
+                        flush=True,
+                    )
+                    continue
+
+                diff_at_entry = signals.get("diff_initial")
+                print(
+                    f"[bot] reversal-guard ENTRY: {direction} on {slug}  "
+                    f"price={entry_price:.3f}  diff=${diff_at_entry:+.2f}  secs={seconds_remaining:.1f}",
+                    flush=True,
+                )
+                await self._open_position(
+                    slug, direction, entry_price, end_ts,
+                    price_to_beat=price_to_beat,
+                    diff_at_entry=diff_at_entry,
+                    seconds_remaining=seconds_remaining,
+                    strategy="chainlink-reversal-guard",
+                )
+                break
 
     # ── Active markets ─────────────────────────────────────────────────────────
 
@@ -297,7 +321,7 @@ class PaperBot:
         session  = await self._get_session()
         for i in range(1, 7):
             end_ts = boundary - (i - 1) * 300
-            if end_ts in self._final_price_cache:
+            if end_ts in self._final_price_cache and end_ts in self._price_to_beat_cache:
                 continue
             slug = f"btc-updown-5m-{end_ts - 300}"
             try:
@@ -311,11 +335,18 @@ class PaperBot:
                     continue
                 events = markets[0].get("events", [])
                 meta   = (events[0].get("eventMetadata") or {}) if events else {}
-                if meta.get("finalPrice") is not None:
+                if meta.get("finalPrice") is not None and end_ts not in self._final_price_cache:
                     fp = float(meta["finalPrice"])
                     self._final_price_cache[end_ts] = fp
                     print(
                         f"[bot] finalPrice cache: {slug} end_ts={end_ts} → ${fp:,.2f}",
+                        flush=True,
+                    )
+                if meta.get("priceToBeat") is not None and end_ts not in self._price_to_beat_cache:
+                    ptb = float(meta["priceToBeat"])
+                    self._price_to_beat_cache[end_ts] = ptb
+                    print(
+                        f"[bot] priceToBeat cache: {slug} end_ts={end_ts} → ${ptb:,.2f}",
                         flush=True,
                     )
             except Exception as exc:
@@ -362,6 +393,56 @@ class PaperBot:
             return False  # not enough data yet — don't filter
         spread = max(self._btc_price_history) - min(self._btc_price_history)
         return spread < RANGING_THRESHOLD
+
+    async def _evaluate_carry(self, market: dict, slug: str) -> Optional[tuple]:
+        """Momentum-carry strategy: if the previous 5-min window had a strong directional
+        move (abs(finalPrice - priceToBeat) >= CARRY_DIFF_THRESHOLD), enter in the same
+        direction at the start of the new window."""
+        start_ts    = int(slug.split("-")[-1])
+        prev_end_ts = start_ts  # previous window ended when current window started
+        prev_final  = self._final_price_cache.get(prev_end_ts)
+        prev_beat   = self._price_to_beat_cache.get(prev_end_ts)
+
+        if prev_final is None or prev_beat is None:
+            print(
+                f"[bot] carry SKIP: no prev data for {slug}  "
+                f"prev_end_ts={prev_end_ts}  "
+                f"final={'✓' if prev_final else '✗'}  beat={'✓' if prev_beat else '✗'}",
+                flush=True,
+            )
+            return None
+
+        carry_diff = prev_final - prev_beat
+        print(
+            f"[bot] carry: {slug}  prev_final={prev_final:.2f}  prev_beat={prev_beat:.2f}  "
+            f"carry_diff={carry_diff:+.2f}",
+            flush=True,
+        )
+
+        if abs(carry_diff) < CARRY_DIFF_THRESHOLD:
+            print(
+                f"[bot] carry SKIP: diff ${abs(carry_diff):.2f} < threshold ${CARRY_DIFF_THRESHOLD}",
+                flush=True,
+            )
+            return None
+
+        direction   = "Up" if carry_diff > 0 else "Down"
+        entry_price = _side_price(market, direction)
+
+        if not (CROWD_MIN <= entry_price <= CARRY_CROWD_MAX):
+            print(
+                f"[bot] carry SKIP: {direction} price={entry_price:.3f} outside "
+                f"[{CROWD_MIN}, {CARRY_CROWD_MAX}]",
+                flush=True,
+            )
+            return None
+
+        print(
+            f"[bot] carry ENTRY: {direction}  carry_diff={carry_diff:+.2f}  "
+            f"price={entry_price:.3f}",
+            flush=True,
+        )
+        return direction, entry_price, carry_diff
 
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float]
@@ -466,22 +547,24 @@ class PaperBot:
     async def _open_position(self, slug: str, side: str, entry_price: float, end_ts: float,
                              price_to_beat: Optional[float] = None,
                              diff_at_entry: Optional[float] = None,
-                             seconds_remaining: Optional[float] = None):
+                             seconds_remaining: Optional[float] = None,
+                             strategy: Optional[str] = None):
         if self.balance < BET_SIZE:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
             return
 
         self.balance -= BET_SIZE
         pos = {
-            "market_slug":      slug,
-            "side":             side,
-            "size":             BET_SIZE,
-            "entry_price":      entry_price,
-            "price_to_beat":    price_to_beat,
-            "end_ts":           end_ts,
-            "opened_at":        datetime.now(timezone.utc).isoformat(),
-            "diff_at_entry":    diff_at_entry,
+            "market_slug":       slug,
+            "side":              side,
+            "size":              BET_SIZE,
+            "entry_price":       entry_price,
+            "price_to_beat":     price_to_beat,
+            "end_ts":            end_ts,
+            "opened_at":         datetime.now(timezone.utc).isoformat(),
+            "diff_at_entry":     diff_at_entry,
             "seconds_remaining": seconds_remaining,
+            "strategy":          strategy,
         }
         self.positions.append(pos)
         db.save_open_position(pos)
@@ -513,8 +596,9 @@ class PaperBot:
                 """INSERT INTO bot_trades
                    (whale_address, market_slug, side, size, entry_price,
                     price_to_beat, poly_price_to_beat, resolution_price,
-                    outcome, pnl, balance_after, opened_at, closed_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    outcome, pnl, balance_after, diff_at_entry, seconds_remaining,
+                    strategy, opened_at, closed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     STRATEGY_TAG,
                     pos["market_slug"],
@@ -527,6 +611,9 @@ class PaperBot:
                     "unresolved",
                     0.0,
                     round(self.balance, 2),
+                    round(pos["diff_at_entry"], 2) if pos.get("diff_at_entry") is not None else None,
+                    round(pos["seconds_remaining"], 1) if pos.get("seconds_remaining") is not None else None,
+                    pos.get("strategy"),
                     pos["opened_at"],
                     closed_at,
                 ),
@@ -714,8 +801,9 @@ class PaperBot:
                 """INSERT INTO bot_trades
                    (whale_address, market_slug, side, size, entry_price,
                     price_to_beat, poly_price_to_beat, resolution_price,
-                    outcome, pnl, balance_after, opened_at, closed_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    outcome, pnl, balance_after, diff_at_entry, seconds_remaining,
+                    strategy, opened_at, closed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     STRATEGY_TAG,
                     pos["market_slug"],
@@ -728,6 +816,9 @@ class PaperBot:
                     winner,
                     round(pnl, 2),
                     round(self.balance, 2),
+                    round(pos["diff_at_entry"], 2) if pos.get("diff_at_entry") is not None else None,
+                    round(pos["seconds_remaining"], 1) if pos.get("seconds_remaining") is not None else None,
+                    pos.get("strategy"),
                     pos["opened_at"],
                     closed_at,
                 ),
