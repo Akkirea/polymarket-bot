@@ -518,14 +518,15 @@ class PaperBot:
         print(f"[bot] backfill: gave up on finalPrice for {slug}", flush=True)
 
     async def _try_resolve(self):
-        slug = self.position["market_slug"]
-        winner, resolution_price, poly_price_to_beat = await self._resolve_market(slug)
+        slug   = self.position["market_slug"]
+        end_ts = self.position["end_ts"]
+        winner, resolution_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
         if winner is None:
             print(f"[bot] {slug} not resolved yet — will retry")
             return
         await self._close_position(winner, resolution_price, poly_price_to_beat)
 
-    async def _resolve_market(self, slug: str) -> tuple[Optional[str], Optional[float], Optional[float]]:
+    async def _resolve_market(self, slug: str, end_ts: float) -> tuple[Optional[str], Optional[float], Optional[float]]:
         """Return (winner, final_price, price_to_beat) when market.closed == True
         and market.winner is set. Uses Polymarket's authoritative fields directly —
         no outcomePrices inference."""
@@ -582,8 +583,17 @@ class PaperBot:
                 flush=True,
             )
         else:
-            # Fallback: find which outcome index has price >= 0.99, then look up
-            # the label at that index. Order is not assumed — label comes from outcomes[].
+            minutes_past = (time.time() - end_ts) / 60
+            if minutes_past < 25:
+                print(
+                    f"[bot] resolve: {slug} — finalPrice not yet available "
+                    f"({minutes_past:.1f} min past close, waiting for eventMetadata)",
+                    flush=True,
+                )
+                return None, None, None
+
+            # 25+ min elapsed — finalPrice isn't coming; fall back to outcomePrices
+            # Order is not assumed — label comes from outcomes[i].
             try:
                 outcomes       = _json.loads(m.get("outcomes", "[]"))
                 outcome_prices = _json.loads(m.get("outcomePrices", "[]"))
@@ -596,7 +606,7 @@ class PaperBot:
 
             if winner:
                 print(
-                    f"[bot] resolved via outcomePrices: {slug} → {winner}",
+                    f"[bot] resolved via outcomePrices (25+ min fallback): {slug} → {winner}",
                     flush=True,
                 )
             else:
