@@ -212,6 +212,16 @@ def init_db():
             opened_at     TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS bot_open_positions (
+            market_slug   TEXT PRIMARY KEY,
+            side          TEXT NOT NULL,
+            size          REAL NOT NULL,
+            entry_price   REAL NOT NULL,
+            price_to_beat REAL,
+            end_ts        REAL NOT NULL,
+            opened_at     TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_whale_wallets_winrate ON whale_wallets(win_rate DESC);
         CREATE INDEX IF NOT EXISTS idx_whale_trades_wallet   ON whale_trades(wallet_address)
     """)
@@ -436,14 +446,13 @@ def save_bot_state(balance: float):
 
 
 def save_open_position(pos: dict):
-    """Upsert the single in-flight position row."""
+    """Upsert a position row keyed by market_slug (supports up to 2 concurrent positions)."""
     conn = get_connection()
     conn.execute(
-        """INSERT INTO bot_open_position
-               (id, market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at)
-               VALUES (1, %s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT(id) DO UPDATE SET
-               market_slug   = excluded.market_slug,
+        """INSERT INTO bot_open_positions
+               (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT(market_slug) DO UPDATE SET
                side          = excluded.side,
                size          = excluded.size,
                entry_price   = excluded.entry_price,
@@ -451,9 +460,9 @@ def save_open_position(pos: dict):
                end_ts        = excluded.end_ts,
                opened_at     = excluded.opened_at"""
         if _USE_PG else
-        """INSERT OR REPLACE INTO bot_open_position
-               (id, market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at)
-               VALUES (1, %s, %s, %s, %s, %s, %s, %s)""",
+        """INSERT OR REPLACE INTO bot_open_positions
+               (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
         (
             pos["market_slug"],
             pos["side"],
@@ -468,31 +477,32 @@ def save_open_position(pos: dict):
     conn.close()
 
 
-def load_open_position() -> Optional[dict]:
-    """Return the persisted open position, or None if none exists."""
+def load_open_positions() -> list:
+    """Return all persisted open positions (up to 2)."""
     conn = get_connection()
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at "
-        "FROM bot_open_position WHERE id = 1"
-    ).fetchone()
+        "FROM bot_open_positions"
+    ).fetchall()
     conn.close()
-    if not row:
-        return None
-    return {
-        "market_slug":   row["market_slug"],
-        "side":          row["side"],
-        "size":          float(row["size"]),
-        "entry_price":   float(row["entry_price"]),
-        "price_to_beat": float(row["price_to_beat"]) if row["price_to_beat"] is not None else None,
-        "end_ts":        float(row["end_ts"]),
-        "opened_at":     row["opened_at"],
-    }
+    return [
+        {
+            "market_slug":   row["market_slug"],
+            "side":          row["side"],
+            "size":          float(row["size"]),
+            "entry_price":   float(row["entry_price"]),
+            "price_to_beat": float(row["price_to_beat"]) if row["price_to_beat"] is not None else None,
+            "end_ts":        float(row["end_ts"]),
+            "opened_at":     row["opened_at"],
+        }
+        for row in rows
+    ]
 
 
-def clear_open_position():
-    """Remove the persisted open position (called on close or force-close)."""
+def clear_open_position(market_slug: str):
+    """Remove a specific open position by market_slug."""
     conn = get_connection()
-    conn.execute("DELETE FROM bot_open_position WHERE id = 1")
+    conn.execute("DELETE FROM bot_open_positions WHERE market_slug = %s", (market_slug,))
     conn.commit()
     conn.close()
 

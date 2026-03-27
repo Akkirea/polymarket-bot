@@ -53,12 +53,12 @@ class PaperBot:
     def __init__(self):
         db.init_db()
         state = db.load_bot_state()
-        self.balance:     float          = state["balance"]
-        self.position:    Optional[dict] = db.load_open_position()
-        self.wins:        int            = 0
-        self.losses:      int            = 0
-        self.total_pnl:   float          = 0.0
-        self.running:     bool           = False
+        self.balance:     float = state["balance"]
+        self.positions:   list  = db.load_open_positions()   # up to 2 concurrent positions
+        self.wins:        int   = 0
+        self.losses:      int   = 0
+        self.total_pnl:   float = 0.0
+        self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()          # avoid re-entering the same market
@@ -68,14 +68,13 @@ class PaperBot:
         self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
-        if self.position:
+        for pos in self.positions:
             print(
-                f"[bot] Restored open position from DB: {self.position['side']} "
-                f"{self.position['market_slug']}  end_ts={self.position['end_ts']}",
+                f"[bot] Restored open position from DB: {pos['side']} "
+                f"{pos['market_slug']}  end_ts={pos['end_ts']}",
                 flush=True,
             )
-            # Prevent re-entry into the restored slug
-            self._entered_slugs.add(self.position["market_slug"])
+            self._entered_slugs.add(pos["market_slug"])
 
     # ── Session ────────────────────────────────────────────────────────────────
 
@@ -122,7 +121,7 @@ class PaperBot:
             "losses":           self.losses,
             "win_rate":         round(self.wins / total, 4) if total else 0.0,
             "pnl":              round(self.total_pnl, 2),
-            "current_position": self.position,
+            "open_positions":   self.positions,
         }
 
     def get_recent_trades(self, n: int = 5) -> list:
@@ -148,26 +147,27 @@ class PaperBot:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _tick(self):
-        print(f"[bot] _tick called  position={'HELD' if self.position else 'none'}", flush=True)
+        print(f"[bot] _tick called  positions={len(self.positions)}", flush=True)
         # Continuously collect finalPrices for recent closed markets, independent of position state
         asyncio.create_task(self._collect_final_prices())
-        # If holding a position, try to resolve once the market window has closed
-        if self.position:
-            end_ts = self.position.get("end_ts", 0)
-            now_ts = time.time()
+
+        # Resolve / force-close all held positions
+        now_ts = time.time()
+        for pos in list(self.positions):  # snapshot — list mutates during iteration
+            end_ts = pos.get("end_ts", 0)
             if now_ts >= end_ts + 1200:
-                # 20 minutes past close — finalPrice still not available; force-close
                 print(
-                    f"[bot] FORCE-CLOSE: {self.position['market_slug']} "
+                    f"[bot] FORCE-CLOSE: {pos['market_slug']} "
                     f"— {int(now_ts - end_ts)}s past close with no resolution",
                     flush=True,
                 )
-                await self._force_close()
+                await self._force_close(pos)
             elif now_ts >= end_ts:
-                await self._try_resolve()
-            return  # one position at a time
+                await self._try_resolve(pos)
 
-        # Reversal guard in progress — don't scan until it completes
+        # Entry: skip if at capacity or mid-evaluation
+        if len(self.positions) >= 2:
+            return
         if self._evaluating:
             print("[bot] _tick: reversal check in progress — skipping scan", flush=True)
             return
@@ -455,7 +455,7 @@ class PaperBot:
             return
 
         self.balance -= BET_SIZE
-        self.position = {
+        pos = {
             "market_slug":   slug,
             "side":          side,
             "size":          BET_SIZE,
@@ -464,21 +464,22 @@ class PaperBot:
             "end_ts":        end_ts,
             "opened_at":     datetime.now(timezone.utc).isoformat(),
         }
-        db.save_open_position(self.position)
+        self.positions.append(pos)
+        db.save_open_position(pos)
         db.save_bot_state(self.balance)
         print(
             f"[bot] OPEN  {side:>4}  ${BET_SIZE:.0f}  {slug}"
-            f"  entry={entry_price:.3f}  balance=${self.balance:.2f}",
+            f"  entry={entry_price:.3f}  balance=${self.balance:.2f}  "
+            f"positions={len(self.positions)}",
             flush=True,
         )
 
-    async def _force_close(self):
+    async def _force_close(self, pos: dict):
         """Close a position that never received a winner from Polymarket.
         Stake is returned to balance — outcome recorded as 'unresolved'."""
-        # Clear position first — prevents re-entry if DB write fails
-        pos           = self.position
-        self.position = None
-        db.clear_open_position()
+        # Remove from list first — prevents re-entry if DB write fails
+        self.positions = [p for p in self.positions if p["market_slug"] != pos["market_slug"]]
+        db.clear_open_position(pos["market_slug"])
 
         self.balance += pos["size"]
         closed_at = datetime.now(timezone.utc).isoformat()
@@ -558,14 +559,14 @@ class PaperBot:
 
         print(f"[bot] backfill: gave up on finalPrice for {slug}", flush=True)
 
-    async def _try_resolve(self):
-        slug   = self.position["market_slug"]
-        end_ts = self.position["end_ts"]
+    async def _try_resolve(self, pos: dict):
+        slug   = pos["market_slug"]
+        end_ts = pos["end_ts"]
         winner, resolution_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
         if winner is None:
             print(f"[bot] {slug} not resolved yet — will retry")
             return
-        await self._close_position(winner, resolution_price, poly_price_to_beat)
+        await self._close_position(pos, winner, resolution_price, poly_price_to_beat)
 
     async def _resolve_market(self, slug: str, end_ts: float) -> tuple[Optional[str], Optional[float], Optional[float]]:
         """Return (winner, final_price, price_to_beat) when market.closed == True
@@ -659,12 +660,11 @@ class PaperBot:
 
         return winner, final_price, price_to_beat
 
-    async def _close_position(self, winner: str, resolution_price: Optional[float] = None,
+    async def _close_position(self, pos: dict, winner: str, resolution_price: Optional[float] = None,
                               poly_price_to_beat: Optional[float] = None):
-        # Snapshot and clear position FIRST — prevents re-entry if DB write fails
-        pos           = self.position
-        self.position = None
-        db.clear_open_position()
+        # Remove from list FIRST — prevents re-entry if DB write fails
+        self.positions = [p for p in self.positions if p["market_slug"] != pos["market_slug"]]
+        db.clear_open_position(pos["market_slug"])
 
         won         = pos["side"] == winner
         size        = pos["size"]
