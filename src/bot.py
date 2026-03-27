@@ -156,7 +156,7 @@ class PaperBot:
     async def _tick(self):
         print(f"[bot] _tick called  positions={len(self.positions)}", flush=True)
         # Continuously collect finalPrices for recent closed markets, independent of position state
-        asyncio.create_task(self._collect_final_prices())
+        await self._collect_final_prices()
 
         # Resolve / force-close all held positions
         now_ts = time.time()
@@ -347,7 +347,7 @@ class PaperBot:
                     print(f"[bot] finalPrice cache: {slug} end_ts={end_ts} → ${fp:,.2f}", flush=True)
 
                 # Try eventMetadata first, then top-level market object as fallback
-                ptb_raw = meta.get("priceToBeat") or m.get("priceToBeat")
+                ptb_raw = meta.get("priceToBeat") if meta.get("priceToBeat") is not None else m.get("priceToBeat")
                 if ptb_raw is not None and end_ts not in self._price_to_beat_cache:
                     ptb = float(ptb_raw)
                     self._price_to_beat_cache[end_ts] = ptb
