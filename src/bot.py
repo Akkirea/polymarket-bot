@@ -279,6 +279,7 @@ class PaperBot:
         and cache by end_ts. Runs regardless of whether we traded those markets."""
         now_ts   = int(time.time())
         boundary = (now_ts // 300) * 300  # end_ts of the most recently closed market
+        print(f"[bot] finalPrice cache size={len(self._final_price_cache)}  keys={sorted(self._final_price_cache)}", flush=True)
         session  = await self._get_session()
         for i in range(1, 7):
             end_ts = boundary - (i - 1) * 300
