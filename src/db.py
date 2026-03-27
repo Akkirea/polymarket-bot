@@ -179,20 +179,22 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS bot_trades (
-            id                {_PK},
-            whale_address     TEXT NOT NULL,
-            market_slug       TEXT NOT NULL,
-            side              TEXT NOT NULL,
-            size              REAL NOT NULL,
-            entry_price       REAL,
-            price_to_beat     REAL,
+            id                 {_PK},
+            whale_address      TEXT NOT NULL,
+            market_slug        TEXT NOT NULL,
+            side               TEXT NOT NULL,
+            size               REAL NOT NULL,
+            entry_price        REAL,
+            price_to_beat      REAL,
             poly_price_to_beat REAL,
-            resolution_price  REAL,
-            outcome           TEXT,
-            pnl               REAL,
-            balance_after     REAL,
-            opened_at         TEXT NOT NULL,
-            closed_at         TEXT
+            resolution_price   REAL,
+            outcome            TEXT,
+            pnl                REAL,
+            balance_after      REAL,
+            diff_at_entry      REAL,
+            seconds_remaining  REAL,
+            opened_at          TEXT NOT NULL,
+            closed_at          TEXT
         );
 
         CREATE TABLE IF NOT EXISTS bot_state (
@@ -213,13 +215,15 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS bot_open_positions (
-            market_slug   TEXT PRIMARY KEY,
-            side          TEXT NOT NULL,
-            size          REAL NOT NULL,
-            entry_price   REAL NOT NULL,
-            price_to_beat REAL,
-            end_ts        REAL NOT NULL,
-            opened_at     TEXT NOT NULL
+            market_slug       TEXT PRIMARY KEY,
+            side              TEXT NOT NULL,
+            size              REAL NOT NULL,
+            entry_price       REAL NOT NULL,
+            price_to_beat     REAL,
+            end_ts            REAL NOT NULL,
+            opened_at         TEXT NOT NULL,
+            diff_at_entry     REAL,
+            seconds_remaining REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_whale_wallets_winrate ON whale_wallets(win_rate DESC);
@@ -230,13 +234,25 @@ def init_db():
     # Migrate existing bot_trades tables that predate these columns.
     # PostgreSQL: ADD COLUMN IF NOT EXISTS is idempotent — no exception, no broken transaction.
     # SQLite:     IF NOT EXISTS in ALTER TABLE requires 3.37+; use try/except instead.
-    for col, typ in [("price_to_beat", "REAL"), ("poly_price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL")]:
+    for col, typ in [("price_to_beat", "REAL"), ("poly_price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL"), ("diff_at_entry", "REAL"), ("seconds_remaining", "REAL")]:
         if _USE_PG:
             conn.execute(f"ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS {col} {typ}")
             conn.commit()
         else:
             try:
                 conn.execute(f"ALTER TABLE bot_trades ADD COLUMN {col} {typ}")
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+    # Migrate bot_open_positions (new table — may have been created before these columns were added)
+    for col, typ in [("diff_at_entry", "REAL"), ("seconds_remaining", "REAL")]:
+        if _USE_PG:
+            conn.execute(f"ALTER TABLE bot_open_positions ADD COLUMN IF NOT EXISTS {col} {typ}")
+            conn.commit()
+        else:
+            try:
+                conn.execute(f"ALTER TABLE bot_open_positions ADD COLUMN {col} {typ}")
                 conn.commit()
             except Exception:
                 pass  # column already exists
@@ -450,19 +466,23 @@ def save_open_position(pos: dict):
     conn = get_connection()
     conn.execute(
         """INSERT INTO bot_open_positions
-               (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at,
+                diff_at_entry, seconds_remaining)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT(market_slug) DO UPDATE SET
-               side          = excluded.side,
-               size          = excluded.size,
-               entry_price   = excluded.entry_price,
-               price_to_beat = excluded.price_to_beat,
-               end_ts        = excluded.end_ts,
-               opened_at     = excluded.opened_at"""
+               side              = excluded.side,
+               size              = excluded.size,
+               entry_price       = excluded.entry_price,
+               price_to_beat     = excluded.price_to_beat,
+               end_ts            = excluded.end_ts,
+               opened_at         = excluded.opened_at,
+               diff_at_entry     = excluded.diff_at_entry,
+               seconds_remaining = excluded.seconds_remaining"""
         if _USE_PG else
         """INSERT OR REPLACE INTO bot_open_positions
-               (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+               (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at,
+                diff_at_entry, seconds_remaining)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             pos["market_slug"],
             pos["side"],
@@ -471,6 +491,8 @@ def save_open_position(pos: dict):
             pos.get("price_to_beat"),
             pos["end_ts"],
             pos["opened_at"],
+            pos.get("diff_at_entry"),
+            pos.get("seconds_remaining"),
         ),
     )
     conn.commit()
@@ -481,19 +503,21 @@ def load_open_positions() -> list:
     """Return all persisted open positions (up to 2)."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at "
-        "FROM bot_open_positions"
+        "SELECT market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at, "
+        "diff_at_entry, seconds_remaining FROM bot_open_positions"
     ).fetchall()
     conn.close()
     return [
         {
-            "market_slug":   row["market_slug"],
-            "side":          row["side"],
-            "size":          float(row["size"]),
-            "entry_price":   float(row["entry_price"]),
-            "price_to_beat": float(row["price_to_beat"]) if row["price_to_beat"] is not None else None,
-            "end_ts":        float(row["end_ts"]),
-            "opened_at":     row["opened_at"],
+            "market_slug":      row["market_slug"],
+            "side":             row["side"],
+            "size":             float(row["size"]),
+            "entry_price":      float(row["entry_price"]),
+            "price_to_beat":    float(row["price_to_beat"]) if row["price_to_beat"] is not None else None,
+            "end_ts":           float(row["end_ts"]),
+            "opened_at":        row["opened_at"],
+            "diff_at_entry":    float(row["diff_at_entry"]) if row["diff_at_entry"] is not None else None,
+            "seconds_remaining": float(row["seconds_remaining"]) if row["seconds_remaining"] is not None else None,
         }
         for row in rows
     ]

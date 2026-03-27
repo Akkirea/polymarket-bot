@@ -36,7 +36,8 @@ FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
 PRICE_DIFF_THRESHOLD = 30.0  # USD — initial diff required for DOWN entries
 UP_DIFF_THRESHOLD    = 30.0  # USD — initial diff required for UP entries
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
-CROWD_MIN_CONFIDENCE = 0.60  # kept for reference; crowd filter currently disabled
+CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
+CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
 
@@ -221,14 +222,27 @@ class PaperBot:
                 continue
 
             entry_price = _side_price(market, direction)
+            if not (CROWD_MIN <= entry_price <= CROWD_MAX):
+                print(
+                    f"[bot] SKIP: {direction} price={entry_price:.3f} outside "
+                    f"profitability range [{CROWD_MIN}, {CROWD_MAX}]",
+                    flush=True,
+                )
+                continue
+
+            diff_at_entry = signals.get("diff_initial")
             print(
                 f"[bot] SIGNAL ENTRY: {direction} on {slug} — "
-                f"source={signals['source']} momentum={signals['momentum']} "
-                f"price={entry_price:.3f}",
+                f"source={signals['source']} price={entry_price:.3f} "
+                f"diff=${diff_at_entry:+.2f} secs={seconds_remaining:.1f}",
                 flush=True,
             )
-            await self._open_position(slug, direction, entry_price, end_ts, price_to_beat)
-            break  # one position at a time
+            await self._open_position(
+                slug, direction, entry_price, end_ts, price_to_beat,
+                diff_at_entry=diff_at_entry,
+                seconds_remaining=seconds_remaining,
+            )
+            break  # one entry evaluation at a time
 
     # ── Active markets ─────────────────────────────────────────────────────────
 
@@ -450,20 +464,24 @@ class PaperBot:
     # ── Position lifecycle ─────────────────────────────────────────────────────
 
     async def _open_position(self, slug: str, side: str, entry_price: float, end_ts: float,
-                             price_to_beat: Optional[float] = None):
+                             price_to_beat: Optional[float] = None,
+                             diff_at_entry: Optional[float] = None,
+                             seconds_remaining: Optional[float] = None):
         if self.balance < BET_SIZE:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
             return
 
         self.balance -= BET_SIZE
         pos = {
-            "market_slug":   slug,
-            "side":          side,
-            "size":          BET_SIZE,
-            "entry_price":   entry_price,
-            "price_to_beat": price_to_beat,
-            "end_ts":        end_ts,
-            "opened_at":     datetime.now(timezone.utc).isoformat(),
+            "market_slug":      slug,
+            "side":             side,
+            "size":             BET_SIZE,
+            "entry_price":      entry_price,
+            "price_to_beat":    price_to_beat,
+            "end_ts":           end_ts,
+            "opened_at":        datetime.now(timezone.utc).isoformat(),
+            "diff_at_entry":    diff_at_entry,
+            "seconds_remaining": seconds_remaining,
         }
         self.positions.append(pos)
         db.save_open_position(pos)
