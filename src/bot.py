@@ -426,29 +426,42 @@ class PaperBot:
                 return None, {"source": "none", "momentum": None}
 
             # Condition a3: choppy market filter — require last 2 of 3 windows moved same direction
+            # Only applies when all 3 window moves are >= $50 (small moves = ranging, not choppy)
             recent_finals = sorted(
                 [(ts, fp) for ts, fp in self._final_price_cache.items() if ts <= start_ts],
                 reverse=True,
             )[:3]
             if len(recent_finals) >= 3:
                 finals_asc = sorted(recent_finals)  # oldest first
-                window_dirs = [
-                    "Up" if finals_asc[i][1] > finals_asc[i - 1][1] else "Down"
+                window_moves = [
+                    abs(finals_asc[i][1] - finals_asc[i - 1][1])
                     for i in range(1, len(finals_asc))
                 ]
-                # window_dirs has 2 entries: direction of 2nd and 3rd recent windows
-                if window_dirs[0] != window_dirs[1]:
+                if all(m >= 50.0 for m in window_moves):
+                    window_dirs = [
+                        "Up" if finals_asc[i][1] > finals_asc[i - 1][1] else "Down"
+                        for i in range(1, len(finals_asc))
+                    ]
+                    # window_dirs has 2 entries: direction of 2nd and 3rd recent windows
+                    if window_dirs[0] != window_dirs[1]:
+                        print(
+                            f"[bot] SKIP: choppy — last 3 windows alternated {window_dirs} "
+                            f"moves=${[round(m) for m in window_moves]}",
+                            flush=True,
+                        )
+                        return None, {"source": "none", "momentum": None}
+                    if direction not in window_dirs:
+                        print(
+                            f"[bot] SKIP: choppy — last 2 of 3 windows {window_dirs} don't support {direction} "
+                            f"moves=${[round(m) for m in window_moves]}",
+                            flush=True,
+                        )
+                        return None, {"source": "none", "momentum": None}
+                else:
                     print(
-                        f"[bot] SKIP: choppy — last 3 windows alternated {window_dirs}",
+                        f"[bot] choppy filter skipped — low volatility moves=${[round(m) for m in window_moves]}",
                         flush=True,
                     )
-                    return None, {"source": "none", "momentum": None}
-                if direction not in window_dirs:
-                    print(
-                        f"[bot] SKIP: choppy — last 2 of 3 windows {window_dirs} don't support {direction}",
-                        flush=True,
-                    )
-                    return None, {"source": "none", "momentum": None}
 
             # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
