@@ -168,7 +168,7 @@ class PaperBot:
                 await self._try_resolve(pos)
 
         # Entry: skip if at capacity
-        if len(self.positions) >= 2:
+        if len(self.positions) >= 3:
             return
 
         # Scan active BTC 5m markets
