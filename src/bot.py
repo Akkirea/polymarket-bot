@@ -333,22 +333,25 @@ class PaperBot:
                     markets = await resp.json()
                 if not markets:
                     continue
-                events = markets[0].get("events", [])
+                m      = markets[0]
+                events = m.get("events", [])
                 meta   = (events[0].get("eventMetadata") or {}) if events else {}
+                print(
+                    f"[bot] cache probe {slug}: meta_keys={list(meta.keys())}  "
+                    f"market_keys_sample={[k for k in m.keys() if 'price' in k.lower() or 'beat' in k.lower()]}",
+                    flush=True,
+                )
                 if meta.get("finalPrice") is not None and end_ts not in self._final_price_cache:
                     fp = float(meta["finalPrice"])
                     self._final_price_cache[end_ts] = fp
-                    print(
-                        f"[bot] finalPrice cache: {slug} end_ts={end_ts} → ${fp:,.2f}",
-                        flush=True,
-                    )
-                if meta.get("priceToBeat") is not None and end_ts not in self._price_to_beat_cache:
-                    ptb = float(meta["priceToBeat"])
+                    print(f"[bot] finalPrice cache: {slug} end_ts={end_ts} → ${fp:,.2f}", flush=True)
+
+                # Try eventMetadata first, then top-level market object as fallback
+                ptb_raw = meta.get("priceToBeat") or m.get("priceToBeat")
+                if ptb_raw is not None and end_ts not in self._price_to_beat_cache:
+                    ptb = float(ptb_raw)
                     self._price_to_beat_cache[end_ts] = ptb
-                    print(
-                        f"[bot] priceToBeat cache: {slug} end_ts={end_ts} → ${ptb:,.2f}",
-                        flush=True,
-                    )
+                    print(f"[bot] priceToBeat cache: {slug} end_ts={end_ts} → ${ptb:,.2f}", flush=True)
             except Exception as exc:
                 print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
 
