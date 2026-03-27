@@ -33,8 +33,9 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 6     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 60.0  # USD — initial diff required to consider entry
-REVERSAL_THRESHOLD   = 40.0  # USD — diff must still be >= this after 3s re-check
+PRICE_DIFF_THRESHOLD = 60.0   # USD — initial diff required for DOWN entries
+UP_DIFF_THRESHOLD    = 120.0  # USD — higher bar for UP entries (feed offset works against us)
+REVERSAL_THRESHOLD   = 40.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN_CONFIDENCE = 0.60  # kept for reference; crowd filter currently disabled
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
@@ -348,14 +349,14 @@ class PaperBot:
                 f"now=${live_price:,.2f}  beat(first-sight)=${price_to_beat:,.2f}",
                 flush=True,
             )
-            if abs(diff_initial) < PRICE_DIFF_THRESHOLD:
+            direction = "Up" if diff_initial > 0 else "Down"
+            threshold = UP_DIFF_THRESHOLD if direction == "Up" else PRICE_DIFF_THRESHOLD
+            if abs(diff_initial) < threshold:
                 print(
-                    f"[bot] SKIP: diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD}",
+                    f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${threshold:.0f} (asymmetric)",
                     flush=True,
                 )
                 return None, {"source": "none", "momentum": None}
-
-            direction = "Up" if diff_initial > 0 else "Down"
 
             # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
