@@ -63,6 +63,7 @@ class PaperBot:
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()          # avoid re-entering the same market
         self._evaluating:    bool = False         # True while reversal guard is mid-sleep
+        self._final_price_cache: dict = {}        # {end_ts: final_price} for recent closed markets
         self._market_start_prices: dict = {}     # slug → BTC price at first sight (price_to_beat)
         self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
@@ -148,6 +149,8 @@ class PaperBot:
 
     async def _tick(self):
         print(f"[bot] _tick called  position={'HELD' if self.position else 'none'}", flush=True)
+        # Continuously collect finalPrices for recent closed markets, independent of position state
+        asyncio.create_task(self._collect_final_prices())
         # If holding a position, try to resolve once the market window has closed
         if self.position:
             end_ts = self.position.get("end_ts", 0)
@@ -271,6 +274,38 @@ class PaperBot:
 
     # ── Signals ────────────────────────────────────────────────────────────────
 
+    async def _collect_final_prices(self) -> None:
+        """Each tick: fetch eventMetadata.finalPrice for the last 6 closed BTC 5m markets
+        and cache by end_ts. Runs regardless of whether we traded those markets."""
+        now_ts   = int(time.time())
+        boundary = (now_ts // 300) * 300  # end_ts of the most recently closed market
+        session  = await self._get_session()
+        for i in range(1, 7):
+            end_ts = boundary - (i - 1) * 300
+            if end_ts in self._final_price_cache:
+                continue
+            slug = f"btc-updown-5m-{end_ts - 300}"
+            try:
+                async with session.get(
+                    f"{GAMMA_API}/markets", params={"slug": slug}
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    markets = await resp.json()
+                if not markets:
+                    continue
+                events = markets[0].get("events", [])
+                meta   = (events[0].get("eventMetadata") or {}) if events else {}
+                if meta.get("finalPrice") is not None:
+                    fp = float(meta["finalPrice"])
+                    self._final_price_cache[end_ts] = fp
+                    print(
+                        f"[bot] finalPrice cache: {slug} end_ts={end_ts} → ${fp:,.2f}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
+
     async def _get_btc_price(self) -> Optional[float]:
         """Fetch live BTC/USD from Chainlink on Polygon and append to both history stores."""
         try:
@@ -322,8 +357,14 @@ class PaperBot:
         2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD ($40)
         Ranging filter also applied before the diff check.
         """
-        if price_to_beat is None:
-            print("[bot] BTC: no start price cached — skipping, no trade", flush=True)
+        # Use previous market's finalPrice as reference if cached, else fall back to Chainlink first-sight
+        start_ts    = int(market["slug"].split("-")[-1])
+        prev_final  = self._final_price_cache.get(start_ts)
+        reference_price = prev_final if prev_final is not None else price_to_beat
+        ref_source  = "prev-finalPrice" if prev_final is not None else "chainlink-first-sight"
+
+        if reference_price is None:
+            print("[bot] SKIP: no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
             return None, {"source": "none", "momentum": None}
 
         self._evaluating = True
@@ -342,11 +383,11 @@ class PaperBot:
                 )
                 return None, {"source": "none", "momentum": None}
 
-            # Condition a: strong initial move from first-sight price
-            diff_initial = live_price - price_to_beat
+            # Condition a: strong initial move from reference price
+            diff_initial = live_price - reference_price
             print(
                 f"[bot] signals: diff_initial=${diff_initial:+.2f}  "
-                f"now=${live_price:,.2f}  beat(first-sight)=${price_to_beat:,.2f}",
+                f"now=${live_price:,.2f}  ref=${reference_price:,.2f} ({ref_source})",
                 flush=True,
             )
             direction = "Up" if diff_initial > 0 else "Down"
@@ -365,7 +406,7 @@ class PaperBot:
                 print("[bot] SKIP: reversal check fetch failed", flush=True)
                 return None, {"source": "none", "momentum": None}
 
-            diff_final = live_price_b - price_to_beat
+            diff_final = live_price_b - reference_price
             reversed_direction = (diff_final > 0) != (diff_initial > 0)
             if reversed_direction or abs(diff_final) < REVERSAL_THRESHOLD:
                 print(
@@ -377,14 +418,14 @@ class PaperBot:
 
             print(
                 f"[bot] ENTRY: {direction}  diff_initial=${diff_initial:+.2f}  "
-                f"diff_final=${diff_final:+.2f}  beat=${price_to_beat:,.2f}",
+                f"diff_final=${diff_final:+.2f}  ref=${reference_price:,.2f} ({ref_source})",
                 flush=True,
             )
             return direction, {
-                "source":        "chainlink-reversal-guard",
+                "source":        f"chainlink-reversal-guard/{ref_source}",
                 "momentum":      direction,
                 "live_price":    live_price_b,
-                "price_to_beat": price_to_beat,
+                "price_to_beat": reference_price,
                 "diff_initial":  diff_initial,
                 "diff_final":    diff_final,
             }
