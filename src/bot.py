@@ -36,12 +36,9 @@ FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
 PRICE_DIFF_THRESHOLD = 30.0  # USD — initial diff required for DOWN entries
 UP_DIFF_THRESHOLD    = 30.0  # USD — initial diff required for UP entries
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
+PRICE_DIFF_CEILING   = 100.0 # USD — skip if abs(diff) > this (mean reversion risk)
 CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
-CARRY_ENTRY_LO       = 270   # seconds_remaining lower bound for momentum-carry (first 30s)
-CARRY_ENTRY_HI       = 295   # seconds_remaining upper bound for momentum-carry
-CARRY_DIFF_THRESHOLD = 100.0 # min abs(prev_final - prev_beat) to trigger carry
-CARRY_CROWD_MAX      = 0.60  # tighter upper bound for carry (early entry)
 RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
 RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
 
@@ -67,10 +64,8 @@ class PaperBot:
         self._task:       Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()           # avoid re-entering the same market
-        self._carry_checked_slugs: set = set()    # slugs already evaluated for momentum-carry
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {end_ts: finalPrice} for recent closed markets
-        self._price_to_beat_cache:  dict = {}      # {end_ts: priceToBeat} for carry signal
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
@@ -203,27 +198,7 @@ class PaperBot:
                 else:
                     print(f"[bot] BTC price unavailable — cannot cache start price for {slug}", flush=True)
 
-            # ── Strategy 1: momentum-carry (first 30s of market)
-            if (CARRY_ENTRY_LO <= seconds_remaining <= CARRY_ENTRY_HI
-                    and slug not in self._entered_slugs
-                    and slug not in self._carry_checked_slugs):
-                self._carry_checked_slugs.add(slug)
-                carry_result = await self._evaluate_carry(market, slug)
-                if carry_result is not None:
-                    direction, entry_price, carry_diff = carry_result
-                    price_to_beat = self._final_price_cache.get(int(slug.split("-")[-1]))
-                    self._entered_slugs.add(slug)
-                    await self._open_position(
-                        slug, direction, entry_price, end_ts,
-                        price_to_beat=price_to_beat,
-                        diff_at_entry=carry_diff,
-                        seconds_remaining=seconds_remaining,
-                        strategy="momentum-carry",
-                    )
-                if len(self.positions) >= 2:
-                    break
-
-            # ── Strategy 2: chainlink-reversal-guard (last 6-15s of market)
+            # ── chainlink-reversal-guard (last 6-15s of market)
             if (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI
                     and slug not in self._entered_slugs):
                 if self._evaluating:
@@ -321,7 +296,7 @@ class PaperBot:
         session  = await self._get_session()
         for i in range(1, 7):
             end_ts = boundary - (i - 1) * 300
-            if end_ts in self._final_price_cache and end_ts in self._price_to_beat_cache:
+            if end_ts in self._final_price_cache:
                 continue
             slug = f"btc-updown-5m-{end_ts - 300}"
             try:
@@ -346,12 +321,6 @@ class PaperBot:
                     self._final_price_cache[end_ts] = fp
                     print(f"[bot] finalPrice cache: {slug} end_ts={end_ts} → ${fp:,.2f}", flush=True)
 
-                # Try eventMetadata first, then top-level market object as fallback
-                ptb_raw = meta.get("priceToBeat") if meta.get("priceToBeat") is not None else m.get("priceToBeat")
-                if ptb_raw is not None and end_ts not in self._price_to_beat_cache:
-                    ptb = float(ptb_raw)
-                    self._price_to_beat_cache[end_ts] = ptb
-                    print(f"[bot] priceToBeat cache: {slug} end_ts={end_ts} → ${ptb:,.2f}", flush=True)
             except Exception as exc:
                 print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
 
@@ -396,56 +365,6 @@ class PaperBot:
             return False  # not enough data yet — don't filter
         spread = max(self._btc_price_history) - min(self._btc_price_history)
         return spread < RANGING_THRESHOLD
-
-    async def _evaluate_carry(self, market: dict, slug: str) -> Optional[tuple]:
-        """Momentum-carry strategy: if the previous 5-min window had a strong directional
-        move (abs(finalPrice - priceToBeat) >= CARRY_DIFF_THRESHOLD), enter in the same
-        direction at the start of the new window."""
-        start_ts    = int(slug.split("-")[-1])
-        prev_end_ts = start_ts  # previous window ended when current window started
-        prev_final  = self._final_price_cache.get(prev_end_ts)
-        prev_beat   = self._price_to_beat_cache.get(prev_end_ts)
-
-        if prev_final is None or prev_beat is None:
-            print(
-                f"[bot] carry SKIP: no prev data for {slug}  "
-                f"prev_end_ts={prev_end_ts}  "
-                f"final={'✓' if prev_final else '✗'}  beat={'✓' if prev_beat else '✗'}",
-                flush=True,
-            )
-            return None
-
-        carry_diff = prev_final - prev_beat
-        print(
-            f"[bot] carry: {slug}  prev_final={prev_final:.2f}  prev_beat={prev_beat:.2f}  "
-            f"carry_diff={carry_diff:+.2f}",
-            flush=True,
-        )
-
-        if abs(carry_diff) < CARRY_DIFF_THRESHOLD:
-            print(
-                f"[bot] carry SKIP: diff ${abs(carry_diff):.2f} < threshold ${CARRY_DIFF_THRESHOLD}",
-                flush=True,
-            )
-            return None
-
-        direction   = "Up" if carry_diff > 0 else "Down"
-        entry_price = _side_price(market, direction)
-
-        if not (CROWD_MIN <= entry_price <= CARRY_CROWD_MAX):
-            print(
-                f"[bot] carry SKIP: {direction} price={entry_price:.3f} outside "
-                f"[{CROWD_MIN}, {CARRY_CROWD_MAX}]",
-                flush=True,
-            )
-            return None
-
-        print(
-            f"[bot] carry ENTRY: {direction}  carry_diff={carry_diff:+.2f}  "
-            f"price={entry_price:.3f}",
-            flush=True,
-        )
-        return direction, entry_price, carry_diff
 
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float]
@@ -497,6 +416,39 @@ class PaperBot:
                     flush=True,
                 )
                 return None, {"source": "none", "momentum": None}
+
+            # Condition a2: ceiling — skip extreme moves (mean reversion risk)
+            if abs(diff_initial) > PRICE_DIFF_CEILING:
+                print(
+                    f"[bot] SKIP: diff ${abs(diff_initial):.2f} > ceiling ${PRICE_DIFF_CEILING:.0f} (mean reversion risk)",
+                    flush=True,
+                )
+                return None, {"source": "none", "momentum": None}
+
+            # Condition a3: choppy market filter — require last 2 of 3 windows moved same direction
+            recent_finals = sorted(
+                [(ts, fp) for ts, fp in self._final_price_cache.items() if ts <= start_ts],
+                reverse=True,
+            )[:3]
+            if len(recent_finals) >= 3:
+                finals_asc = sorted(recent_finals)  # oldest first
+                window_dirs = [
+                    "Up" if finals_asc[i][1] > finals_asc[i - 1][1] else "Down"
+                    for i in range(1, len(finals_asc))
+                ]
+                # window_dirs has 2 entries: direction of 2nd and 3rd recent windows
+                if window_dirs[0] != window_dirs[1]:
+                    print(
+                        f"[bot] SKIP: choppy — last 3 windows alternated {window_dirs}",
+                        flush=True,
+                    )
+                    return None, {"source": "none", "momentum": None}
+                if direction not in window_dirs:
+                    print(
+                        f"[bot] SKIP: choppy — last 2 of 3 windows {window_dirs} don't support {direction}",
+                        flush=True,
+                    )
+                    return None, {"source": "none", "momentum": None}
 
             # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
