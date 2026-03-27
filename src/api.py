@@ -101,7 +101,7 @@ def get_bot_status():
 @app.get("/api/bot/trades")
 def get_bot_trades():
     """Last 5 completed bot trades."""
-    return bot.get_recent_trades(n=5)
+    return bot.get_recent_trades(n=20)
 
 
 @app.get("/api/bot/stats")
