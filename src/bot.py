@@ -358,9 +358,11 @@ class PaperBot:
         2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD
         Reference price is previous window's finalPrice if cached, else Chainlink first-sight.
         """
-        # Use previous market's finalPrice as reference if cached, else fall back to Chainlink first-sight
-        start_ts    = int(market["slug"].split("-")[-1])
-        prev_final  = self._final_price_cache.get(start_ts)
+        # Use previous market's finalPrice as reference if cached, else fall back to Chainlink first-sight.
+        # Slug number = end_ts of the current window (confirmed by _fetch_active_markets and _extract_end_ts).
+        # _final_price_cache is keyed by end_ts, so look up (end_ts - 300) to get the PREVIOUS window.
+        end_ts      = int(market["slug"].split("-")[-1])
+        prev_final  = self._final_price_cache.get(end_ts - 300)
         reference_price = prev_final if prev_final is not None else price_to_beat
         ref_source  = "prev-finalPrice" if prev_final is not None else "chainlink-first-sight"
 
