@@ -466,8 +466,12 @@ class PaperBot:
         self.positions.append(pos)
         db.save_open_position(pos)
         db.save_bot_state(self.balance)
+        slug_ts   = int(slug.rsplit("-", 1)[-1])
+        win_start = datetime.utcfromtimestamp(slug_ts - 300).strftime("%H:%M")
+        win_end   = datetime.utcfromtimestamp(slug_ts).strftime("%H:%M")
         print(
-            f"[bot] OPEN  {side:>4}  ${BET_SIZE:.0f}  {slug}"
+            f"[bot] OPEN  {side:>4}  ${BET_SIZE:.0f}  slug={slug}"
+            f"  window={win_start}→{win_end} UTC  end_ts={slug_ts}"
             f"  entry={entry_price:.3f}  balance=${self.balance:.2f}  "
             f"positions={len(self.positions)}",
             flush=True,
