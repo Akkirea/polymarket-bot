@@ -31,6 +31,7 @@ INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 BET_SIZE             = 500.0  # Kelly cap (max stake per trade)
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
 MIN_PREV_MOVE        = 30.0   # USD — skip if the reference window moved less than this
+BLOCKED_HOURS        = {6, 9, 10, 13, 14, 15, 16, 17}  # ET hours — high-noise / low-edge windows
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 30    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 60    # enter when seconds_remaining <= this
@@ -166,6 +167,12 @@ class PaperBot:
 
         # Entry: skip if at capacity
         if len(self.positions) >= 3:
+            return
+
+        # Trading hours filter — block entry during low-edge ET hours
+        hour_et = (datetime.now(timezone.utc).hour - 4) % 24
+        if hour_et in BLOCKED_HOURS:
+            print(f"[bot] entry blocked: ET hour={hour_et} in BLOCKED_HOURS", flush=True)
             return
 
         # Scan active BTC 5m markets
