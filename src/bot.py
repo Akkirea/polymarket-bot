@@ -28,7 +28,9 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BYBIT_API = "https://api.bybit.com/v5/market"
 
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
-BET_SIZE             = 500.0
+BET_SIZE             = 500.0  # Kelly cap (max stake per trade)
+WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
+MIN_PREV_MOVE        = 30.0   # USD — skip if the reference window moved less than this
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 30    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 60    # enter when seconds_remaining <= this
@@ -370,6 +372,18 @@ class PaperBot:
             print("[bot] SKIP: no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
             return None, {"source": "none", "momentum": None}
 
+        # Condition 0: minimum prev-window move — only enter if the reference window had momentum
+        if prev_final is not None:
+            prev_prev_final = self._final_price_cache.get(end_ts - 600)
+            if prev_prev_final is not None:
+                prev_move = abs(reference_price - prev_prev_final)
+                if prev_move < MIN_PREV_MOVE:
+                    print(
+                        f"[bot] SKIP: prev_move ${prev_move:.2f} < MIN_PREV_MOVE ${MIN_PREV_MOVE:.0f} (flat reference window)",
+                        flush=True,
+                    )
+                    return None, {"source": "none", "momentum": None}
+
         self._evaluating = True
         try:
             live_price = await self._get_btc_price()
@@ -446,15 +460,22 @@ class PaperBot:
                              diff_at_entry: Optional[float] = None,
                              seconds_remaining: Optional[float] = None,
                              strategy: Optional[str] = None):
-        if self.balance < BET_SIZE:
+        # Kelly criterion sizing (half-Kelly, capped $50–$500)
+        loss_prob      = 1.0 - WIN_PROB
+        b              = (1.0 / entry_price) - 1.0   # net payout per dollar risked
+        kelly_fraction = max(0.0, (WIN_PROB * b - loss_prob) / b) if b > 0 else 0.0
+        stake          = self.balance * kelly_fraction * 0.5
+        stake          = max(50.0, min(BET_SIZE, stake))   # floor $50, cap $500
+
+        if self.balance < stake:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
             return
 
-        self.balance -= BET_SIZE
+        self.balance -= stake
         pos = {
             "market_slug":       slug,
             "side":              side,
-            "size":              BET_SIZE,
+            "size":              stake,
             "entry_price":       entry_price,
             "price_to_beat":     price_to_beat,
             "end_ts":            end_ts,
@@ -470,7 +491,7 @@ class PaperBot:
         win_start = datetime.utcfromtimestamp(slug_ts - 300).strftime("%H:%M")
         win_end   = datetime.utcfromtimestamp(slug_ts).strftime("%H:%M")
         print(
-            f"[bot] OPEN  {side:>4}  ${BET_SIZE:.0f}  slug={slug}"
+            f"[bot] OPEN  {side:>4}  ${stake:.0f} (kelly={kelly_fraction:.3f})  slug={slug}"
             f"  window={win_start}→{win_end} UTC  end_ts={slug_ts}"
             f"  entry={entry_price:.3f}  balance=${self.balance:.2f}  "
             f"positions={len(self.positions)}",
