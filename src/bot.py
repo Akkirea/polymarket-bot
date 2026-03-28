@@ -30,8 +30,8 @@ BYBIT_API = "https://api.bybit.com/v5/market"
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 BET_SIZE             = 500.0
 POLL_INTERVAL        = 3     # seconds between ticks
-ENTRY_WINDOW_LO      = 6     # enter when seconds_remaining >= this
-ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
+ENTRY_WINDOW_LO      = 30    # enter when seconds_remaining >= this
+ENTRY_WINDOW_HI      = 60    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
 PRICE_DIFF_THRESHOLD = 30.0  # USD — minimum diff from reference price to enter
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
