@@ -33,14 +33,10 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 6     # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 15    # enter when seconds_remaining <= this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 30.0  # USD — initial diff required for DOWN entries
-UP_DIFF_THRESHOLD    = 30.0  # USD — initial diff required for UP entries
+PRICE_DIFF_THRESHOLD = 30.0  # USD — minimum diff from reference price to enter
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
-PRICE_DIFF_CEILING   = 100.0 # USD — skip if abs(diff) > this (mean reversion risk)
 CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
-RANGING_WINDOW       = 3     # number of recent BTC readings to check for ranging market
-RANGING_THRESHOLD    = 20.0  # USD — if all readings within $20, market is flat → skip
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -67,7 +63,6 @@ class PaperBot:
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {end_ts: finalPrice} for recent closed markets
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
-        self._btc_price_history:     list = []  # rolling window of recent prices for ranging filter
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
         for pos in self.positions:
@@ -331,12 +326,7 @@ class PaperBot:
             price = await loop.run_in_executor(None, get_btc_price)
             now   = time.time()
 
-            # Ranging filter — last N readings (no timestamps needed)
-            self._btc_price_history.append(price)
-            if len(self._btc_price_history) > RANGING_WINDOW:
-                self._btc_price_history.pop(0)
-
-            # Momentum filter — timestamped, keep last 60s
+            # Timestamped history — keep last 60s
             self._btc_price_timestamps.append((now, price))
             cutoff = now - 60
             self._btc_price_timestamps = [
@@ -359,21 +349,14 @@ class PaperBot:
             return None
         return closest_price
 
-    def _is_ranging(self) -> bool:
-        """Return True if the last RANGING_WINDOW prices are all within RANGING_THRESHOLD of each other."""
-        if len(self._btc_price_history) < RANGING_WINDOW:
-            return False  # not enough data yet — don't filter
-        spread = max(self._btc_price_history) - min(self._btc_price_history)
-        return spread < RANGING_THRESHOLD
-
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float]
     ) -> tuple[Optional[str], dict]:
         """
-        Two-condition reversal guard:
-        1. abs(live_price - price_to_beat) >= PRICE_DIFF_THRESHOLD ($60)
-        2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD ($40)
-        Ranging filter also applied before the diff check.
+        Two-condition entry:
+        1. abs(live_price - reference_price) >= PRICE_DIFF_THRESHOLD
+        2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD
+        Reference price is previous window's finalPrice if cached, else Chainlink first-sight.
         """
         # Use previous market's finalPrice as reference if cached, else fall back to Chainlink first-sight
         start_ts    = int(market["slug"].split("-")[-1])
@@ -392,15 +375,6 @@ class PaperBot:
                 print("[bot] BTC: unavailable — skipping, no trade", flush=True)
                 return None, {"source": "none", "momentum": None}
 
-            if self._is_ranging():
-                spread = max(self._btc_price_history) - min(self._btc_price_history)
-                print(
-                    f"[bot] SKIP: ranging market — last {RANGING_WINDOW} readings span ${spread:.2f} "
-                    f"(threshold ${RANGING_THRESHOLD})",
-                    flush=True,
-                )
-                return None, {"source": "none", "momentum": None}
-
             # Condition a: strong initial move from reference price
             diff_initial = live_price - reference_price
             print(
@@ -409,59 +383,12 @@ class PaperBot:
                 flush=True,
             )
             direction = "Up" if diff_initial > 0 else "Down"
-            threshold = UP_DIFF_THRESHOLD if direction == "Up" else PRICE_DIFF_THRESHOLD
-            if abs(diff_initial) < threshold:
+            if abs(diff_initial) < PRICE_DIFF_THRESHOLD:
                 print(
-                    f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${threshold:.0f} (asymmetric)",
+                    f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD:.0f}",
                     flush=True,
                 )
                 return None, {"source": "none", "momentum": None}
-
-            # Condition a2: ceiling — skip extreme moves (mean reversion risk)
-            if abs(diff_initial) > PRICE_DIFF_CEILING:
-                print(
-                    f"[bot] SKIP: diff ${abs(diff_initial):.2f} > ceiling ${PRICE_DIFF_CEILING:.0f} (mean reversion risk)",
-                    flush=True,
-                )
-                return None, {"source": "none", "momentum": None}
-
-            # Condition a3: choppy market filter — require last 2 of 3 windows moved same direction
-            # Only applies when all 3 window moves are >= $50 (small moves = ranging, not choppy)
-            recent_finals = sorted(
-                [(ts, fp) for ts, fp in self._final_price_cache.items() if ts <= start_ts],
-                reverse=True,
-            )[:3]
-            if len(recent_finals) >= 3:
-                finals_asc = sorted(recent_finals)  # oldest first
-                window_moves = [
-                    abs(finals_asc[i][1] - finals_asc[i - 1][1])
-                    for i in range(1, len(finals_asc))
-                ]
-                if all(m >= 50.0 for m in window_moves):
-                    window_dirs = [
-                        "Up" if finals_asc[i][1] > finals_asc[i - 1][1] else "Down"
-                        for i in range(1, len(finals_asc))
-                    ]
-                    # window_dirs has 2 entries: direction of 2nd and 3rd recent windows
-                    if window_dirs[0] != window_dirs[1]:
-                        print(
-                            f"[bot] SKIP: choppy — last 3 windows alternated {window_dirs} "
-                            f"moves=${[round(m) for m in window_moves]}",
-                            flush=True,
-                        )
-                        return None, {"source": "none", "momentum": None}
-                    if direction not in window_dirs:
-                        print(
-                            f"[bot] SKIP: choppy — last 2 of 3 windows {window_dirs} don't support {direction} "
-                            f"moves=${[round(m) for m in window_moves]}",
-                            flush=True,
-                        )
-                        return None, {"source": "none", "momentum": None}
-                else:
-                    print(
-                        f"[bot] choppy filter skipped — low volatility moves=${[round(m) for m in window_moves]}",
-                        flush=True,
-                    )
 
             # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
