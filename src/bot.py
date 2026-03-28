@@ -248,11 +248,11 @@ class PaperBot:
         and fetch each by exact slug.
         """
         now = int(time.time())
-        # Current window closes at the next 5-min boundary; fetch that plus the
-        # following window so we never miss a market that opens while we're polling
+        # Current window closes at the current 5-min boundary floor; fetch that plus
+        # the next window as fallback in case the current has already closed
         candidates = [
+            (now // 300) * 300,
             (now // 300 + 1) * 300,
-            (now // 300 + 2) * 300,
         ]
         slugs = [f"btc-updown-5m-{ts}" for ts in candidates]
         print(f"[bot] fetching slugs: {slugs}")
