@@ -307,7 +307,7 @@ class PaperBot:
             end_ts = boundary - (i - 1) * 300
             if end_ts in self._final_price_cache:
                 continue
-            slug = f"btc-updown-5m-{end_ts - 300}"
+            slug = f"btc-updown-5m-{end_ts}"
             try:
                 async with session.get(
                     f"{GAMMA_API}/markets", params={"slug": slug}
