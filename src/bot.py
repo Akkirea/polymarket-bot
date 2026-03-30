@@ -28,10 +28,14 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BYBIT_API = "https://api.bybit.com/v5/market"
 
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
-BET_SIZE             = 500.0  # Kelly cap (max stake per trade)
+BET_SIZE             = 500.0  # Kelly base cap — 2x hours can go up to $1,000
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
 MIN_PREV_MOVE        = 30.0   # USD — skip if the reference window moved less than this
-BLOCKED_HOURS        = {6, 9, 10, 13, 14, 15, 16, 17}  # ET hours — high-noise / low-edge windows
+# Data-validated allowed hours (ET = UTC-4). All others blocked.
+# Hours 18+19 statistically significant (p=0.009 combined). Hours 0,4 solid (n=13-15).
+ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
+# Hour 19: 2x (70.6% WR, n=17, p<0.01). Hour 18: 1x until n≥20 (77.8% WR but n=9).
+HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 30    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 60    # enter when seconds_remaining <= this
@@ -169,10 +173,10 @@ class PaperBot:
         if len(self.positions) >= 3:
             return
 
-        # Trading hours filter — block entry during low-edge ET hours
+        # Trading hours filter — only enter during data-validated ET hours
         hour_et = (datetime.now(timezone.utc).hour - 4) % 24
-        if hour_et in BLOCKED_HOURS:
-            print(f"[bot] entry blocked: ET hour={hour_et} in BLOCKED_HOURS", flush=True)
+        if hour_et not in ALLOWED_HOURS:
+            print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS", flush=True)
             return
 
         # Scan active BTC 5m markets
@@ -244,6 +248,7 @@ class PaperBot:
                     diff_at_entry=diff_at_entry,
                     seconds_remaining=seconds_remaining,
                     strategy="chainlink-reversal-guard",
+                    hour_et=hour_et,
                 )
                 break
 
@@ -466,13 +471,16 @@ class PaperBot:
                              price_to_beat: Optional[float] = None,
                              diff_at_entry: Optional[float] = None,
                              seconds_remaining: Optional[float] = None,
-                             strategy: Optional[str] = None):
-        # Kelly criterion sizing (half-Kelly, capped $50–$500)
+                             strategy: Optional[str] = None,
+                             hour_et: int = 0):
+        # Half-Kelly sizing with data-driven hour multiplier
         loss_prob      = 1.0 - WIN_PROB
         b              = (1.0 / entry_price) - 1.0   # net payout per dollar risked
         kelly_fraction = max(0.0, (WIN_PROB * b - loss_prob) / b) if b > 0 else 0.0
-        stake          = self.balance * kelly_fraction * 0.5
-        stake          = max(50.0, min(BET_SIZE, stake))   # floor $50, cap $500
+        multiplier     = HOUR_MULTIPLIER.get(hour_et, 1.0)
+        max_stake      = BET_SIZE * multiplier         # $500 base, $1000 for 2x hours
+        stake          = self.balance * kelly_fraction * 0.5 * multiplier
+        stake          = max(50.0, min(max_stake, stake))  # floor $50, cap by hour tier
 
         if self.balance < stake:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
@@ -498,7 +506,7 @@ class PaperBot:
         win_start = datetime.utcfromtimestamp(slug_ts - 300).strftime("%H:%M")
         win_end   = datetime.utcfromtimestamp(slug_ts).strftime("%H:%M")
         print(
-            f"[bot] OPEN  {side:>4}  ${stake:.0f} (kelly={kelly_fraction:.3f})  slug={slug}"
+            f"[bot] OPEN  {side:>4}  ${stake:.0f} (kelly={kelly_fraction:.3f} ×{multiplier})  slug={slug}"
             f"  window={win_start}→{win_end} UTC  end_ts={slug_ts}"
             f"  entry={entry_price:.3f}  balance=${self.balance:.2f}  "
             f"positions={len(self.positions)}",
