@@ -37,8 +37,9 @@ ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
 # Hour 19: 2x (70.6% WR, n=17, p<0.01). Hour 18: 1x until n≥20 (77.8% WR but n=9).
 HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
-ENTRY_WINDOW_LO      = 30    # enter when seconds_remaining >= this
-ENTRY_WINDOW_HI      = 60    # enter when seconds_remaining <= this
+ENTRY_WINDOW_LO      = 20    # enter when seconds_remaining >= this
+ENTRY_WINDOW_HI      = 45    # enter when seconds_remaining <= this
+MIN_MOMENTUM_MOVE    = 20.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
 PRICE_DIFF_THRESHOLD = 30.0  # USD — minimum diff from reference price to enter
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
@@ -418,7 +419,41 @@ class PaperBot:
                 )
                 return None, {"source": "none", "momentum": None}
 
-            # Condition b: reversal guard — wait 3s, re-fetch, confirm move still holding
+            # Condition b1: chop filter — 10s price range must show real movement
+            price_10s_ago = self._get_price_n_seconds_ago(10)
+            if price_10s_ago is not None:
+                chop_range = abs(live_price - price_10s_ago)
+                if chop_range < MIN_MOMENTUM_MOVE:
+                    print(
+                        f"[bot] SKIP (chop): 10s range=${chop_range:.2f} < ${MIN_MOMENTUM_MOVE:.0f}  "
+                        f"now=${live_price:,.2f}  10s_ago=${price_10s_ago:,.2f}",
+                        flush=True,
+                    )
+                    return None, {"source": "none", "momentum": None}
+            else:
+                print("[bot] chop filter: no 10s reading, continuing", flush=True)
+
+            # Condition b2: momentum filter — short-term momentum must agree with direction
+            price_5s_ago = self._get_price_n_seconds_ago(5)
+            if price_5s_ago is not None:
+                momentum = live_price - price_5s_ago
+                if direction == "Up" and momentum < 0:
+                    print(
+                        f"[bot] SKIP (momentum): signal=Up but 5s momentum=${momentum:+.2f} (falling)",
+                        flush=True,
+                    )
+                    return None, {"source": "none", "momentum": None}
+                if direction == "Down" and momentum > 0:
+                    print(
+                        f"[bot] SKIP (momentum): signal=Down but 5s momentum=${momentum:+.2f} (rising)",
+                        flush=True,
+                    )
+                    return None, {"source": "none", "momentum": None}
+                print(f"[bot] momentum OK: 5s=${momentum:+.2f}  direction={direction}", flush=True)
+            else:
+                print("[bot] momentum filter: no 5s reading, continuing", flush=True)
+
+            # Condition c: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
             live_price_b = await self._get_btc_price()
             if live_price_b is None:
