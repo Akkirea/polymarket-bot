@@ -174,11 +174,12 @@ class PaperBot:
         if len(self.positions) >= 3:
             return
 
-        # Trading hours filter — only enter during data-validated ET hours
+        # Trading hours filter — temporarily disabled to collect post-fix data across all hours
+        # Re-enable after sufficient sample size to re-validate hour performance
         hour_et = (datetime.now(timezone.utc).hour - 4) % 24
-        if hour_et not in ALLOWED_HOURS:
-            print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS", flush=True)
-            return
+        # if hour_et not in ALLOWED_HOURS:
+        #     print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS", flush=True)
+        #     return
 
         # Scan active BTC 5m markets
         markets = await self._fetch_active_markets()
