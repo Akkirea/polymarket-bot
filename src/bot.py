@@ -156,6 +156,12 @@ class PaperBot:
         # Continuously collect finalPrices for recent closed markets, independent of position state
         await self._collect_final_prices()
 
+        # Populate rolling BTC price history on every tick so momentum/chop filters
+        # have real 5s/10s readings. Without this, _btc_price_timestamps only has 1-2
+        # stale entries and _get_price_n_seconds_ago returns the current price for all
+        # lookups, making chop_range=0 and blocking every trade.
+        await self._get_btc_price()
+
         # Resolve / force-close all held positions
         now_ts = time.time()
         for pos in list(self.positions):  # snapshot — list mutates during iteration
