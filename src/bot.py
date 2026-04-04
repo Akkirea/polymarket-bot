@@ -77,6 +77,8 @@ class PaperBot:
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._market_start_sources: dict = {}     # slug → source name for cached first-sight price
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
+        self._funding_rate: Optional[float] = None
+        self._funding_rate_updated_at: float = 0.0
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
         for pos in self.positions:
             print(
@@ -147,6 +149,8 @@ class PaperBot:
                 "current_price": round(self._binance_feed.current_price, 2) if self._binance_feed.current_price else None,
                 "last_update":  self._binance_feed.last_update,
             },
+            "funding_rate": self._funding_rate,
+            "funding_rate_updated_at": self._funding_rate_updated_at or None,
         }
 
     def get_recent_trades(self, n: int = 5) -> list:
@@ -418,6 +422,38 @@ class PaperBot:
             return chainlink_price, "chainlink"
         return None, "none"
 
+    async def _get_btc_funding_rate(self) -> Optional[float]:
+        """Fetch BTC funding rate from Bybit and cache it briefly."""
+        now = time.time()
+        if self._funding_rate is not None and (now - self._funding_rate_updated_at) <= 30:
+            return self._funding_rate
+
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{BYBIT_API}/tickers",
+                params={"category": "linear", "symbol": "BTCUSDT"},
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[bot] funding: Bybit returned {resp.status}", flush=True)
+                    return None
+                data = await resp.json()
+        except Exception as exc:
+            print(f"[bot] funding fetch error: {exc}", flush=True)
+            return None
+
+        try:
+            tickers = data.get("result", {}).get("list", [])
+            if not tickers:
+                return None
+            funding_rate = float(tickers[0]["fundingRate"]) * 100
+            self._funding_rate = funding_rate
+            self._funding_rate_updated_at = now
+            return funding_rate
+        except Exception as exc:
+            print(f"[bot] funding parse error: {exc}", flush=True)
+            return None
+
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float], price_source: Optional[str]
     ) -> tuple[Optional[str], dict]:
@@ -480,6 +516,31 @@ class PaperBot:
                                   direction=direction, diff=diff_initial)
                 return None, {"source": "none", "momentum": None}
 
+            funding_rate = await self._get_btc_funding_rate()
+            if funding_rate is None:
+                print("[bot] SKIP: funding unavailable", flush=True)
+                db.log_bot_signal(slug, filter_hit="no_funding", outcome="skipped",
+                                  direction=direction, diff=diff_initial)
+                return None, {"source": "none", "momentum": None}
+            if abs(funding_rate) < FUNDING_THRESHOLD:
+                print(
+                    f"[bot] SKIP (funding): {funding_rate:+.4f}% inside neutral band ±{FUNDING_THRESHOLD:.2f}%",
+                    flush=True,
+                )
+                db.log_bot_signal(slug, filter_hit="funding_neutral", outcome="skipped",
+                                  direction=direction, diff=diff_initial)
+                return None, {"source": "none", "momentum": None}
+            funding_direction = "Up" if funding_rate > 0 else "Down"
+            if funding_direction != direction:
+                print(
+                    f"[bot] SKIP (funding): signal={direction} but funding={funding_rate:+.4f}% ({funding_direction})",
+                    flush=True,
+                )
+                db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
+                                  direction=direction, diff=diff_initial)
+                return None, {"source": "none", "momentum": None}
+            print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
+
             # Condition b1: chop filter — 10s price range must show real movement
             price_10s_ago = self._get_price_n_seconds_ago(10)
             chop_range = abs(live_price - price_10s_ago) if price_10s_ago is not None else None
@@ -494,7 +555,10 @@ class PaperBot:
                                       direction=direction, diff=diff_initial, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
             else:
-                print("[bot] chop filter: no 10s reading, continuing", flush=True)
+                print("[bot] SKIP (chop): no 10s reading", flush=True)
+                db.log_bot_signal(slug, filter_hit="no_chop_history", outcome="skipped",
+                                  direction=direction, diff=diff_initial)
+                return None, {"source": "none", "momentum": None}
 
             # Condition b2: momentum filter — short-term momentum must agree with direction
             price_5s_ago = self._get_price_n_seconds_ago(5)
@@ -520,7 +584,10 @@ class PaperBot:
                     return None, {"source": "none", "momentum": None}
                 print(f"[bot] momentum OK: 5s=${momentum:+.2f}  direction={direction}", flush=True)
             else:
-                print("[bot] momentum filter: no 5s reading, continuing", flush=True)
+                print("[bot] SKIP (momentum): no 5s reading", flush=True)
+                db.log_bot_signal(slug, filter_hit="no_momentum_history", outcome="skipped",
+                                  direction=direction, diff=diff_initial, chop_range=chop_range)
+                return None, {"source": "none", "momentum": None}
 
             # Condition c: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
@@ -556,6 +623,7 @@ class PaperBot:
             return direction, {
                 "source":        f"{live_source}-reversal-guard/{ref_source}",
                 "confirm_source": confirm_source,
+                "funding_rate":  funding_rate,
                 "momentum":      direction,
                 "live_price":    live_price_b,
                 "price_to_beat": reference_price,
