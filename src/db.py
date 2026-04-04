@@ -229,7 +229,22 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_whale_wallets_winrate ON whale_wallets(win_rate DESC);
-        CREATE INDEX IF NOT EXISTS idx_whale_trades_wallet   ON whale_trades(wallet_address)
+        CREATE INDEX IF NOT EXISTS idx_whale_trades_wallet   ON whale_trades(wallet_address);
+
+        CREATE TABLE IF NOT EXISTS bot_signals (
+            id          {_PK},
+            ts          TEXT NOT NULL,
+            slug        TEXT NOT NULL,
+            direction   TEXT,
+            diff        REAL,
+            momentum    REAL,
+            chop_range  REAL,
+            filter_hit  TEXT NOT NULL,
+            outcome     TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bot_signals_ts   ON bot_signals(ts);
+        CREATE INDEX IF NOT EXISTS idx_bot_signals_slug ON bot_signals(slug)
     """)
     conn.commit()
 
@@ -259,6 +274,35 @@ def init_db():
             except Exception:
                 pass  # column already exists
 
+    conn.close()
+
+
+def log_bot_signal(
+    slug: str,
+    filter_hit: str,
+    outcome: str,
+    direction: Optional[str] = None,
+    diff: Optional[float] = None,
+    momentum: Optional[float] = None,
+    chop_range: Optional[float] = None,
+):
+    """Record one evaluated signal — whether it was blocked by a filter or entered."""
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO bot_signals (ts, slug, direction, diff, momentum, chop_range, filter_hit, outcome)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+        (
+            datetime.utcnow().isoformat(),
+            slug,
+            direction,
+            round(diff, 4) if diff is not None else None,
+            round(momentum, 4) if momentum is not None else None,
+            round(chop_range, 4) if chop_range is not None else None,
+            filter_hit,
+            outcome,
+        ),
+    )
+    conn.commit()
     conn.close()
 
 

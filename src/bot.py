@@ -242,6 +242,8 @@ class PaperBot:
                         f"profitability range [{CROWD_MIN}, {CROWD_MAX}]",
                         flush=True,
                     )
+                    db.log_bot_signal(slug, filter_hit="crowd_price", outcome="skipped",
+                                      direction=direction, diff=signals.get("diff_initial"))
                     continue
 
                 diff_at_entry = signals.get("diff_initial")
@@ -388,8 +390,11 @@ class PaperBot:
         reference_price = prev_final if prev_final is not None else price_to_beat
         ref_source  = "prev-finalPrice" if prev_final is not None else "chainlink-first-sight"
 
+        slug = market["slug"]
+
         if reference_price is None:
             print("[bot] SKIP: no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
+            db.log_bot_signal(slug, filter_hit="no_reference", outcome="skipped")
             return None, {"source": "none", "momentum": None}
 
         # Condition 0: minimum prev-window move — only enter if the reference window had momentum
@@ -402,6 +407,7 @@ class PaperBot:
                         f"[bot] SKIP: prev_move ${prev_move:.2f} < MIN_PREV_MOVE ${MIN_PREV_MOVE:.0f} (flat reference window)",
                         flush=True,
                     )
+                    db.log_bot_signal(slug, filter_hit="prev_move", outcome="skipped")
                     return None, {"source": "none", "momentum": None}
 
         self._evaluating = True
@@ -409,6 +415,7 @@ class PaperBot:
             live_price = await self._get_btc_price()
             if live_price is None:
                 print("[bot] BTC: unavailable — skipping, no trade", flush=True)
+                db.log_bot_signal(slug, filter_hit="no_btc_price", outcome="skipped")
                 return None, {"source": "none", "momentum": None}
 
             # Condition a: strong initial move from reference price
@@ -424,37 +431,47 @@ class PaperBot:
                     f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD:.0f}",
                     flush=True,
                 )
+                db.log_bot_signal(slug, filter_hit="diff_threshold", outcome="skipped",
+                                  direction=direction, diff=diff_initial)
                 return None, {"source": "none", "momentum": None}
 
             # Condition b1: chop filter — 10s price range must show real movement
             price_10s_ago = self._get_price_n_seconds_ago(10)
+            chop_range = abs(live_price - price_10s_ago) if price_10s_ago is not None else None
             if price_10s_ago is not None:
-                chop_range = abs(live_price - price_10s_ago)
                 if chop_range < MIN_MOMENTUM_MOVE:
                     print(
                         f"[bot] SKIP (chop): 10s range=${chop_range:.2f} < ${MIN_MOMENTUM_MOVE:.0f}  "
                         f"now=${live_price:,.2f}  10s_ago=${price_10s_ago:,.2f}",
                         flush=True,
                     )
+                    db.log_bot_signal(slug, filter_hit="chop", outcome="skipped",
+                                      direction=direction, diff=diff_initial, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
             else:
                 print("[bot] chop filter: no 10s reading, continuing", flush=True)
 
             # Condition b2: momentum filter — short-term momentum must agree with direction
             price_5s_ago = self._get_price_n_seconds_ago(5)
+            momentum = (live_price - price_5s_ago) if price_5s_ago is not None else None
             if price_5s_ago is not None:
-                momentum = live_price - price_5s_ago
                 if direction == "Up" and momentum < 0:
                     print(
                         f"[bot] SKIP (momentum): signal=Up but 5s momentum=${momentum:+.2f} (falling)",
                         flush=True,
                     )
+                    db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
+                                      direction=direction, diff=diff_initial,
+                                      momentum=momentum, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
                 if direction == "Down" and momentum > 0:
                     print(
                         f"[bot] SKIP (momentum): signal=Down but 5s momentum=${momentum:+.2f} (rising)",
                         flush=True,
                     )
+                    db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
+                                      direction=direction, diff=diff_initial,
+                                      momentum=momentum, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
                 print(f"[bot] momentum OK: 5s=${momentum:+.2f}  direction={direction}", flush=True)
             else:
@@ -465,6 +482,9 @@ class PaperBot:
             live_price_b = await self._get_btc_price()
             if live_price_b is None:
                 print("[bot] SKIP: reversal check fetch failed", flush=True)
+                db.log_bot_signal(slug, filter_hit="reversal_fetch_failed", outcome="skipped",
+                                  direction=direction, diff=diff_initial,
+                                  momentum=momentum, chop_range=chop_range)
                 return None, {"source": "none", "momentum": None}
 
             diff_final = live_price_b - reference_price
@@ -475,6 +495,9 @@ class PaperBot:
                     f"initial=${diff_initial:+.2f}  now=${diff_final:+.2f}",
                     flush=True,
                 )
+                db.log_bot_signal(slug, filter_hit="reversal", outcome="skipped",
+                                  direction=direction, diff=diff_initial,
+                                  momentum=momentum, chop_range=chop_range)
                 return None, {"source": "none", "momentum": None}
 
             print(
@@ -482,6 +505,9 @@ class PaperBot:
                 f"diff_final=${diff_final:+.2f}  ref=${reference_price:,.2f} ({ref_source})",
                 flush=True,
             )
+            db.log_bot_signal(slug, filter_hit="none", outcome="entered",
+                              direction=direction, diff=diff_initial,
+                              momentum=momentum, chop_range=chop_range)
             return direction, {
                 "source":        f"chainlink-reversal-guard/{ref_source}",
                 "momentum":      direction,
