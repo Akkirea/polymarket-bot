@@ -31,7 +31,7 @@ BYBIT_API = "https://api.bybit.com/v5/market"
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 BET_SIZE             = 500.0  # Kelly base cap — 2x hours can go up to $1,000
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
-MIN_PREV_MOVE        = 30.0   # USD — skip if the reference window moved less than this
+MIN_PREV_MOVE        = 40.0   # USD — skip if the reference window moved less than this
 # Data-validated allowed hours (ET = UTC-4). All others blocked.
 # Hours 18+19 statistically significant (p=0.009 combined). Hours 0,4 solid (n=13-15).
 ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
@@ -40,10 +40,10 @@ HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 20    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 45    # enter when seconds_remaining <= this
-MIN_MOMENTUM_MOVE    = 20.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
+MIN_MOMENTUM_MOVE    = 25.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 30.0  # USD — minimum diff from reference price to enter
-REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
+PRICE_DIFF_THRESHOLD = 40.0  # USD — minimum diff from reference price to enter
+REVERSAL_THRESHOLD   = 25.0  # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
