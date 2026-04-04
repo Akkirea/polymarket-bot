@@ -66,6 +66,7 @@ class PaperBot:
         self.total_pnl:   float = 0.0
         self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
+        self._btc_price_task: Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
@@ -112,6 +113,13 @@ class PaperBot:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._btc_price_task:
+            self._btc_price_task.cancel()
+            try:
+                await self._btc_price_task
+            except asyncio.CancelledError:
+                pass
+            self._btc_price_task = None
         if self._session and not self._session.closed:
             await self._session.close()
         print("[bot] Stopped")
@@ -156,11 +164,9 @@ class PaperBot:
         # Continuously collect finalPrices for recent closed markets, independent of position state
         await self._collect_final_prices()
 
-        # Populate rolling BTC price history on every tick so momentum/chop filters
-        # have real 5s/10s readings. Without this, _btc_price_timestamps only has 1-2
-        # stale entries and _get_price_n_seconds_ago returns the current price for all
-        # lookups, making chop_range=0 and blocking every trade.
-        await self._get_btc_price()
+        # Refresh BTC history in the background so momentum/chop filters keep recent
+        # 5s/10s samples without stalling exits or market scans on Chainlink RPC latency.
+        self._schedule_btc_price_refresh()
 
         # Resolve / force-close all held positions
         now_ts = time.time()
@@ -342,6 +348,25 @@ class PaperBot:
 
             except Exception as exc:
                 print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
+
+    def _schedule_btc_price_refresh(self) -> None:
+        """Keep BTC history warm without blocking the critical path on slow RPCs."""
+        if self._btc_price_task and not self._btc_price_task.done():
+            return
+
+        loop = asyncio.get_running_loop()
+        self._btc_price_task = loop.create_task(self._get_btc_price())
+        self._btc_price_task.add_done_callback(self._clear_btc_price_task)
+
+    def _clear_btc_price_task(self, task: asyncio.Task) -> None:
+        if self._btc_price_task is task:
+            self._btc_price_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"[bot] BTC price refresh task error: {exc}", flush=True)
 
     async def _get_btc_price(self) -> Optional[float]:
         """Fetch live BTC/USD from Chainlink on Polygon and append to both history stores."""
