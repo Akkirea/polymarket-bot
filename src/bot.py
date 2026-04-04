@@ -21,6 +21,7 @@ from typing import Optional
 import aiohttp
 
 from . import db
+from .binance_ws import BinancePriceFeed
 from .chainlink import get_btc_price
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -45,6 +46,7 @@ PRICE_DIFF_THRESHOLD = 30.0  # USD — minimum diff from reference price to ente
 REVERSAL_THRESHOLD   = 20.0  # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
+BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 
@@ -66,12 +68,14 @@ class PaperBot:
         self.total_pnl:   float = 0.0
         self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
-        self._btc_price_task: Optional[asyncio.Task] = None
+        self._binance_task: Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
+        self._binance_feed = BinancePriceFeed()
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {end_ts: finalPrice} for recent closed markets
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
+        self._market_start_sources: dict = {}     # slug → source name for cached first-sight price
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
         for pos in self.positions:
@@ -100,6 +104,7 @@ class PaperBot:
             return
         self.running = True
         loop = asyncio.get_running_loop()
+        self._binance_task = loop.create_task(self._binance_feed.connect())
         self._task = loop.create_task(self._loop())
         print("[bot] Started — task created")
 
@@ -113,13 +118,14 @@ class PaperBot:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        if self._btc_price_task:
-            self._btc_price_task.cancel()
+        self._binance_feed.stop()
+        if self._binance_task:
+            self._binance_task.cancel()
             try:
-                await self._btc_price_task
+                await self._binance_task
             except asyncio.CancelledError:
                 pass
-            self._btc_price_task = None
+            self._binance_task = None
         if self._session and not self._session.closed:
             await self._session.close()
         print("[bot] Stopped")
@@ -135,6 +141,12 @@ class PaperBot:
             "win_rate":         round(self.wins / total, 4) if total else 0.0,
             "pnl":              round(self.total_pnl, 2),
             "open_positions":   self.positions,
+            "price_feed": {
+                "source":       "binance",
+                "connected":    self._binance_feed.connected,
+                "current_price": round(self._binance_feed.current_price, 2) if self._binance_feed.current_price else None,
+                "last_update":  self._binance_feed.last_update,
+            },
         }
 
     def get_recent_trades(self, n: int = 5) -> list:
@@ -163,10 +175,6 @@ class PaperBot:
         print(f"[bot] _tick called  positions={len(self.positions)}", flush=True)
         # Continuously collect finalPrices for recent closed markets, independent of position state
         await self._collect_final_prices()
-
-        # Refresh BTC history in the background so momentum/chop filters keep recent
-        # 5s/10s samples without stalling exits or market scans on Chainlink RPC latency.
-        self._schedule_btc_price_refresh()
 
         # Resolve / force-close all held positions
         now_ts = time.time()
@@ -213,10 +221,14 @@ class PaperBot:
 
             # Cache BTC price at first sight — used by reversal-guard as baseline
             if slug not in self._market_start_prices and slug not in self._entered_slugs:
-                start_price = await self._get_btc_price()
+                start_price, start_source = await self._get_signal_price()
                 if start_price is not None:
                     self._market_start_prices[slug] = start_price
-                    print(f"[bot] cached start price for {slug}: ${start_price:,.2f}", flush=True)
+                    self._market_start_sources[slug] = start_source
+                    print(
+                        f"[bot] cached start price for {slug}: ${start_price:,.2f} via {start_source}",
+                        flush=True,
+                    )
                 else:
                     print(f"[bot] BTC price unavailable — cannot cache start price for {slug}", flush=True)
 
@@ -227,14 +239,16 @@ class PaperBot:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
                     continue
                 price_to_beat = self._market_start_prices.get(slug)
+                price_source = self._market_start_sources.get(slug)
                 print(
                     f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s  "
-                    f"ref=${price_to_beat:,.2f}" if price_to_beat else
+                    f"ref=${price_to_beat:,.2f} ({price_source})" if price_to_beat else
                     f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s  ref=None",
                     flush=True,
                 )
-                direction, signals = await self._evaluate_signals(market, price_to_beat)
+                direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
                 self._market_start_prices.pop(slug, None)
+                self._market_start_sources.pop(slug, None)
                 self._entered_slugs.add(slug)
 
                 if direction is None:
@@ -349,25 +363,6 @@ class PaperBot:
             except Exception as exc:
                 print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
 
-    def _schedule_btc_price_refresh(self) -> None:
-        """Keep BTC history warm without blocking the critical path on slow RPCs."""
-        if self._btc_price_task and not self._btc_price_task.done():
-            return
-
-        loop = asyncio.get_running_loop()
-        self._btc_price_task = loop.create_task(self._get_btc_price())
-        self._btc_price_task.add_done_callback(self._clear_btc_price_task)
-
-    def _clear_btc_price_task(self, task: asyncio.Task) -> None:
-        if self._btc_price_task is task:
-            self._btc_price_task = None
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            print(f"[bot] BTC price refresh task error: {exc}", flush=True)
-
     async def _get_btc_price(self) -> Optional[float]:
         """Fetch live BTC/USD from Chainlink on Polygon and append to both history stores."""
         try:
@@ -388,18 +383,43 @@ class PaperBot:
             return None
 
     def _get_price_n_seconds_ago(self, n: float) -> Optional[float]:
-        """Return the Chainlink reading closest to n seconds ago.
-        Returns None if no reading exists within 10s of the target timestamp."""
+        """Return the nearest recent BTC reading, preferring Binance history."""
+        target = time.time() - n
+
+        if self._binance_feed.connected:
+            price = self._find_closest_price(self._binance_feed._price_history, target, max_gap=2.0)
+            if price is not None:
+                return price
+
         if not self._btc_price_timestamps:
             return None
-        target = time.time() - n
-        closest_ts, closest_price = min(self._btc_price_timestamps, key=lambda x: abs(x[0] - target))
-        if abs(closest_ts - target) > 10:
+        return self._find_closest_price(self._btc_price_timestamps, target, max_gap=10.0)
+
+    def _find_closest_price(self, history, target: float, max_gap: float) -> Optional[float]:
+        if not history:
+            return None
+        closest_ts, closest_price = min(history, key=lambda x: abs(x[0] - target))
+        if abs(closest_ts - target) > max_gap:
             return None
         return closest_price
 
+    def _binance_is_fresh(self) -> bool:
+        if self._binance_feed.current_price is None or self._binance_feed.last_update is None:
+            return False
+        return (time.time() - self._binance_feed.last_update) <= BINANCE_STALE_AFTER
+
+    async def _get_signal_price(self) -> tuple[Optional[float], str]:
+        """Prefer Binance for fast signal reads, fall back to Chainlink when cold."""
+        if self._binance_is_fresh():
+            return self._binance_feed.current_price, "binance"
+
+        chainlink_price = await self._get_btc_price()
+        if chainlink_price is not None:
+            return chainlink_price, "chainlink"
+        return None, "none"
+
     async def _evaluate_signals(
-        self, market: dict, price_to_beat: Optional[float]
+        self, market: dict, price_to_beat: Optional[float], price_source: Optional[str]
     ) -> tuple[Optional[str], dict]:
         """
         Two-condition entry:
@@ -413,7 +433,7 @@ class PaperBot:
         end_ts      = int(market["slug"].split("-")[-1])
         prev_final  = self._final_price_cache.get(end_ts - 300)
         reference_price = prev_final if prev_final is not None else price_to_beat
-        ref_source  = "prev-finalPrice" if prev_final is not None else "chainlink-first-sight"
+        ref_source  = "prev-finalPrice" if prev_final is not None else f"{price_source or 'unknown'}-first-sight"
 
         slug = market["slug"]
 
@@ -437,7 +457,7 @@ class PaperBot:
 
         self._evaluating = True
         try:
-            live_price = await self._get_btc_price()
+            live_price, live_source = await self._get_signal_price()
             if live_price is None:
                 print("[bot] BTC: unavailable — skipping, no trade", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_btc_price", outcome="skipped")
@@ -447,7 +467,7 @@ class PaperBot:
             diff_initial = live_price - reference_price
             print(
                 f"[bot] signals: diff_initial=${diff_initial:+.2f}  "
-                f"now=${live_price:,.2f}  ref=${reference_price:,.2f} ({ref_source})",
+                f"now=${live_price:,.2f} ({live_source})  ref=${reference_price:,.2f} ({ref_source})",
                 flush=True,
             )
             direction = "Up" if diff_initial > 0 else "Down"
@@ -504,7 +524,7 @@ class PaperBot:
 
             # Condition c: reversal guard — wait 3s, re-fetch, confirm move still holding
             await asyncio.sleep(3)
-            live_price_b = await self._get_btc_price()
+            live_price_b, confirm_source = await self._get_signal_price()
             if live_price_b is None:
                 print("[bot] SKIP: reversal check fetch failed", flush=True)
                 db.log_bot_signal(slug, filter_hit="reversal_fetch_failed", outcome="skipped",
@@ -534,7 +554,8 @@ class PaperBot:
                               direction=direction, diff=diff_initial,
                               momentum=momentum, chop_range=chop_range)
             return direction, {
-                "source":        f"chainlink-reversal-guard/{ref_source}",
+                "source":        f"{live_source}-reversal-guard/{ref_source}",
+                "confirm_source": confirm_source,
                 "momentum":      direction,
                 "live_price":    live_price_b,
                 "price_to_beat": reference_price,
