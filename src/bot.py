@@ -61,11 +61,12 @@ class PaperBot:
     def __init__(self):
         db.init_db()
         state = db.load_bot_state()
+        performance = db.load_bot_performance()
         self.balance:     float = state["balance"]
         self.positions:   list  = db.load_open_positions()   # up to 2 concurrent positions
-        self.wins:        int   = 0
-        self.losses:      int   = 0
-        self.total_pnl:   float = 0.0
+        self.wins:        int   = performance["wins"]
+        self.losses:      int   = performance["losses"]
+        self.total_pnl:   float = performance["total_pnl"]
         self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
         self._binance_task: Optional[asyncio.Task] = None
@@ -79,7 +80,13 @@ class PaperBot:
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         self._funding_rate: Optional[float] = None
         self._funding_rate_updated_at: float = 0.0
+        self._funding_rate_source: Optional[str] = None
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
+        print(
+            f"[bot] Loaded stats from DB: wins={self.wins} losses={self.losses} "
+            f"pnl=${self.total_pnl:.2f}",
+            flush=True,
+        )
         for pos in self.positions:
             print(
                 f"[bot] Restored open position from DB: {pos['side']} "
@@ -151,6 +158,7 @@ class PaperBot:
             },
             "funding_rate": self._funding_rate,
             "funding_rate_updated_at": self._funding_rate_updated_at or None,
+            "funding_rate_source": self._funding_rate_source,
         }
 
     def get_recent_trades(self, n: int = 5) -> list:
@@ -423,35 +431,64 @@ class PaperBot:
         return None, "none"
 
     async def _get_btc_funding_rate(self) -> Optional[float]:
-        """Fetch BTC funding rate from Bybit and cache it briefly."""
+        """Fetch BTC funding rate from public derivatives APIs and cache it briefly."""
         now = time.time()
         if self._funding_rate is not None and (now - self._funding_rate_updated_at) <= 30:
             return self._funding_rate
 
         session = await self._get_session()
-        try:
-            async with session.get(
+        sources = (
+            (
+                "bybit",
                 f"{BYBIT_API}/tickers",
-                params={"category": "linear", "symbol": "BTCUSDT"},
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[bot] funding: Bybit returned {resp.status}", flush=True)
-                    return None
-                data = await resp.json()
-        except Exception as exc:
-            print(f"[bot] funding fetch error: {exc}", flush=True)
-            return None
+                {"category": "linear", "symbol": "BTCUSDT"},
+                self._parse_bybit_funding_rate,
+            ),
+            (
+                "binance",
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                {"symbol": "BTCUSDT"},
+                self._parse_binance_funding_rate,
+            ),
+        )
 
+        for source_name, url, params, parser in sources:
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        print(f"[bot] funding: {source_name} returned {resp.status}", flush=True)
+                        continue
+                    data = await resp.json()
+                funding_rate = parser(data)
+                if funding_rate is None:
+                    print(f"[bot] funding: {source_name} returned no usable funding rate", flush=True)
+                    continue
+                self._funding_rate = funding_rate
+                self._funding_rate_updated_at = now
+                self._funding_rate_source = source_name
+                return funding_rate
+            except Exception as exc:
+                print(f"[bot] funding fetch error from {source_name}: {exc}", flush=True)
+
+        self._funding_rate = None
+        self._funding_rate_source = None
+        return None
+
+    def _parse_bybit_funding_rate(self, data: dict) -> Optional[float]:
         try:
             tickers = data.get("result", {}).get("list", [])
             if not tickers:
                 return None
-            funding_rate = float(tickers[0]["fundingRate"]) * 100
-            self._funding_rate = funding_rate
-            self._funding_rate_updated_at = now
-            return funding_rate
+            return float(tickers[0]["fundingRate"]) * 100
         except Exception as exc:
-            print(f"[bot] funding parse error: {exc}", flush=True)
+            print(f"[bot] funding parse error from bybit: {exc}", flush=True)
+            return None
+
+    def _parse_binance_funding_rate(self, data: dict) -> Optional[float]:
+        try:
+            return float(data["lastFundingRate"]) * 100
+        except Exception as exc:
+            print(f"[bot] funding parse error from binance: {exc}", flush=True)
             return None
 
     async def _evaluate_signals(

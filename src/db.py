@@ -489,6 +489,27 @@ def load_bot_state() -> dict:
     return {"balance": INITIAL_BALANCE}
 
 
+def load_bot_performance() -> dict:
+    """Return aggregate win/loss/P&L from resolved bot trades."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT
+               COUNT(*) AS total_trades,
+               COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+               COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,
+               COALESCE(SUM(pnl), 0) AS total_pnl
+           FROM bot_trades
+           WHERE pnl IS NOT NULL"""
+    ).fetchone()
+    conn.close()
+    return {
+        "total_trades": int(row["total_trades"] or 0),
+        "wins": int(row["wins"] or 0),
+        "losses": int(row["losses"] or 0),
+        "total_pnl": float(row["total_pnl"] or 0.0),
+    }
+
+
 def save_bot_state(balance: float):
     """Upsert the single bot_state row."""
     conn = get_connection()
