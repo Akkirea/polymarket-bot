@@ -188,6 +188,16 @@ class PaperBot:
         # Continuously collect finalPrices for recent closed markets, independent of position state
         await self._collect_final_prices()
 
+        # Keep fallback history warm when Binance is stale/disconnected so the
+        # 5s/10s momentum checks still have usable samples.
+        if not self._binance_is_fresh():
+            fallback_price, fallback_source = await self._get_signal_price()
+            if fallback_price is not None:
+                print(
+                    f"[bot] warmed fallback price history: ${fallback_price:,.2f} via {fallback_source}",
+                    flush=True,
+                )
+
         # Resolve / force-close all held positions
         now_ts = time.time()
         for pos in list(self.positions):  # snapshot — list mutates during iteration
@@ -259,9 +269,6 @@ class PaperBot:
                     flush=True,
                 )
                 direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
-                self._market_start_prices.pop(slug, None)
-                self._market_start_sources.pop(slug, None)
-                self._entered_slugs.add(slug)
 
                 if direction is None:
                     print(f"[bot] SKIP: no clear signal — {signals}", flush=True)
@@ -278,6 +285,9 @@ class PaperBot:
                                       direction=direction, diff=signals.get("diff_initial"))
                     continue
 
+                self._market_start_prices.pop(slug, None)
+                self._market_start_sources.pop(slug, None)
+                self._entered_slugs.add(slug)
                 diff_at_entry = signals.get("diff_initial")
                 print(
                     f"[bot] reversal-guard ENTRY: {direction} on {slug}  "
