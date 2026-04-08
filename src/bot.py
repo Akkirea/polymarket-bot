@@ -31,7 +31,7 @@ BYBIT_API = "https://api.bybit.com/v5/market"
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 BET_SIZE             = 500.0  # Kelly base cap — 2x hours can go up to $1,000
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
-MIN_PREV_MOVE        = 40.0   # USD — skip if the reference window moved less than this
+MIN_PREV_MOVE        = 25.0   # USD — skip if the reference window moved less than this
 # Data-validated allowed hours (ET = UTC-4). All others blocked.
 # Hours 18+19 statistically significant (p=0.009 combined). Hours 0,4 solid (n=13-15).
 ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
@@ -40,10 +40,10 @@ HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 20    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 45    # enter when seconds_remaining <= this
-MIN_MOMENTUM_MOVE    = 25.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
+MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
-PRICE_DIFF_THRESHOLD = 25.0  # USD — minimum diff from reference price to enter
-REVERSAL_THRESHOLD   = 15.0  # USD — diff must still be >= this after 3s re-check
+PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to enter
+REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
@@ -565,28 +565,26 @@ class PaperBot:
 
             funding_rate = await self._get_btc_funding_rate()
             if funding_rate is None:
-                print("[bot] SKIP: funding unavailable", flush=True)
-                db.log_bot_signal(slug, filter_hit="no_funding", outcome="skipped",
-                                  direction=direction, diff=diff_initial)
-                return None, {"source": "none", "momentum": None}
-            if abs(funding_rate) < FUNDING_THRESHOLD:
-                print(
-                    f"[bot] SKIP (funding): {funding_rate:+.4f}% inside neutral band ±{FUNDING_THRESHOLD:.2f}%",
-                    flush=True,
-                )
-                db.log_bot_signal(slug, filter_hit="funding_neutral", outcome="skipped",
-                                  direction=direction, diff=diff_initial)
-                return None, {"source": "none", "momentum": None}
-            funding_direction = "Up" if funding_rate > 0 else "Down"
-            if funding_direction != direction:
-                print(
-                    f"[bot] SKIP (funding): signal={direction} but funding={funding_rate:+.4f}% ({funding_direction})",
-                    flush=True,
-                )
-                db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
-                                  direction=direction, diff=diff_initial)
-                return None, {"source": "none", "momentum": None}
-            print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
+                print("[bot] funding unavailable — proceeding without funding filter", flush=True)
+            else:
+                if abs(funding_rate) < FUNDING_THRESHOLD:
+                    print(
+                        f"[bot] SKIP (funding): {funding_rate:+.4f}% inside neutral band ±{FUNDING_THRESHOLD:.2f}%",
+                        flush=True,
+                    )
+                    db.log_bot_signal(slug, filter_hit="funding_neutral", outcome="skipped",
+                                      direction=direction, diff=diff_initial)
+                    return None, {"source": "none", "momentum": None}
+                funding_direction = "Up" if funding_rate > 0 else "Down"
+                if funding_direction != direction:
+                    print(
+                        f"[bot] SKIP (funding): signal={direction} but funding={funding_rate:+.4f}% ({funding_direction})",
+                        flush=True,
+                    )
+                    db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
+                                      direction=direction, diff=diff_initial)
+                    return None, {"source": "none", "momentum": None}
+                print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
 
             # Condition b1: chop filter — 10s price range must show real movement
             price_10s_ago = self._get_price_n_seconds_ago(10)
