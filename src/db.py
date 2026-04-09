@@ -584,21 +584,31 @@ def load_open_positions() -> list:
         "diff_at_entry, seconds_remaining, strategy FROM bot_open_positions"
     ).fetchall()
     conn.close()
-    return [
-        {
-            "market_slug":       row["market_slug"],
-            "side":              row["side"],
-            "size":              float(row["size"]),
-            "entry_price":       float(row["entry_price"]),
-            "price_to_beat":     float(row["price_to_beat"]) if row["price_to_beat"] is not None else None,
-            "end_ts":            float(row["end_ts"]),
-            "opened_at":         row["opened_at"],
-            "diff_at_entry":     float(row["diff_at_entry"]) if row["diff_at_entry"] is not None else None,
-            "seconds_remaining": float(row["seconds_remaining"]) if row["seconds_remaining"] is not None else None,
-            "strategy":          row["strategy"],
-        }
-        for row in rows
-    ]
+    positions = []
+    for row in rows:
+        market_slug = row["market_slug"]
+        end_ts = float(row["end_ts"])
+        try:
+            slug_start_ts = float(str(market_slug).rsplit("-", 1)[-1])
+            if abs(end_ts - slug_start_ts) < 1:
+                end_ts += 300.0
+        except (ValueError, IndexError):
+            pass
+        positions.append(
+            {
+                "market_slug":       market_slug,
+                "side":              row["side"],
+                "size":              float(row["size"]),
+                "entry_price":       float(row["entry_price"]),
+                "price_to_beat":     float(row["price_to_beat"]) if row["price_to_beat"] is not None else None,
+                "end_ts":            end_ts,
+                "opened_at":         row["opened_at"],
+                "diff_at_entry":     float(row["diff_at_entry"]) if row["diff_at_entry"] is not None else None,
+                "seconds_remaining": float(row["seconds_remaining"]) if row["seconds_remaining"] is not None else None,
+                "strategy":          row["strategy"],
+            }
+        )
+    return positions
 
 
 def clear_open_position(market_slug: str):
