@@ -114,6 +114,7 @@ class PaperBot:
         self.running = True
         loop = asyncio.get_running_loop()
         self._binance_task = loop.create_task(self._binance_feed.connect())
+        loop.create_task(self._reconcile_unresolved_trades())
         self._task = loop.create_task(self._loop())
         print("[bot] Started — task created")
 
@@ -793,34 +794,37 @@ class PaperBot:
             print(f"[bot] DB write failed after force-close — trade lost but position cleared: {exc}\n{traceback.format_exc()}", flush=True)
 
     async def _backfill_resolution_price(self, slug: str, end_ts: float):
-        """Background task: wait until ~15 min past close, then fetch finalPrice
-        from eventMetadata and write it to bot_trades if still missing."""
+        """Background task: wait until resolution data is available, then settle."""
         wait = max(0.0, (end_ts + 900) - time.time())
         print(f"[bot] backfill: waiting {wait:.0f}s to fetch finalPrice for {slug}", flush=True)
         await asyncio.sleep(wait)
 
         for attempt in range(3):
             try:
-                session = await self._get_session()
-                async with session.get(
-                    f"{GAMMA_API}/markets", params={"slug": slug}
-                ) as resp:
-                    markets = await resp.json()
-                if not markets:
-                    break
-                m      = markets[0]
-                events = m.get("events", [])
-                meta   = (events[0].get("eventMetadata") or {}) if events else {}
-                final_price = meta.get("finalPrice")
-                if final_price is not None:
-                    db.update_resolution_price(slug, float(final_price))
+                winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
+                if winner is not None:
+                    settled = db.settle_unresolved_bot_trade(
+                        slug,
+                        winner,
+                        resolution_price=final_price,
+                        poly_price_to_beat=poly_price_to_beat,
+                    )
+                    if settled:
+                        self._reload_accounting_state()
+                        print(
+                            f"[bot] backfill: {slug} settled → {winner} pnl=${settled['pnl']:+.2f}",
+                            flush=True,
+                        )
+                        return
+                    if final_price is not None:
+                        db.update_resolution_price(slug, float(final_price))
                     print(
                         f"[bot] backfill: {slug} → finalPrice={float(final_price):.2f} written",
                         flush=True,
                     )
                     return
                 print(
-                    f"[bot] backfill: attempt {attempt + 1}/3 — finalPrice not yet available for {slug}",
+                    f"[bot] backfill: attempt {attempt + 1}/3 — resolution not yet available for {slug}",
                     flush=True,
                 )
             except Exception as exc:
@@ -828,6 +832,49 @@ class PaperBot:
             await asyncio.sleep(300)  # wait 5 more minutes before next attempt
 
         print(f"[bot] backfill: gave up on finalPrice for {slug}", flush=True)
+
+    def _reload_accounting_state(self) -> None:
+        state = db.load_bot_state()
+        performance = db.load_bot_performance()
+        self.balance = state["balance"]
+        self.wins = performance["wins"]
+        self.losses = performance["losses"]
+        self.total_pnl = performance["total_pnl"]
+        db.save_bot_state(self.balance)
+        print(
+            f"[bot] accounting reload: balance=${self.balance:.2f} "
+            f"wins={self.wins} losses={self.losses} pnl=${self.total_pnl:.2f}",
+            flush=True,
+        )
+
+    async def _reconcile_unresolved_trades(self) -> None:
+        unresolved = db.load_unresolved_bot_trades()
+        if not unresolved:
+            return
+        print(f"[bot] reconcile: checking {len(unresolved)} unresolved trades", flush=True)
+        settled_count = 0
+        for row in unresolved:
+            slug = row["market_slug"]
+            end_ts = _extract_end_ts(slug)
+            if end_ts is None:
+                continue
+            winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
+            if winner is None:
+                continue
+            settled = db.settle_unresolved_bot_trade(
+                slug,
+                winner,
+                resolution_price=final_price,
+                poly_price_to_beat=poly_price_to_beat,
+            )
+            if settled:
+                settled_count += 1
+                print(
+                    f"[bot] reconcile: {slug} settled → {winner} pnl=${settled['pnl']:+.2f}",
+                    flush=True,
+                )
+        if settled_count:
+            self._reload_accounting_state()
 
     async def _try_resolve(self, pos: dict):
         slug   = pos["market_slug"]

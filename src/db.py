@@ -480,13 +480,20 @@ INITIAL_BALANCE = 10_000.0
 
 
 def load_bot_state() -> dict:
-    """Return persisted bot state, or defaults if none exists yet."""
+    """Return balance derived from the trade ledger and open positions."""
     conn = get_connection()
-    row = conn.execute("SELECT balance FROM bot_state WHERE id = 1").fetchone()
+    realized = conn.execute(
+        """SELECT COALESCE(SUM(pnl), 0) AS total
+             FROM bot_trades
+            WHERE pnl IS NOT NULL
+              AND COALESCE(outcome, '') != 'unresolved'"""
+    ).fetchone()
+    reserved = conn.execute(
+        "SELECT COALESCE(SUM(size), 0) AS total FROM bot_open_positions"
+    ).fetchone()
     conn.close()
-    if row:
-        return {"balance": float(row["balance"])}
-    return {"balance": INITIAL_BALANCE}
+    balance = INITIAL_BALANCE + float(realized["total"] or 0.0) - float(reserved["total"] or 0.0)
+    return {"balance": balance}
 
 
 def load_bot_performance() -> dict:
@@ -496,10 +503,11 @@ def load_bot_performance() -> dict:
         """SELECT
                COUNT(*) AS total_trades,
                COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
-               COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,
+               COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses,
                COALESCE(SUM(pnl), 0) AS total_pnl
            FROM bot_trades
-           WHERE pnl IS NOT NULL"""
+           WHERE pnl IS NOT NULL
+             AND COALESCE(outcome, '') != 'unresolved'"""
     ).fetchone()
     conn.close()
     return {
@@ -611,6 +619,69 @@ def update_resolution_price(market_slug: str, resolution_price: float):
     )
     conn.commit()
     conn.close()
+
+
+def load_unresolved_bot_trades(limit: int = 200) -> list:
+    """Return unresolved placeholder trades that still need settlement."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT market_slug, side, size, entry_price, opened_at
+             FROM bot_trades
+            WHERE outcome = 'unresolved'
+            ORDER BY opened_at DESC
+            LIMIT %s""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def settle_unresolved_bot_trade(
+    market_slug: str,
+    winner: str,
+    resolution_price: Optional[float] = None,
+    poly_price_to_beat: Optional[float] = None,
+) -> Optional[dict]:
+    """Convert an unresolved placeholder row into a settled trade."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT side, size, entry_price
+             FROM bot_trades
+            WHERE market_slug = %s
+              AND outcome = 'unresolved'
+            ORDER BY opened_at DESC
+            LIMIT 1""",
+        (market_slug,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    side = row["side"]
+    size = float(row["size"] or 0.0)
+    entry_price = float(row["entry_price"] or 0.5)
+    won = side == winner
+    pnl = size * (1.0 / entry_price - 1.0) if won else -size
+
+    conn.execute(
+        """UPDATE bot_trades
+              SET outcome = %s,
+                  pnl = %s,
+                  resolution_price = COALESCE(%s, resolution_price),
+                  poly_price_to_beat = COALESCE(%s, poly_price_to_beat)
+            WHERE market_slug = %s
+              AND outcome = 'unresolved'""",
+        (
+            winner,
+            round(pnl, 2),
+            round(resolution_price, 2) if resolution_price is not None else None,
+            round(poly_price_to_beat, 2) if poly_price_to_beat is not None else None,
+            market_slug,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"won": won, "pnl": round(pnl, 2)}
 
 
 def get_top_whale_wallets(limit: int = 5) -> list:

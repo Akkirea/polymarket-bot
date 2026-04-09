@@ -110,7 +110,9 @@ def get_bot_stats():
     conn = db.get_connection()
     try:
         rows = conn.execute(
-            "SELECT pnl, outcome, side, opened_at FROM bot_trades WHERE pnl IS NOT NULL ORDER BY opened_at"
+            "SELECT pnl, outcome, side, opened_at FROM bot_trades "
+            "WHERE pnl IS NOT NULL AND COALESCE(outcome, '') != 'unresolved' "
+            "ORDER BY opened_at"
         ).fetchall()
     finally:
         conn.close()
@@ -124,7 +126,7 @@ def get_bot_stats():
 
     pnls   = [r["pnl"] for r in rows]
     wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
+    losses = [p for p in pnls if p < 0]
     total  = len(pnls)
 
     by_day: dict = {}
