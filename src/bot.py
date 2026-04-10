@@ -14,6 +14,7 @@ Usage (started automatically by api.py endpoints):
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -959,12 +960,11 @@ class PaperBot:
         price_to_beat: Optional[float] = None
         winner:        Optional[str]   = None
 
-        import json as _json
         events = m.get("events", [])
         meta   = (events[0].get("eventMetadata") or {}) if events else {}
         print(
             f"[bot] resolve raw: slug={slug}  events={len(events)}  "
-            f"meta={_json.dumps(meta)}  winner_field={m.get('winner')!r}  "
+            f"meta={json.dumps(meta)}  winner_field={m.get('winner')!r}  "
             f"outcomePrices={m.get('outcomePrices')!r}",
             flush=True,
         )
@@ -993,11 +993,11 @@ class PaperBot:
                 )
                 return None, None, None
 
-            # 25+ min elapsed — finalPrice isn't coming; fall back to outcomePrices
+            # 25+ min elapsed — finalPrice isn't coming; fall back to outcomePrices.
             # Order is not assumed — label comes from outcomes[i].
             try:
-                outcomes       = _json.loads(m.get("outcomes", "[]"))
-                outcome_prices = _json.loads(m.get("outcomePrices", "[]"))
+                outcomes       = json.loads(m.get("outcomes", "[]"))
+                outcome_prices = json.loads(m.get("outcomePrices", "[]"))
                 for i, price_str in enumerate(outcome_prices):
                     if float(price_str) >= 0.99:
                         winner = outcomes[i]
@@ -1016,6 +1016,20 @@ class PaperBot:
                     flush=True,
                 )
                 return None, None, None
+
+            # outcomePrices gives us the winner but not the actual settlement BTC price.
+            # Pull it from _final_price_cache if _collect_final_prices() already fetched it.
+            if final_price is None:
+                start_ts_for_cache = _extract_start_ts(slug)
+                if start_ts_for_cache is not None:
+                    cached_fp = self._final_price_cache.get(start_ts_for_cache)
+                    if cached_fp is not None:
+                        final_price = cached_fp
+                        print(
+                            f"[bot] resolve: pulled finalPrice=${final_price:,.2f} "
+                            f"from _final_price_cache for {slug}",
+                            flush=True,
+                        )
 
         return winner, final_price, price_to_beat
 
@@ -1117,8 +1131,8 @@ def _side_price(market: dict, side: str) -> float:
     try:
         outcomes_raw = market.get("outcomes",      '["Up","Down"]')
         prices_raw   = market.get("outcomePrices", "[0.5,0.5]")
-        outcomes = eval(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-        prices   = eval(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices   = json.loads(prices_raw)   if isinstance(prices_raw,   str) else prices_raw
         return float(prices[outcomes.index(side)])
     except Exception:
         return 0.5
