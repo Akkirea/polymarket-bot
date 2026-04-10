@@ -29,7 +29,7 @@ from rich.text import Text
 
 from . import config
 from . import db
-from .price_feed import PriceFeed
+from .binance_ws import BinancePriceFeed as PriceFeed
 from .polymarket_api import PolymarketClient
 from .edge_detector import detect_edge
 from .paper_trader import PaperTrader
@@ -239,6 +239,14 @@ async def main():
     status = "initializing..."
     top_wallets: list = []
     whale_last_run: float = 0
+    # BTC price recorded at the moment each market was first seen.
+    # Key = market["id"], value = BTC price (float).
+    # This is the correct price_to_beat: the oracle compares window-open
+    # BTC vs window-close BTC, not entry-time BTC vs close BTC.
+    window_open_prices: dict = {}
+    # Tracks when we last attempted Polymarket API resolution per market_id.
+    # Prevents hammering the API every tick for unresolved positions.
+    resolve_last_attempt: dict = {}
 
     def add_log(msg: str, style: str = ""):
         signal_log.append({
@@ -285,8 +293,13 @@ async def main():
                         market = await poly_client.poll_market()
 
                         if market:
-                            if not poly_client.current_market or poly_client.current_market.get("id") != market.get("id"):
+                            market_id = market.get("id", "")
+                            if not poly_client.current_market or poly_client.current_market.get("id") != market_id:
                                 add_log(f"Market found: {market['question'][:50]}")
+                            # Cache BTC price at window open (first time we see this market)
+                            if market_id and market_id not in window_open_prices and price_feed.current_price:
+                                window_open_prices[market_id] = price_feed.current_price
+                                add_log(f"Window open BTC: ${price_feed.current_price:,.2f}")
                             db.log_market_snapshot(market)
                         else:
                             add_log("No active 5-min BTC market found")
@@ -326,11 +339,15 @@ async def main():
 
                                 # Paper trade if conditions met
                                 if trader.can_trade() and edge_signal.confidence != "low":
-                                    pos = trader.open_position(edge_signal, market)
+                                    wop = window_open_prices.get(market.get("id", ""))
+                                    pos = trader.open_position(
+                                        edge_signal, market, window_open_price=wop
+                                    )
                                     if pos:
                                         add_log(
                                             f"PAPER OPEN: {pos.side.upper()} "
                                             f"@{pos.entry_price:.3f} "
+                                            f"ptb=${pos.price_to_beat:,.2f} "
                                             f"${pos.size:.2f}"
                                         )
 
@@ -342,19 +359,54 @@ async def main():
                     else:
                         status = "waiting for data..."
 
-                    # ── Resolve expired positions
-                    expired = trader.get_expired_positions()
+                    # ── Resolve expired positions ──────────────────────────────
+                    # Strategy:
+                    # 1. Wait ≥30s after close for Polymarket to publish resolution.
+                    # 2. Hit the API at most once every 15s per position.
+                    # 3. After 10 min with no API resolution, fall back to comparing
+                    #    current BTC vs price_to_beat (less accurate but unblocks P&L).
+                    now_ts = time.time()
+                    expired = trader.get_expired_positions(now_ts)
                     for pos in expired:
-                        if price_feed.current_price:
-                            # "Up" wins if final BTC >= price at window open
-                            outcome = "up" if price_feed.current_price >= pos.price_to_beat else "down"
-                            trade = trader.resolve_position(pos, outcome)
+                        time_past_close = now_ts - pos.end_ts
+                        if time_past_close < 30:
+                            continue  # give Polymarket time to post resolution
+
+                        last_attempt = resolve_last_attempt.get(pos.market_id, 0)
+                        if now_ts - last_attempt < 15:
+                            continue  # throttle API calls
+
+                        resolve_last_attempt[pos.market_id] = now_ts
+                        winner, final_price, ptb = await poly_client.get_resolution(
+                            pos.market_id, slug=pos.slug
+                        )
+
+                        if winner is not None:
+                            trade = trader.resolve_position(pos, winner)
                             won = trade["pnl"] > 0
+                            fp_str = f"${final_price:,.2f}" if final_price else "n/a"
                             add_log(
-                                f"{'✓ WIN' if won else '✗ LOSS'}: {pos.side.upper()} "
-                                f"open={pos.price_to_beat:,.2f} final={price_feed.current_price:,.2f} "
+                                f"{'✓ WIN' if won else '✗ LOSS'} (poly): "
+                                f"{pos.side.upper()} final={fp_str} "
                                 f"PnL={trade['pnl']:+.2f}"
                             )
+                            resolve_last_attempt.pop(pos.market_id, None)
+
+                        elif time_past_close >= 600:
+                            # 10 min elapsed — API never returned resolution.
+                            # Fall back to BTC price comparison as approximation.
+                            if price_feed.current_price and pos.price_to_beat:
+                                outcome = "up" if price_feed.current_price >= pos.price_to_beat else "down"
+                                trade = trader.resolve_position(pos, outcome)
+                                won = trade["pnl"] > 0
+                                add_log(
+                                    f"{'✓ WIN' if won else '✗ LOSS'} (approx): "
+                                    f"{pos.side.upper()} "
+                                    f"open=${pos.price_to_beat:,.2f} "
+                                    f"cur=${price_feed.current_price:,.2f} "
+                                    f"PnL={trade['pnl']:+.2f}"
+                                )
+                                resolve_last_attempt.pop(pos.market_id, None)
 
                     # ── Refresh whale data every 60 seconds
                     import time as _time

@@ -12,6 +12,7 @@ Polymarket 5-min markets:
 """
 
 import asyncio
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -171,13 +172,13 @@ class PolymarketClient:
             # Parse outcomes — can be JSON string or list
             if isinstance(outcomes, str):
                 try:
-                    outcomes = eval(outcomes)  # often comes as '["Up", "Down"]'
+                    outcomes = json.loads(outcomes)
                 except Exception:
                     outcomes = ["Up", "Down"]
 
             if isinstance(outcome_prices, str):
                 try:
-                    outcome_prices = eval(outcome_prices)
+                    outcome_prices = json.loads(outcome_prices)
                 except Exception:
                     outcome_prices = [0.5, 0.5]
 
@@ -196,6 +197,7 @@ class PolymarketClient:
 
             return {
                 "id": raw.get("id", ""),
+                "slug": raw.get("slug", ""),
                 "condition_id": raw.get("conditionId", ""),
                 "question": question,
                 "up_price": up_price,
@@ -210,6 +212,70 @@ class PolymarketClient:
 
         except Exception:
             return None
+
+    async def get_resolution(
+        self, market_id: str, slug: str = ""
+    ) -> tuple:
+        """
+        Fetch authoritative settlement data for a closed market.
+
+        Returns (winner, final_price, price_to_beat) where winner is "up" or
+        "down" (lowercase). Returns (None, None, None) if not yet resolved.
+
+        Tries eventMetadata.finalPrice vs priceToBeat first (authoritative),
+        then falls back to outcomePrices >= 0.99 for markets that resolve
+        without publishing finalPrice.
+        """
+        session = await self._get_session()
+        params = {"slug": slug} if slug else {"id": market_id}
+        try:
+            async with session.get(
+                f"{config.GAMMA_API_BASE}/markets", params=params
+            ) as resp:
+                if resp.status != 200:
+                    return None, None, None
+                markets = await resp.json()
+        except Exception:
+            return None, None, None
+
+        if not markets:
+            return None, None, None
+
+        m = markets[0]
+        if not m.get("closed"):
+            return None, None, None
+
+        # ── Primary: eventMetadata.finalPrice vs priceToBeat ──────────────
+        events = m.get("events", [])
+        meta = (events[0].get("eventMetadata") or {}) if events else {}
+
+        final_price: Optional[float] = None
+        price_to_beat: Optional[float] = None
+
+        try:
+            if meta.get("finalPrice") is not None:
+                final_price = float(meta["finalPrice"])
+            if meta.get("priceToBeat") is not None:
+                price_to_beat = float(meta["priceToBeat"])
+        except Exception:
+            pass
+
+        if final_price is not None and price_to_beat is not None:
+            winner = "up" if final_price >= price_to_beat else "down"
+            return winner, final_price, price_to_beat
+
+        # ── Fallback: outcomePrices settled to 0/1 ─────────────────────────
+        try:
+            outcomes = json.loads(m.get("outcomes", "[]"))
+            outcome_prices = json.loads(m.get("outcomePrices", "[]"))
+            for i, price_str in enumerate(outcome_prices):
+                if float(price_str) >= 0.99 and i < len(outcomes):
+                    winner = str(outcomes[i]).lower()
+                    return winner, None, None
+        except Exception:
+            pass
+
+        return None, None, None
 
     def _parse_time_window(self, question: str) -> tuple:
         """

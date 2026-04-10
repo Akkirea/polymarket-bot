@@ -130,6 +130,118 @@ def analyze():
     else:
         console.print("[dim]  No trades yet.[/dim]")
 
+    # ── Signal Accuracy (direction vs actual outcome)
+    console.print()
+    console.print("[bold]Signal Accuracy[/bold]")
+
+    # For each closed trade, check what direction the most recent signal
+    # fired before that trade and whether it agreed with the outcome.
+    trade_rows = conn.execute(
+        "SELECT market_id, side, outcome FROM paper_trades "
+        "WHERE outcome IS NOT NULL AND outcome != 'open'"
+    ).fetchall()
+
+    correct = 0
+    incorrect = 0
+    for t in trade_rows:
+        sig_row = conn.execute(
+            "SELECT direction FROM signals WHERE market_id = %s "
+            "ORDER BY ts DESC LIMIT 1",
+            (t["market_id"],),
+        ).fetchone()
+        if sig_row:
+            if sig_row["direction"] == t["outcome"]:
+                correct += 1
+            else:
+                incorrect += 1
+
+    acc_table = Table(show_header=False, box=None, padding=(0, 3))
+    acc_table.add_column(style="dim")
+    acc_table.add_column(style="bold")
+
+    if correct + incorrect > 0:
+        accuracy = correct / (correct + incorrect)
+        acc_style = "green" if accuracy > 0.55 else "yellow" if accuracy > 0.50 else "red"
+        acc_table.add_row("Signal→outcome pairs", str(correct + incorrect))
+        acc_table.add_row(
+            "Direction accuracy",
+            Text(f"{accuracy:.1%}  ({correct} correct, {incorrect} wrong)", style=acc_style),
+        )
+        # Breakeven (ignoring fees) for binary market with 50c shares = 50%.
+        # With ~1% total fees, need ~51% to cover fees at entry_price=0.50.
+        acc_table.add_row(
+            "Breakeven (after fees ~1%)",
+            "≈ 51%",
+        )
+    else:
+        acc_table.add_row("Signal→outcome pairs", "0  (need closed trades with logged signals)")
+
+    console.print(acc_table)
+
+    # ── Per-Hour Performance (bot_trades)
+    console.print()
+    console.print("[bold]Bot Trades — Per Hour (ET)[/bold]")
+
+    hour_rows = conn.execute(
+        """SELECT
+               CAST(((CAST(strftime('%H', opened_at) AS INTEGER) - 4 + 24) % 24) AS TEXT) AS hour_et,
+               COUNT(*) AS total,
+               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+               COALESCE(SUM(pnl), 0) AS total_pnl
+           FROM bot_trades
+           WHERE pnl IS NOT NULL AND COALESCE(outcome, '') NOT IN ('unresolved', '')
+           GROUP BY hour_et
+           ORDER BY hour_et"""
+    ).fetchall()
+
+    if hour_rows:
+        hour_table = Table(box=None, padding=(0, 2))
+        hour_table.add_column("Hour (ET)", style="dim")
+        hour_table.add_column("Trades", justify="right")
+        hour_table.add_column("Win%", justify="right")
+        hour_table.add_column("Total P&L", justify="right")
+        hour_table.add_column("Note", style="dim")
+
+        for r in hour_rows:
+            total_h = int(r["total"] or 0)
+            wins_h  = int(r["wins"]  or 0)
+            wr      = wins_h / total_h if total_h else 0.0
+            pnl_h   = float(r["total_pnl"] or 0.0)
+            wr_style = "green" if wr > 0.55 else "yellow" if wr > 0.50 else "red"
+            note = ""
+            if total_h < 10:
+                note = f"[dim]n={total_h} — insufficient[/dim]"
+            elif total_h < 20:
+                note = f"[dim]n={total_h} — caution[/dim]"
+            hour_table.add_row(
+                r["hour_et"],
+                str(total_h),
+                Text(f"{wr:.0%}", style=wr_style),
+                Text(f"${pnl_h:+.2f}", style="green" if pnl_h >= 0 else "red"),
+                note,
+            )
+        console.print(hour_table)
+    else:
+        console.print("[dim]  No resolved bot trades yet.[/dim]")
+
+    # Kelly sizing sanity check
+    console.print()
+    all_bot = conn.execute(
+        "SELECT COUNT(*) AS n FROM bot_trades "
+        "WHERE pnl IS NOT NULL AND COALESCE(outcome,'') NOT IN ('unresolved','')"
+    ).fetchone()
+    n_bot = int(all_bot["n"] or 0)
+    if n_bot < 20:
+        console.print(
+            Panel(
+                f"[yellow]Kelly sizing is using the conservative default (WIN_PROB=0.52) "
+                f"because only {n_bot} resolved trades exist.\n"
+                f"Need ≥ 20 resolved trades for measured win rate to take effect.[/yellow]",
+                title="[bold]Kelly Warning[/bold]",
+                border_style="yellow",
+            )
+        )
+
     # ── Price Data Summary
     console.print()
     tick_count = conn.execute("SELECT COUNT(*) as n FROM price_ticks").fetchone()["n"]

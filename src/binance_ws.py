@@ -23,6 +23,8 @@ class BinancePriceFeed:
     def __init__(self):
         self.current_price: Optional[float] = None
         self.last_update: Optional[float] = None
+        self.source: str = "binance"
+        self.change_24h: Optional[float] = None  # not provided by trade stream
         self._price_history: deque = deque(maxlen=600)  # ~10 min at 1/sec
         self._running = False
         self._ws = None

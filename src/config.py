@@ -47,6 +47,24 @@ EST_FEE_CONSTANT = 2.0
 # ── Database ────────────────────────────────────────────────
 DB_PATH = "signal_zero.db"
 
+# ── Market quality filters ───────────────────────────────────
+# Minimum USDC volume before entering a market
+MIN_MARKET_VOLUME = 5000.0
+
+# ── Execution model ──────────────────────────────────────────
+# Simulated CLOB taker spread (basis points of entry price).
+# Polymarket 5-min BTC taker fee is roughly 0.5-1%.
+CLOB_SLIPPAGE_BPS = 50   # 0.5 %
+
+# ── Kelly sizing ─────────────────────────────────────────────
+# Minimum resolved trades required before switching from the
+# conservative default to the measured win rate.
+MIN_KELLY_TRADES = 20
+
+# Chainlink price feed maximum acceptable age (seconds).
+# Feed heartbeat is 3 600 s; reject if older than that.
+CHAINLINK_MAX_STALE_SECS = 3600
+
 # ── Display ─────────────────────────────────────────────────
 # Use rich terminal UI
 ENABLE_RICH_UI = True

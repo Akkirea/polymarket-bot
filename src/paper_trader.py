@@ -26,14 +26,15 @@ class PaperPosition:
     market_id: str
     condition_id: str
     side: str              # "up" or "down"
-    entry_price: float     # price paid per share
+    entry_price: float     # effective price paid per share (after slippage)
     shares: float          # number of shares (size / entry_price)
     size: float            # total USDC deployed
     fee: float             # estimated fee
     opened_at: str
     signal_divergence: float
-    price_to_beat: float = 0.0   # BTC price at window open (resolution reference)
+    price_to_beat: float = 0.0   # BTC price at window OPEN (resolution reference)
     end_ts: float = 0.0          # unix timestamp when the 5-min window closes
+    slug: str = ""               # Polymarket market slug (for API resolution)
 
 
 @dataclass
@@ -67,9 +68,22 @@ class PaperTrader:
 
         return True
 
-    def open_position(self, signal: Signal, market: dict) -> Optional[PaperPosition]:
+    def open_position(
+        self,
+        signal: Signal,
+        market: dict,
+        window_open_price: float = None,
+    ) -> Optional[PaperPosition]:
         """
         Open a simulated position based on a detected signal.
+
+        Args:
+            signal: Detected edge signal.
+            market: Current Polymarket market dict.
+            window_open_price: BTC price at the START of this 5-min window.
+                               Used as price_to_beat for outcome determination.
+                               Defaults to signal.btc_price if not provided.
+
         Returns the position if opened, None if blocked by risk controls.
         """
         if not self.can_trade():
@@ -79,17 +93,28 @@ class PaperTrader:
         if signal.confidence == "low":
             return None
 
+        # Minimum market volume filter
+        volume = market.get("volume", 0) or 0
+        if volume < config.MIN_MARKET_VOLUME:
+            return None
+
         size = config.PAPER_BET_SIZE
 
-        # Entry price is the current share price for our side
+        # Mid-market price for our side
         if signal.direction == "up":
-            entry_price = market["up_price"]
+            mid_price = market["up_price"]
         else:
-            entry_price = market["down_price"]
+            mid_price = market["down_price"]
 
         # Sanity check: don't buy shares priced above 0.95 or below 0.05
-        if entry_price > 0.95 or entry_price < 0.05:
+        if mid_price > 0.95 or mid_price < 0.05:
             return None
+
+        # Apply CLOB taker slippage — we're crossing the spread as a taker
+        slippage = config.CLOB_SLIPPAGE_BPS / 10_000
+        entry_price = mid_price * (1 + slippage)
+        if entry_price > 0.95:
+            return None  # slippage pushed beyond sanity bound
 
         shares = size / entry_price
         fee = signal.fee_estimate * size
@@ -107,6 +132,13 @@ class PaperTrader:
         if end_ts == 0.0:
             end_ts = _time.time() + 300
 
+        # price_to_beat = BTC at window OPEN, not at entry.
+        # The Polymarket oracle compares window-open vs window-close BTC.
+        # If the caller tracked BTC when this market first appeared, use that.
+        effective_price_to_beat = (
+            window_open_price if window_open_price is not None else signal.btc_price
+        )
+
         pos = PaperPosition(
             market_id=market.get("id", ""),
             condition_id=market.get("condition_id", ""),
@@ -117,8 +149,9 @@ class PaperTrader:
             fee=fee,
             opened_at=datetime.now(timezone.utc).isoformat(),
             signal_divergence=signal.divergence,
-            price_to_beat=signal.btc_price,
+            price_to_beat=effective_price_to_beat,
             end_ts=end_ts,
+            slug=market.get("slug", ""),
         )
 
         self.balance -= size

@@ -217,12 +217,10 @@ class PaperBot:
         if len(self.positions) >= 3:
             return
 
-        # Trading hours filter — temporarily disabled to collect post-fix data across all hours
-        # Re-enable after sufficient sample size to re-validate hour performance
         hour_et = (datetime.now(timezone.utc).hour - 4) % 24
-        # if hour_et not in ALLOWED_HOURS:
-        #     print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS", flush=True)
-        #     return
+        if hour_et not in ALLOWED_HOURS:
+            print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS", flush=True)
+            return
 
         # Scan active BTC 5m markets
         markets = await self._fetch_active_markets()
@@ -238,6 +236,12 @@ class PaperBot:
             start_ts = _extract_start_ts(slug)
             end_ts = _market_end_ts(market)
             if start_ts is None or end_ts is None:
+                continue
+
+            # Minimum volume filter — thin markets cause large slippage
+            volume = float(market.get("volume") or 0)
+            if volume < 5000.0:
+                print(f"[bot] SKIP: {slug} volume=${volume:.0f} < $5,000 minimum", flush=True)
                 continue
 
             seconds_remaining = end_ts - now
@@ -306,6 +310,35 @@ class PaperBot:
                     hour_et=hour_et,
                 )
                 break
+
+    def _get_measured_win_prob(self) -> float:
+        """
+        Return the win probability to use for Kelly sizing.
+
+        Uses the measured win rate from resolved trades once we have at least
+        MIN_KELLY_TRADES samples, shrunk toward 0.5 with a Bayesian prior of
+        weight 10 (equivalent to 10 virtual 50/50 observations).
+
+        Falls back to a conservative 0.52 (barely above breakeven) until we
+        have enough data — avoids over-sizing on unvalidated edge.
+        """
+        total = self.wins + self.losses
+        if total < 20:  # config.MIN_KELLY_TRADES
+            print(
+                f"[bot] Kelly: only {total} resolved trades — "
+                f"using conservative WIN_PROB=0.52",
+                flush=True,
+            )
+            return 0.52
+        # Bayesian shrinkage toward 0.5 with prior weight 10
+        prior_weight = 10
+        shrunk = (self.wins + prior_weight * 0.5) / (total + prior_weight)
+        print(
+            f"[bot] Kelly: measured win_prob={self.wins}/{total}={self.wins/total:.3f} "
+            f"→ shrunk={shrunk:.3f}",
+            flush=True,
+        )
+        return shrunk
 
     # ── Active markets ─────────────────────────────────────────────────────────
 
@@ -705,10 +738,13 @@ class PaperBot:
                              seconds_remaining: Optional[float] = None,
                              strategy: Optional[str] = None,
                              hour_et: int = 0):
-        # Half-Kelly sizing with data-driven hour multiplier
-        loss_prob      = 1.0 - WIN_PROB
+        # Half-Kelly sizing with data-driven hour multiplier.
+        # WIN_PROB is derived from measured trade history (or conservative
+        # default of 0.52 when sample size is too small).
+        win_prob       = self._get_measured_win_prob()
+        loss_prob      = 1.0 - win_prob
         b              = (1.0 / entry_price) - 1.0   # net payout per dollar risked
-        kelly_fraction = max(0.0, (WIN_PROB * b - loss_prob) / b) if b > 0 else 0.0
+        kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
         multiplier     = HOUR_MULTIPLIER.get(hour_et, 1.0)
         max_stake      = BET_SIZE * multiplier         # $500 base, $1000 for 2x hours
         stake          = self.balance * kelly_fraction * 0.5 * multiplier
