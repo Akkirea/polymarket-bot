@@ -10,6 +10,7 @@ Every trade is a binary bet:
   - If you lose: receive $0.00 → loss = entry_price + fee
 """
 
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -31,6 +32,8 @@ class PaperPosition:
     fee: float             # estimated fee
     opened_at: str
     signal_divergence: float
+    price_to_beat: float = 0.0   # BTC price at window open (resolution reference)
+    end_ts: float = 0.0          # unix timestamp when the 5-min window closes
 
 
 @dataclass
@@ -91,6 +94,19 @@ class PaperTrader:
         shares = size / entry_price
         fee = signal.fee_estimate * size
 
+        # Parse window expiry from market end_date (ISO string from Polymarket)
+        end_date_str = market.get("end_date", "")
+        end_ts = 0.0
+        if end_date_str:
+            try:
+                end_ts = datetime.fromisoformat(
+                    end_date_str.replace("Z", "+00:00")
+                ).timestamp()
+            except Exception:
+                end_ts = _time.time() + 300  # fallback: 5 min from now
+        if end_ts == 0.0:
+            end_ts = _time.time() + 300
+
         pos = PaperPosition(
             market_id=market.get("id", ""),
             condition_id=market.get("condition_id", ""),
@@ -101,12 +117,20 @@ class PaperTrader:
             fee=fee,
             opened_at=datetime.now(timezone.utc).isoformat(),
             signal_divergence=signal.divergence,
+            price_to_beat=signal.btc_price,
+            end_ts=end_ts,
         )
 
         self.balance -= size
         self.positions.append(pos)
 
         return pos
+
+    def get_expired_positions(self, now_ts: float = None) -> list:
+        """Return positions whose 5-min window has expired."""
+        if now_ts is None:
+            now_ts = _time.time()
+        return [p for p in self.positions if p.end_ts > 0 and now_ts >= p.end_ts]
 
     def resolve_position(self, pos: PaperPosition, outcome: str) -> dict:
         """
@@ -137,8 +161,8 @@ class PaperTrader:
         if won:
             self.win_count += 1
 
-        # Remove from open positions
-        self.positions = [p for p in self.positions if p.market_id != pos.market_id]
+        # Remove this specific position by identity
+        self.positions = [p for p in self.positions if p is not pos]
 
         trade_record = {
             "opened_at": pos.opened_at,

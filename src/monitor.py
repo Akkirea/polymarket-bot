@@ -18,6 +18,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 from rich.console import Console
 from rich.layout import Layout
@@ -124,10 +125,48 @@ def build_dashboard(
     daily_style = "green" if stats["daily_pnl"] >= 0 else "red"
 
     stats_table.add_row("Balance", f"${stats['balance']:.2f}")
+    stats_table.add_row("Total Value", f"${stats['total_value']:.2f}")
     stats_table.add_row("Total P&L", Text(f"${stats['total_pnl']:+.3f}", style=pnl_style))
     stats_table.add_row("Daily P&L", Text(f"${stats['daily_pnl']:+.3f}", style=daily_style))
     stats_table.add_row("Trades", f"{stats['total_trades']} ({stats['win_rate']:.0%} win)")
     stats_table.add_row("Open", f"{stats['open_positions']} position(s)")
+
+    # ── Open Positions Detail
+    pos_table = Table(show_header=True, box=None, padding=(0, 2))
+    pos_table.add_column("Side", style="bold", width=6)
+    pos_table.add_column("Size $", style="dim", justify="right")
+    pos_table.add_column("Entry", justify="right")
+    pos_table.add_column("Open BTC", justify="right")
+    pos_table.add_column("Cur BTC", justify="right")
+    pos_table.add_column("Expires in", justify="right")
+
+    now_ts = time.time()
+    current_btc = price_feed.current_price
+
+    if trader.positions:
+        for pos in trader.positions:
+            secs_left = max(0.0, pos.end_ts - now_ts) if pos.end_ts else 0.0
+            mins_left = int(secs_left // 60)
+            secs_rem  = int(secs_left % 60)
+            exp_str   = f"{mins_left}m{secs_rem:02d}s" if pos.end_ts else "—"
+
+            cur_str = f"${current_btc:,.2f}" if current_btc else "—"
+            open_str = f"${pos.price_to_beat:,.2f}" if pos.price_to_beat else "—"
+            side_style = "green" if pos.side == "up" else "red"
+
+            # Colour expiry red when < 30s
+            exp_style = "red" if secs_left < 30 else "yellow" if secs_left < 90 else "dim"
+
+            pos_table.add_row(
+                Text(pos.side.upper(), style=side_style),
+                f"${pos.size:.2f}",
+                f"{pos.entry_price:.3f}",
+                open_str,
+                cur_str,
+                Text(exp_str, style=exp_style),
+            )
+    else:
+        pos_table.add_row("—", "—", "—", "—", "—", "—")
 
     # ── Signal Log
     log_table = Table(show_header=True, box=None, padding=(0, 1))
@@ -174,6 +213,7 @@ def build_dashboard(
     output.add_row(Panel(market_table, title="[dim]ACTIVE MARKET[/dim]", border_style="dim"))
     output.add_row(Panel(edge_table, title="[dim]EDGE DETECTION[/dim]", border_style="cyan"))
     output.add_row(Panel(stats_table, title="[dim]PAPER TRADING[/dim]", border_style="yellow"))
+    output.add_row(Panel(pos_table, title="[dim]OPEN POSITIONS[/dim]", border_style="blue"))
     output.add_row(Panel(whale_table, title="[dim]TOP WALLETS · BTC 5M[/dim]", border_style="magenta"))
     output.add_row(Panel(log_table, title="[dim]LOG[/dim]", border_style="dim"))
     output.add_row(Text(f"  {status}", style="dim"))
@@ -301,6 +341,20 @@ async def main():
                         status = f"monitoring · tick #{poll_counter}"
                     else:
                         status = "waiting for data..."
+
+                    # ── Resolve expired positions
+                    expired = trader.get_expired_positions()
+                    for pos in expired:
+                        if price_feed.current_price:
+                            # "Up" wins if final BTC >= price at window open
+                            outcome = "up" if price_feed.current_price >= pos.price_to_beat else "down"
+                            trade = trader.resolve_position(pos, outcome)
+                            won = trade["pnl"] > 0
+                            add_log(
+                                f"{'✓ WIN' if won else '✗ LOSS'}: {pos.side.upper()} "
+                                f"open={pos.price_to_beat:,.2f} final={price_feed.current_price:,.2f} "
+                                f"PnL={trade['pnl']:+.2f}"
+                            )
 
                     # ── Refresh whale data every 60 seconds
                     import time as _time
