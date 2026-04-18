@@ -401,7 +401,7 @@ class PaperBot:
             slug = f"btc-updown-5m-{start_ts}"
             try:
                 async with session.get(
-                    f"{GAMMA_API}/markets", params={"slug": slug}
+                    f"{GAMMA_API}/markets", params={"slug": slug, "closed": "true"}
                 ) as resp:
                     if resp.status != 200:
                         continue
@@ -938,7 +938,7 @@ class PaperBot:
         session = await self._get_session()
         try:
             async with session.get(
-                f"{GAMMA_API}/markets", params={"slug": slug}
+                f"{GAMMA_API}/markets", params={"slug": slug, "closed": "true"}
             ) as resp:
                 if resp.status != 200:
                     print(f"[bot] resolve: Gamma returned {resp.status} for {slug}", flush=True)

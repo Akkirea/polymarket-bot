@@ -227,7 +227,8 @@ class PolymarketClient:
         without publishing finalPrice.
         """
         session = await self._get_session()
-        params = {"slug": slug} if slug else {"id": market_id}
+        # closed=true is required — the Gamma API excludes closed markets by default
+        params = {"slug": slug, "closed": "true"} if slug else {"id": market_id, "closed": "true"}
         try:
             async with session.get(
                 f"{config.GAMMA_API_BASE}/markets", params=params

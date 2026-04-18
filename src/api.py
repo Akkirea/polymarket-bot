@@ -50,7 +50,7 @@ async def _backfill_resolution_prices():
         for row in rows:
             slug = row["market_slug"]
             try:
-                async with session.get(f"{GAMMA}/markets", params={"slug": slug}) as resp:
+                async with session.get(f"{GAMMA}/markets", params={"slug": slug, "closed": "true"}) as resp:
                     if resp.status != 200:
                         continue
                     markets = await resp.json()
