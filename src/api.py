@@ -20,6 +20,61 @@ from .whale_tracker import WhaleTracker
 from .chainlink import get_btc_price
 
 
+async def _backfill_resolution_prices():
+    """
+    For trades that are settled (outcome known) but missing resolution_price,
+    fetch the Polymarket finalPrice and write it to the DB.
+    Runs once at startup in the background.
+    """
+    import aiohttp as _aiohttp
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT market_slug, outcome
+                 FROM bot_trades
+                WHERE resolution_price IS NULL
+                  AND outcome NOT IN ('', 'unresolved')
+                  AND outcome IS NOT NULL"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("[backfill] no settled trades missing resolution_price")
+        return
+
+    print(f"[backfill] {len(rows)} settled trade(s) missing resolution_price")
+    GAMMA = "https://gamma-api.polymarket.com"
+
+    async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=15)) as session:
+        for row in rows:
+            slug = row["market_slug"]
+            try:
+                async with session.get(f"{GAMMA}/markets", params={"slug": slug}) as resp:
+                    if resp.status != 200:
+                        continue
+                    markets = await resp.json()
+                if not markets:
+                    continue
+                m = markets[0]
+                events = m.get("events", [])
+                meta   = (events[0].get("eventMetadata") or {}) if events else {}
+                final_price    = meta.get("finalPrice")
+                price_to_beat  = meta.get("priceToBeat")
+                if final_price is not None:
+                    db.update_resolution_price(slug, float(final_price))
+                    print(
+                        f"[backfill] {slug} → finalPrice=${float(final_price):,.2f}"
+                        + (f"  priceToBeat=${float(price_to_beat):,.2f}" if price_to_beat else ""),
+                        flush=True,
+                    )
+                else:
+                    print(f"[backfill] {slug} — finalPrice not in eventMetadata yet", flush=True)
+            except Exception as exc:
+                print(f"[backfill] error for {slug}: {exc}", flush=True)
+            await asyncio.sleep(0.5)   # gentle rate-limit
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[startup] lifespan begin")
@@ -36,9 +91,18 @@ async def lifespan(app: FastAPI):
     finally:
         await tracker.close()
 
+    # Auto-start the trading bot so it survives Railway redeploys without
+    # needing a manual POST /api/bot/start each time.
+    bot.start()
+    print("[startup] bot auto-started")
+
+    # Backfill resolution_price for any settled trades that are still NULL
+    asyncio.create_task(_backfill_resolution_prices())
+
     print("[startup] lifespan ready")
     yield
     print("[shutdown] lifespan end")
+    await bot.stop()
 
 
 app = FastAPI(title="SIGNAL/ZERO API", lifespan=lifespan)

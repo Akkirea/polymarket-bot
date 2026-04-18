@@ -218,10 +218,13 @@ class PaperBot:
         if len(self.positions) >= 3:
             return
 
+        # ALLOWED_HOURS filter is disabled until we accumulate enough trades
+        # (≥200) to validate per-hour edge with statistical confidence.
+        # Re-enable once sample sizes support it.
         hour_et = (datetime.now(timezone.utc).hour - 4) % 24
-        if hour_et not in ALLOWED_HOURS:
-            print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS", flush=True)
-            return
+        # if hour_et not in ALLOWED_HOURS:
+        #     print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS")
+        #     return
 
         # Scan active BTC 5m markets
         markets = await self._fetch_active_markets()
