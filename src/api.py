@@ -420,12 +420,25 @@ async def htf_markets():
 @app.get("/api/htf/latest")
 def htf_latest():
     """DB snapshots, recent trades, and paper bot state."""
-    return {
-        "ok":           True,
-        "snapshots":    db.htf_get_latest_snapshots(),
-        "recent_trades": db.htf_get_recent_trades(20),
-        "bot_state":    db.htf_get_state(),
-    }
+    try:
+        db.init_htf_tables()  # idempotent — creates tables if missing
+    except Exception:
+        pass
+    try:
+        return {
+            "ok":            True,
+            "snapshots":     db.htf_get_latest_snapshots(),
+            "recent_trades": db.htf_get_recent_trades(20),
+            "bot_state":     db.htf_get_state(),
+        }
+    except Exception as e:
+        return {
+            "ok":            False,
+            "error":         str(e),
+            "snapshots":     [],
+            "recent_trades": [],
+            "bot_state":     {"balance": 10000.0, "total_pnl": 0.0},
+        }
 
 
 @app.get("/api/htf/history")
