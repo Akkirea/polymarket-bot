@@ -17,9 +17,16 @@ import aiohttp
 
 GAMMA           = "https://gamma-api.polymarket.com"
 BINANCE_PRICE   = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+BINANCE_US_PRICE = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT"
 BINANCE_KLINES  = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=72"
 COINGECKO_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+COINBASE_SPOT   = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+KRAKEN_TICKER   = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
 BYBIT_PRICE     = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT"
+HTTP_HEADERS    = {
+    "Accept": "application/json",
+    "User-Agent": "signal-zero/0.2 (+https://github.com/openai/codex)",
+}
 
 # ── Probability model ──────────────────────────────────────────────────────────
 
@@ -207,20 +214,46 @@ async def fetch_htf_markets(session: aiohttp.ClientSession) -> list[dict]:
 
 async def fetch_btc_price(session: aiohttp.ClientSession) -> float:
     """
-    BTC/USD spot — tries Bybit → CoinGecko → Binance via aiohttp.
+    BTC/USD spot with resilient fallbacks.
     """
+    def _require_positive(value) -> float:
+        price = float(value)
+        if price <= 0:
+            raise ValueError(f"non-positive price {price}")
+        return price
+
+    async def _fetch_json(url: str):
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), headers=HTTP_HEADERS) as resp:
+            raw = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status}: {raw[:120].strip()}")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"invalid JSON: {raw[:120].strip()}") from exc
+
     errors = []
-    for url, extractor in [
-        (BYBIT_PRICE,     lambda d: float(d["result"]["list"][0]["lastPrice"])),
-        (COINGECKO_PRICE, lambda d: float(d["bitcoin"]["usd"])),
-        (BINANCE_PRICE,   lambda d: float(d["price"])),
+    for label, url, extractor in [
+        ("bybit",       BYBIT_PRICE,      lambda d: _require_positive(d["result"]["list"][0]["lastPrice"])),
+        ("coingecko",   COINGECKO_PRICE,  lambda d: _require_positive(d["bitcoin"]["usd"])),
+        ("binance",     BINANCE_PRICE,    lambda d: _require_positive(d["price"])),
+        ("binance_us",  BINANCE_US_PRICE, lambda d: _require_positive(d["price"])),
+        ("coinbase",    COINBASE_SPOT,    lambda d: _require_positive(d["data"]["amount"])),
+        ("kraken",      KRAKEN_TICKER,    lambda d: _require_positive(d["result"]["XXBTZUSD"]["c"][0])),
     ]:
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json(content_type=None)
+            data = await _fetch_json(url)
             return extractor(data)
         except Exception as e:
-            errors.append(f"{url.split('/')[2]}: {e}")
+            errors.append(f"{label}: {e}")
+
+    try:
+        from .chainlink import get_btc_price
+
+        loop = asyncio.get_running_loop()
+        return _require_positive(await loop.run_in_executor(None, get_btc_price))
+    except Exception as e:
+        errors.append(f"chainlink: {e}")
 
     raise RuntimeError(f"All BTC price sources failed: {'; '.join(errors)}")
 

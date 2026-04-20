@@ -30,6 +30,18 @@ pip install -r requirements.txt
 python -m src.monitor
 ```
 
+## Railway process split
+
+For production, run the latency/API stack and HTF worker as separate processes:
+
+```bash
+web: uvicorn src.api:app --host 0.0.0.0 --port $PORT
+htf: python -m src.htf_worker
+```
+
+This keeps the HTF paper-trading loop isolated from the latency-sensitive bot.
+Both processes can share the same `DATABASE_URL`.
+
 ## Configuration
 
 Edit `src/config.py` to adjust:
