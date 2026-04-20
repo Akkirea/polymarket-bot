@@ -11,6 +11,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import aiohttp
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,6 +19,7 @@ from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
 from .chainlink import get_btc_price
+from . import htf as htf_lib
 
 
 async def _backfill_resolution_prices():
@@ -75,6 +77,74 @@ async def _backfill_resolution_prices():
             await asyncio.sleep(0.5)   # gentle rate-limit
 
 
+_htf_sigma: float = 0.80
+_htf_sigma_ts: float = 0.0
+_HTF_SIGMA_TTL = 30 * 60  # refresh vol every 30 min
+_HTF_INTERVAL  = 20        # pipeline tick every 20s
+_HTF_MIN_EDGE  = 0.05
+_HTF_INITIAL_BALANCE = 10_000.0
+
+
+async def _htf_pipeline_loop():
+    """Background loop — runs every _HTF_INTERVAL seconds."""
+    global _htf_sigma, _htf_sigma_ts
+    await asyncio.sleep(5)  # let startup settle
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                now = asyncio.get_event_loop().time()
+
+                # Refresh vol periodically
+                if now - _htf_sigma_ts > _HTF_SIGMA_TTL:
+                    prices = await htf_lib.fetch_recent_prices(session)
+                    if prices:
+                        _htf_sigma = htf_lib.estimate_vol(prices, 3600)
+                        _htf_sigma_ts = now
+                        print(f"[htf] vol refreshed → σ={_htf_sigma*100:.1f}%/yr", flush=True)
+
+                spot, markets = await asyncio.gather(
+                    htf_lib.fetch_btc_price(session),
+                    htf_lib.fetch_htf_markets(session),
+                )
+                print(f"[htf] spot=${spot:,.0f} σ={_htf_sigma*100:.1f}% markets={len(markets)}", flush=True)
+
+                state   = db.htf_get_state()
+                balance = state["balance"]
+
+                for m in markets:
+                    slug       = m["slug"]
+                    strike     = m["price_to_beat"] or spot
+                    secs_left  = m["seconds_left"]
+                    mkt_prob   = m["prob_up"]
+
+                    prob = htf_lib.btc_up_prob(spot, strike, _htf_sigma, secs_left)
+                    est_prob = prob["prob_up"]
+                    edge     = round(est_prob - mkt_prob, 4)
+
+                    db.htf_save_snapshot(slug, spot, mkt_prob, est_prob, edge, _htf_sigma)
+
+                    if abs(edge) >= _HTF_MIN_EDGE and not db.htf_has_open_trade(slug):
+                        side       = "UP" if edge > 0 else "DOWN"
+                        entry_prob = mkt_prob if side == "UP" else m["prob_down"]
+                        fraction   = htf_lib.half_kelly(est_prob, entry_prob)
+                        stake      = max(1.0, round(balance * fraction, 2))
+                        db.htf_open_trade(slug, side, stake, entry_prob, spot, edge)
+                        print(f"[htf] TRADE {side} {slug} stake=${stake} edge={edge:.4f}", flush=True)
+
+                # Resolve open trades
+                open_trades = [t for t in db.htf_get_recent_trades(50) if t.get("closed_at") is None]
+                for trade in open_trades:
+                    winner, fp, ptb = await htf_lib.fetch_resolution(session, trade["market_slug"])
+                    if winner:
+                        db.htf_close_trades(trade["market_slug"], winner, fp, ptb)
+                        print(f"[htf] RESOLVED {trade['market_slug']} → {winner.upper()}", flush=True)
+
+            except Exception as exc:
+                print(f"[htf] pipeline error: {exc}", flush=True)
+
+            await asyncio.sleep(_HTF_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[startup] lifespan begin")
@@ -98,6 +168,10 @@ async def lifespan(app: FastAPI):
 
     # Backfill resolution_price for any settled trades that are still NULL
     asyncio.create_task(_backfill_resolution_prices())
+
+    # Start HTF analysis pipeline
+    asyncio.create_task(_htf_pipeline_loop())
+    print("[startup] htf pipeline started")
 
     print("[startup] lifespan ready")
     yield
@@ -304,3 +378,57 @@ async def get_funding_rates():
         return filtered[:15]
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── HTF endpoints ──────────────────────────────────────────────────────────────
+
+@app.get("/api/htf/markets")
+async def htf_markets():
+    """
+    Live HTF market data: fetch from Polymarket, enrich with log-normal edge.
+    Returns enriched market list sorted by |edge| descending.
+    """
+    global _htf_sigma
+    try:
+        async with aiohttp.ClientSession() as session:
+            spot, markets = await asyncio.gather(
+                htf_lib.fetch_btc_price(session),
+                htf_lib.fetch_htf_markets(session),
+            )
+
+        enriched = []
+        for m in markets:
+            strike   = m["price_to_beat"] or spot
+            prob     = htf_lib.btc_up_prob(spot, strike, _htf_sigma, m["seconds_left"])
+            edge     = round(prob["prob_up"] - m["prob_up"], 4)
+            enriched.append({
+                **m,
+                "spot":       round(spot, 2),
+                "est_prob_up":   prob["prob_up"],
+                "est_prob_down": prob["prob_down"],
+                "edge":       edge,
+                "d2":         prob["d2"],
+                "sigma":      _htf_sigma,
+            })
+
+        enriched.sort(key=lambda x: abs(x["edge"]), reverse=True)
+        return {"ok": True, "markets": enriched, "spot": round(spot, 2)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/htf/latest")
+def htf_latest():
+    """DB snapshots, recent trades, and paper bot state."""
+    return {
+        "ok":           True,
+        "snapshots":    db.htf_get_latest_snapshots(),
+        "recent_trades": db.htf_get_recent_trades(20),
+        "bot_state":    db.htf_get_state(),
+    }
+
+
+@app.get("/api/htf/history")
+def htf_history(slug: str, hours: int = 6):
+    """Snapshot history for one market (for charting)."""
+    return {"ok": True, "history": db.htf_get_history(slug, min(hours, 168))}
