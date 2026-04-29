@@ -218,6 +218,42 @@ def get_bot_stats():
     }
 
 
+@app.get("/api/bot/stats/hourly")
+def get_hourly_stats():
+    """Per-ET-hour breakdown of win rate and P&L across all resolved trades."""
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT pnl, opened_at FROM bot_trades "
+            "WHERE pnl IS NOT NULL AND COALESCE(outcome, '') != 'unresolved' "
+            "ORDER BY opened_at"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_hour: dict = {}
+    for r in rows:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(r["opened_at"].replace("Z", "+00:00"))
+            hour_et = (dt.hour - 4) % 24
+        except Exception:
+            continue
+        if hour_et not in by_hour:
+            by_hour[hour_et] = {"hour_et": hour_et, "trades": 0, "wins": 0, "pnl": 0.0}
+        by_hour[hour_et]["trades"] += 1
+        by_hour[hour_et]["pnl"] = round(by_hour[hour_et]["pnl"] + r["pnl"], 2)
+        if r["pnl"] > 0:
+            by_hour[hour_et]["wins"] += 1
+
+    result = []
+    for h in sorted(by_hour):
+        d = by_hour[h]
+        d["win_rate"] = round(d["wins"] / d["trades"], 4) if d["trades"] else 0.0
+        result.append(d)
+    return result
+
+
 @app.post("/api/bot/start")
 async def start_bot():
     """Start the whale-copy bot loop."""

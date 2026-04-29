@@ -112,18 +112,27 @@ class BinancePriceFeed:
             return None
         return closest
 
+    # Port 9443 is blocked on some cloud providers; 443 is the fallback.
+    _WS_URLS = [
+        "wss://stream.binance.com:9443/ws/btcusdt@trade",
+        "wss://stream.binance.com:443/ws/btcusdt@trade",
+    ]
+
     async def connect(self):
-        """Connect to Binance and start streaming prices."""
+        """Connect to Binance and start streaming prices, cycling through fallback URLs."""
         self._running = True
+        url_index = 0
 
         while self._running:
+            url = self._WS_URLS[url_index % len(self._WS_URLS)]
             try:
                 async with websockets.connect(
-                    config.BINANCE_WS_URL,
+                    url,
                     ping_interval=20,
                     ping_timeout=10,
                 ) as ws:
                     self._ws = ws
+                    url_index = 0  # reset on successful connect
                     while self._running:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=30)
@@ -136,20 +145,20 @@ class BinancePriceFeed:
                             self._price_history.append((now, price))
 
                         except asyncio.TimeoutError:
-                            # Send a ping to keep alive
                             continue
                         except (json.JSONDecodeError, KeyError):
                             continue
 
-            except (websockets.exceptions.ConnectionClosed, OSError) as e:
+            except (websockets.exceptions.ConnectionClosed, OSError):
                 self._ws = None
                 if self._running:
-                    # Reconnect after brief pause
+                    url_index += 1
                     await asyncio.sleep(2)
 
-            except Exception as e:
+            except Exception:
                 self._ws = None
                 if self._running:
+                    url_index += 1
                     await asyncio.sleep(5)
 
     def stop(self):

@@ -45,7 +45,7 @@ MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) mu
 FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
 PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to enter
 REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-check
-CROWD_MIN            = 0.20  # outcomePrices lower bound — below this crowd is 80%+ against us
+CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is 70%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
 
