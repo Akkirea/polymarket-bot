@@ -26,13 +26,13 @@ async def _backfill_resolution_prices():
     """
     For trades that are settled (outcome known) but missing resolution_price,
     fetch the Polymarket finalPrice and write it to the DB.
-    Runs once at startup in the background.
+    Returns a small summary so it can be run from startup, a periodic task,
+    or a manual API endpoint.
     """
-    import aiohttp as _aiohttp
     conn = db.get_connection()
     try:
         rows = conn.execute(
-            """SELECT market_slug, outcome
+            """SELECT market_slug, outcome, poly_price_to_beat
                  FROM bot_trades
                 WHERE resolution_price IS NULL
                   AND outcome NOT IN ('', 'unresolved')
@@ -43,12 +43,13 @@ async def _backfill_resolution_prices():
 
     if not rows:
         print("[backfill] no settled trades missing resolution_price")
-        return
+        return {"checked": 0, "updated": 0}
 
     print(f"[backfill] {len(rows)} settled trade(s) missing resolution_price")
     GAMMA = "https://gamma-api.polymarket.com"
+    updated = 0
 
-    async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=15)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         for row in rows:
             slug = row["market_slug"]
             try:
@@ -64,7 +65,24 @@ async def _backfill_resolution_prices():
                 final_price    = meta.get("finalPrice")
                 price_to_beat  = meta.get("priceToBeat")
                 if final_price is not None:
-                    db.update_resolution_price(slug, float(final_price))
+                    conn = db.get_connection()
+                    try:
+                        conn.execute(
+                            """UPDATE bot_trades
+                                  SET resolution_price = %s,
+                                      poly_price_to_beat = COALESCE(poly_price_to_beat, %s)
+                                WHERE market_slug = %s
+                                  AND resolution_price IS NULL""",
+                            (
+                                round(float(final_price), 2),
+                                round(float(price_to_beat), 2) if price_to_beat is not None else None,
+                                slug,
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    updated += 1
                     print(
                         f"[backfill] {slug} → finalPrice=${float(final_price):,.2f}"
                         + (f"  priceToBeat=${float(price_to_beat):,.2f}" if price_to_beat else ""),
@@ -75,6 +93,20 @@ async def _backfill_resolution_prices():
             except Exception as exc:
                 print(f"[backfill] error for {slug}: {exc}", flush=True)
             await asyncio.sleep(0.5)   # gentle rate-limit
+
+    return {"checked": len(rows), "updated": updated}
+
+
+async def _periodic_resolution_backfill():
+    """Keep retrying settled trades whose Polymarket finalPrice arrived late."""
+    while True:
+        try:
+            await _backfill_resolution_prices()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[backfill] periodic task error: {exc}", flush=True)
+        await asyncio.sleep(600)
 
 
 @asynccontextmanager
@@ -98,12 +130,17 @@ async def lifespan(app: FastAPI):
     bot.start()
     print("[startup] bot auto-started")
 
-    # Backfill resolution_price for any settled trades that are still NULL
-    asyncio.create_task(_backfill_resolution_prices())
+    # Keep retrying resolution_price for settled trades whose finalPrice was late.
+    resolution_backfill_task = asyncio.create_task(_periodic_resolution_backfill())
 
     print("[startup] lifespan ready")
     yield
     print("[shutdown] lifespan end")
+    resolution_backfill_task.cancel()
+    try:
+        await resolution_backfill_task
+    except asyncio.CancelledError:
+        pass
     await bot.stop()
 
 
@@ -253,6 +290,12 @@ def get_hourly_stats():
         d["win_rate"] = round(d["wins"] / d["trades"], 4) if d["trades"] else 0.0
         result.append(d)
     return result
+
+
+@app.post("/api/bot/backfill-resolutions")
+async def backfill_bot_resolutions():
+    """Manually retry finalPrice backfill for settled trades that still show FINAL —."""
+    return {"ok": True, **await _backfill_resolution_prices()}
 
 
 @app.post("/api/bot/start")
