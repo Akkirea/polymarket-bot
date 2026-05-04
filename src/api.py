@@ -8,6 +8,7 @@ Run with:
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -341,6 +342,79 @@ async def get_funding_rates():
         return filtered[:15]
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/claude-analysis")
+async def claude_analysis(body: dict):
+    """Run Claude analysis server-side so the Anthropic key never reaches the browser."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured")
+
+    funding_rates = body.get("fundingRates") or []
+    onchain_signals = body.get("onchainSignals") or []
+    if not isinstance(funding_rates, list) or not isinstance(onchain_signals, list):
+        raise HTTPException(status_code=400, detail="fundingRates and onchainSignals must be lists")
+
+    def format_rate(rate: dict) -> str:
+        symbol = str(rate.get("symbol", "UNKNOWN"))[:24]
+        try:
+            funding_rate = float(rate.get("fundingRate", 0))
+        except (TypeError, ValueError):
+            funding_rate = 0.0
+        return f"{symbol}: {funding_rate:+.4f}%"
+
+    def format_signal(signal: dict) -> str:
+        symbol = str(signal.get("symbol", "UNKNOWN"))[:24]
+        sentiment = str(signal.get("sentiment", "unknown"))[:24]
+        strength = signal.get("strength", "n/a")
+        return f"{symbol}: {sentiment} ({strength})"
+
+    rates_ctx = ", ".join(format_rate(rate) for rate in funding_rates[:10])
+    signals_ctx = ", ".join(format_signal(signal) for signal in onchain_signals[:20])
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 512,
+        "system": "You are a sharp crypto analyst. Be concise, direct, and actionable.",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Analyze these live funding rates and onchain signals. "
+                "Give 2-3 specific trading insights.\n\n"
+                f"Funding Rates (top 10 by abs value):\n{rates_ctx}\n\n"
+                f"Onchain Signals:\n{signals_ctx}\n\n"
+                "What are the best opportunities and key risks right now?"
+            ),
+        }],
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+            ) as resp:
+                data = await resp.json()
+                if resp.status >= 400:
+                    detail = data.get("error", {}).get("message", "Claude request failed")
+                    raise HTTPException(status_code=resp.status, detail=detail)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    text = ""
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            text += block.get("text", "")
+
+    return {"ok": True, "analysis": text or "No response."}
 
 
 # ── HTF endpoints ──────────────────────────────────────────────────────────────
