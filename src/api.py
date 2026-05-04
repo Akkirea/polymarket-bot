@@ -13,13 +13,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
 from . import htf as htf_lib
+from . import live_clob
 
 
 async def _backfill_resolution_prices():
@@ -290,6 +291,44 @@ def get_hourly_stats():
         d["win_rate"] = round(d["wins"] / d["trades"], 4) if d["trades"] else 0.0
         result.append(d)
     return result
+
+
+@app.get("/api/live/health")
+async def live_health(side: str = "Up"):
+    """Read-only CLOB auth, allowance, orderbook, and active market check."""
+    try:
+        return await live_clob.health(side=side)
+    except live_clob.LiveClobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/live/test-buy")
+async def live_test_buy(body: dict, x_live_test_token: str = Header(default="")):
+    """
+    Manual protected $1-ish FOK/FAK CLOB test buy.
+
+    Requires Railway env:
+      POLYMARKET_LIVE_TEST=true
+      LIVE_TEST_TOKEN=<secret>
+    and request body:
+      {"confirm": "BUY_TEST", "side": "Up", "amount": 1.0}
+    """
+    expected_token = os.getenv("LIVE_TEST_TOKEN")
+    if not expected_token or x_live_test_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing live test token")
+    if body.get("confirm") != "BUY_TEST":
+        raise HTTPException(status_code=400, detail='Body must include confirm="BUY_TEST"')
+
+    side = str(body.get("side", ""))
+    amount = float(body.get("amount", os.getenv("LIVE_TEST_MAX_USDC", "1.0")))
+    try:
+        return await live_clob.test_buy(side=side, amount=amount)
+    except live_clob.LiveClobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.post("/api/bot/backfill-resolutions")

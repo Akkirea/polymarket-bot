@@ -7,4 +7,4 @@ psycopg2-binary>=2.9
 httpx
 web3>=6.0
 python-dotenv
-git+https://github.com/Polymarket/py-clob-client.git
+py-clob-client-v2==1.0.0
