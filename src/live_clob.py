@@ -62,7 +62,7 @@ def _load_sdk():
             AssetType,
             BalanceAllowanceParams,
             ClobClient,
-            MarketOrderArgs,
+            OrderArgs,
             OrderType,
             PartialCreateOrderOptions,
             Side,
@@ -76,7 +76,7 @@ def _load_sdk():
         "AssetType": AssetType,
         "BalanceAllowanceParams": BalanceAllowanceParams,
         "ClobClient": ClobClient,
-        "MarketOrderArgs": MarketOrderArgs,
+        "OrderArgs": OrderArgs,
         "OrderType": OrderType,
         "PartialCreateOrderOptions": PartialCreateOrderOptions,
         "Side": Side,
@@ -232,12 +232,13 @@ async def test_buy(side: str, amount: float) -> dict:
             f"Estimated price {estimated_price:.4f} outside [{min_price:.2f}, {max_price:.2f}]"
         )
 
-    response = client.create_and_post_market_order(
-        order_args=sdk["MarketOrderArgs"](
+    size = round(amount / estimated_price, 4)
+    response = client.create_and_post_order(
+        order_args=sdk["OrderArgs"](
             token_id=token_id,
-            amount=amount,
+            price=estimated_price,
+            size=size,
             side=sdk["Side"].BUY,
-            order_type=order_type,
         ),
         options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
         order_type=order_type,
@@ -253,6 +254,7 @@ async def test_buy(side: str, amount: float) -> dict:
         "side": side,
         "token_id": token_id,
         "amount": amount,
+        "size": size,
         "order_type": order_type_name,
         "estimated_price": estimated_price,
         "tick_size": tick_size,
