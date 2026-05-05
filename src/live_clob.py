@@ -92,19 +92,11 @@ def _api_creds(sdk: dict):
 
 
 def _client(sdk: dict):
-    signature_type = int(_env("SIGNATURE_TYPE", required=True))
-    funder = _env("FUNDER_ADDRESS")
-    if signature_type != 0 and not funder:
-        raise LiveClobError("FUNDER_ADDRESS is required for non-EOA signature types")
-
     return sdk["ClobClient"](
         host=CLOB_HOST,
         chain_id=CHAIN_ID,
         key=_env("PRIVATE_KEY", "PK", required=True),
         creds=_api_creds(sdk),
-        signature_type=signature_type,
-        funder=funder,
-        retry_on_error=True,
     )
 
 
