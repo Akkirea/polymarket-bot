@@ -92,13 +92,18 @@ def _api_creds(sdk: dict):
 
 
 def _client(sdk: dict):
+    signature_type = int(_env("SIGNATURE_TYPE", required=True))
+    funder = _env("FUNDER_ADDRESS")
+    if signature_type != 0 and not funder:
+        raise LiveClobError("FUNDER_ADDRESS is required for non-EOA signature types")
+
     return sdk["ClobClient"](
         host=CLOB_HOST,
         chain_id=CHAIN_ID,
         key=_env("PRIVATE_KEY", "PK", required=True),
         creds=_api_creds(sdk),
-        signature_type=int(_env("SIGNATURE_TYPE", required=True)),
-        funder=_env("FUNDER_ADDRESS", required=True),
+        signature_type=signature_type,
+        funder=funder,
         retry_on_error=True,
     )
 
@@ -109,6 +114,7 @@ def env_summary() -> dict:
     api_key = _env("API_KEY", "CLOB_API_KEY")
     api_secret = _env("API_SECRET", "SECRET", "CLOB_SECRET")
     api_passphrase = _env("API_PASSPHRASE", "PASSPHRASE", "CLOB_PASS_PHRASE")
+    signature_type = _env("SIGNATURE_TYPE")
     return {
         "polymarket_live": os.getenv("POLYMARKET_LIVE", "false").lower() == "true",
         "polymarket_live_test": os.getenv("POLYMARKET_LIVE_TEST", "false").lower() == "true",
@@ -118,7 +124,8 @@ def env_summary() -> dict:
         "has_api_passphrase": bool(api_passphrase),
         "api_key": _mask(api_key),
         "funder_address": _env("FUNDER_ADDRESS"),
-        "signature_type": _env("SIGNATURE_TYPE"),
+        "funder_required": signature_type not in {None, "0"},
+        "signature_type": signature_type,
         "live_bet_size": float(os.getenv("LIVE_BET_SIZE", "1.0")),
         "max_live_price": float(os.getenv("MAX_LIVE_PRICE", "0.70")),
         "min_live_price": float(os.getenv("MIN_LIVE_PRICE", "0.30")),
