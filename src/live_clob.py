@@ -92,8 +92,10 @@ def _api_creds(sdk: dict):
 
 
 def _client(sdk: dict):
+    from py_clob_client_v2 import SignatureTypeV2
     funder = _env("FUNDER_ADDRESS")
-    signature_type = int(_env("SIGNATURE_TYPE") or 0)
+    sig_int = int(_env("SIGNATURE_TYPE") or 0)
+    signature_type = SignatureTypeV2(sig_int)
     return sdk["ClobClient"](
         host=CLOB_HOST,
         chain_id=CHAIN_ID,
