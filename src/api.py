@@ -331,6 +331,19 @@ async def live_test_buy(body: dict, x_live_test_token: str = Header(default=""))
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.get("/api/live/signer")
+def live_signer():
+    """Return the public address derived from PRIVATE_KEY/PK — no secrets exposed."""
+    from eth_account import Account
+
+    pk = os.getenv("PRIVATE_KEY") or os.getenv("PK") or ""
+    if not pk:
+        raise HTTPException(status_code=503, detail="PRIVATE_KEY/PK not set")
+    pk = pk if pk.startswith("0x") else "0x" + pk
+    address = Account.from_key(pk).address
+    return {"signer": address}
+
+
 @app.post("/api/bot/backfill-resolutions")
 async def backfill_bot_resolutions():
     """Manually retry finalPrice backfill for settled trades that still show FINAL —."""
