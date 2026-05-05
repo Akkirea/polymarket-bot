@@ -92,11 +92,15 @@ def _api_creds(sdk: dict):
 
 
 def _client(sdk: dict):
+    funder = _env("FUNDER_ADDRESS")
+    signature_type = int(_env("SIGNATURE_TYPE") or 0)
     return sdk["ClobClient"](
         host=CLOB_HOST,
         chain_id=CHAIN_ID,
         key=_env("PRIVATE_KEY", "PK", required=True),
         creds=_api_creds(sdk),
+        signature_type=signature_type,
+        funder=funder,
     )
 
 
