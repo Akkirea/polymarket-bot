@@ -93,18 +93,26 @@ def _api_creds(sdk: dict):
 
 def _client(sdk: dict):
     from py_clob_client_v2 import SignatureTypeV2
+    from eth_account import Account
+    pk = _env("PRIVATE_KEY", "PK", required=True)
+    pk = pk if pk.startswith("0x") else "0x" + pk
     funder = _env("FUNDER_ADDRESS")
     sig_int = int(_env("SIGNATURE_TYPE") or 0)
     signature_type = SignatureTypeV2(sig_int)
+    eoa = Account.from_key(pk).address
+    print(f"[identity] EOA={eoa}", flush=True)
+    print(f"[identity] FUNDER={funder}", flush=True)
+    print(f"[identity] SIGNATURE_TYPE={sig_int}", flush=True)
+    creds = _api_creds(sdk)
+    print(f"[identity] CREDS_KEY={creds.api_key if hasattr(creds, 'api_key') else creds}", flush=True)
     return sdk["ClobClient"](
         host=CLOB_HOST,
         chain_id=CHAIN_ID,
-        key=_env("PRIVATE_KEY", "PK", required=True),
+        key=pk,
         creds=_api_creds(sdk),
         signature_type=signature_type,
         funder=funder,
     )
-
 
 def env_summary() -> dict:
     """Return non-secret live config status for diagnostics."""
