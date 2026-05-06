@@ -19,7 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
-from . import htf as htf_lib
 from . import live_clob
 
 
@@ -510,71 +509,3 @@ async def claude_analysis(body: dict):
             text += block.get("text", "")
 
     return {"ok": True, "analysis": text or "No response."}
-
-
-# ── HTF endpoints ──────────────────────────────────────────────────────────────
-
-@app.get("/api/htf/markets")
-async def htf_markets():
-    """
-    Live HTF market data: fetch from Polymarket, enrich with log-normal edge.
-    Returns enriched market list sorted by |edge| descending.
-    """
-    try:
-        async with aiohttp.ClientSession() as session:
-            spot, markets, prices = await asyncio.gather(
-                htf_lib.fetch_btc_price(session),
-                htf_lib.fetch_htf_markets(session),
-                htf_lib.fetch_recent_prices(session),
-            )
-        sigma = htf_lib.estimate_vol(prices, 3600) if prices else 0.80
-
-        enriched = []
-        for m in markets:
-            strike   = m["price_to_beat"] or spot
-            prob     = htf_lib.btc_up_prob(spot, strike, sigma, m["seconds_left"])
-            edge     = round(prob["prob_up"] - m["prob_up"], 4)
-            enriched.append({
-                **m,
-                "spot":       round(spot, 2),
-                "est_prob_up":   prob["prob_up"],
-                "est_prob_down": prob["prob_down"],
-                "edge":       edge,
-                "d2":         prob["d2"],
-                "sigma":      sigma,
-            })
-
-        enriched.sort(key=lambda x: abs(x["edge"]), reverse=True)
-        return {"ok": True, "markets": enriched, "spot": round(spot, 2)}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@app.get("/api/htf/latest")
-def htf_latest():
-    """DB snapshots, recent trades, and paper bot state."""
-    try:
-        db.init_htf_tables()  # idempotent — creates tables if missing
-    except Exception:
-        pass
-    try:
-        return {
-            "ok":            True,
-            "snapshots":     db.htf_get_latest_snapshots(),
-            "recent_trades": db.htf_get_recent_trades(20),
-            "bot_state":     db.htf_get_state(),
-        }
-    except Exception as e:
-        return {
-            "ok":            False,
-            "error":         str(e),
-            "snapshots":     [],
-            "recent_trades": [],
-            "bot_state":     {"balance": 10000.0, "total_pnl": 0.0},
-        }
-
-
-@app.get("/api/htf/history")
-def htf_history(slug: str, hours: int = 6):
-    """Snapshot history for one market (for charting)."""
-    return {"ok": True, "history": db.htf_get_history(slug, min(hours, 168))}
