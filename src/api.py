@@ -303,11 +303,36 @@ async def live_health(side: str = "Up"):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.post("/api/live/update-balance")
+async def live_update_balance():
+    """Tell the CLOB to re-read on-chain USDC balance + allowances for the funder."""
+    try:
+        return await live_clob.update_balance()
+    except live_clob.LiveClobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
 @app.get("/api/live/diagnose")
 async def live_diagnose():
     """Probe all signature_type combinations to locate the funder."""
     try:
         return await live_clob.diagnose()
+    except live_clob.LiveClobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/live/update-balance")
+async def live_update_balance(x_live_test_token: str = Header(default="")):
+    """Force the CLOB to re-read on-chain USDC balance + allowances."""
+    expected_token = os.getenv("LIVE_TEST_TOKEN")
+    if not expected_token or x_live_test_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing live test token")
+    try:
+        return await live_clob.update_balance()
     except live_clob.LiveClobError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
