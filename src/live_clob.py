@@ -57,7 +57,7 @@ def _to_plain(value: Any) -> Any:
 
 def _load_sdk():
     try:
-        from py_clob_client_v2 import (  # type: ignore
+        from py_clob_client.client import (  # type: ignore
             ApiCreds,
             AssetType,
             BalanceAllowanceParams,
@@ -69,7 +69,7 @@ def _load_sdk():
         )
     except Exception as exc:
         raise LiveClobError(
-            "py_clob_client_v2 is not installed. Deploy with py_clob_client_v2 in requirements.txt."
+            "py-clob-client is not installed. Deploy with py_clob_client.client in requirements.txt."
         ) from exc
     return {
         "ApiCreds": ApiCreds,
