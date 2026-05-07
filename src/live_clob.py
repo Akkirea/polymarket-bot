@@ -118,6 +118,9 @@ def _client(sdk: dict):
         print(f"[identity] EOA={eoa} (EOA-only mode)", flush=True)
     return sdk["ClobClient"](**kwargs)
 
+CODE_VERSION = "safe-mode-v1"
+
+
 def env_summary() -> dict:
     """Return non-secret live config status for diagnostics."""
     private_key = _env("PRIVATE_KEY", "PK")
@@ -126,6 +129,7 @@ def env_summary() -> dict:
     api_passphrase = _env("API_PASSPHRASE", "PASSPHRASE", "CLOB_PASS_PHRASE")
     signature_type = _env("SIGNATURE_TYPE")
     return {
+        "code_version": CODE_VERSION,
         "polymarket_live": os.getenv("POLYMARKET_LIVE", "false").lower() == "true",
         "polymarket_live_test": os.getenv("POLYMARKET_LIVE_TEST", "false").lower() == "true",
         "has_private_key": bool(private_key),
