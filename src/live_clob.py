@@ -183,6 +183,58 @@ def token_for_side(market: dict, side: str) -> str:
     raise LiveClobError(f"Could not find CLOB token id for side={side}")
 
 
+async def diagnose() -> dict:
+    """
+    Try every known signature_type and the SDK's own derived address so we can see
+    where the CLOB actually thinks our funds live.
+    """
+    sdk = _load_sdk()
+    eoa = None
+    pk = _env("PRIVATE_KEY", "PK", required=True)
+    pk = pk if pk.startswith("0x") else "0x" + pk
+    from eth_account import Account
+    eoa = Account.from_key(pk).address
+
+    funder_env = _env("FUNDER_ADDRESS")
+    sig_env = _env("SIGNATURE_TYPE")
+
+    results = {
+        "signer_eoa": eoa,
+        "funder_env": funder_env,
+        "sig_type_env": sig_env,
+        "attempts": [],
+    }
+
+    # Try each (sig_type, funder) combination we know about
+    attempts = [
+        (0, None, "EOA only"),
+        (1, funder_env, "POLY_PROXY with env funder"),
+        (2, funder_env, "POLY_GNOSIS_SAFE with env funder"),
+        (1, None, "POLY_PROXY no funder"),
+        (2, None, "POLY_GNOSIS_SAFE no funder"),
+    ]
+
+    for sig_type, funder, label in attempts:
+        attempt: dict = {"label": label, "sig_type": sig_type, "funder": funder}
+        try:
+            kwargs = dict(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=_api_creds(sdk))
+            if sig_type and sig_type != 0:
+                kwargs["signature_type"] = sig_type
+                if funder:
+                    kwargs["funder"] = funder
+            client = sdk["ClobClient"](**kwargs)
+            attempt["sdk_address"] = getattr(client, "get_address", lambda: None)()
+            collateral = client.get_balance_allowance(
+                sdk["BalanceAllowanceParams"](asset_type=sdk["AssetType"].COLLATERAL)
+            )
+            attempt["collateral"] = _to_plain(collateral)
+        except Exception as exc:
+            attempt["error"] = f"{type(exc).__name__}: {exc}"
+        results["attempts"].append(attempt)
+
+    return results
+
+
 async def health(side: str = "Up") -> dict:
     sdk = _load_sdk()
     client = _client(sdk)

@@ -303,6 +303,17 @@ async def live_health(side: str = "Up"):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.get("/api/live/diagnose")
+async def live_diagnose():
+    """Probe all signature_type combinations to locate the funder."""
+    try:
+        return await live_clob.diagnose()
+    except live_clob.LiveClobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
 @app.post("/api/live/test-buy")
 async def live_test_buy(body: dict, x_live_test_token: str = Header(default="")):
     """
