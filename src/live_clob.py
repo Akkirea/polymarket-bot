@@ -57,19 +57,20 @@ def _to_plain(value: Any) -> Any:
 
 def _load_sdk():
     try:
-        from py_clob_client.client import (  # type: ignore
+        from types import SimpleNamespace
+        from py_clob_client.client import ClobClient  # type: ignore
+        from py_clob_client.clob_types import (  # type: ignore
             ApiCreds,
             AssetType,
             BalanceAllowanceParams,
-            ClobClient,
             OrderArgs,
             OrderType,
             PartialCreateOrderOptions,
-            Side,
         )
+        from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
     except Exception as exc:
         raise LiveClobError(
-            "py-clob-client is not installed. Deploy with py_clob_client.client in requirements.txt."
+            "py-clob-client is not installed. Deploy with py-clob-client in requirements.txt."
         ) from exc
     return {
         "ApiCreds": ApiCreds,
@@ -79,7 +80,7 @@ def _load_sdk():
         "OrderArgs": OrderArgs,
         "OrderType": OrderType,
         "PartialCreateOrderOptions": PartialCreateOrderOptions,
-        "Side": Side,
+        "Side": SimpleNamespace(BUY=BUY, SELL=SELL),
     }
 
 
