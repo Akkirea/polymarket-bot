@@ -8,3 +8,4 @@ httpx
 web3>=6.0
 python-dotenv
 py-clob-client>=0.34.0
+# force clean rebuild
