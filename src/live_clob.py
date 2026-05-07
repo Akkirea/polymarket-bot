@@ -235,6 +235,27 @@ async def diagnose() -> dict:
     return results
 
 
+async def update_balance() -> dict:
+    """Tell the CLOB to re-read on-chain USDC balance + allowances for the funder."""
+    sdk = _load_sdk()
+    client = _client(sdk)
+
+    results = {}
+    for label, asset_type in [
+        ("collateral",  sdk["AssetType"].COLLATERAL),
+        ("conditional", sdk["AssetType"].CONDITIONAL),
+    ]:
+        try:
+            params = sdk["BalanceAllowanceParams"](asset_type=asset_type)
+            before = client.get_balance_allowance(params)
+            after  = client.update_balance_allowance(params)
+            results[label] = {"before": _to_plain(before), "after": _to_plain(after)}
+        except Exception as exc:
+            results[label] = {"error": str(exc)}
+
+    return {"ok": True, "results": results}
+
+
 async def health(side: str = "Up") -> dict:
     sdk = _load_sdk()
     client = _client(sdk)
@@ -306,7 +327,7 @@ async def test_buy(side: str, amount: float) -> dict:
         )
 
     size = round(amount / estimated_price, 4)
-    response = client.create_and_post_order(
+    order = client.create_order(
         order_args=sdk["OrderArgs"](
             token_id=token_id,
             price=estimated_price,
@@ -314,8 +335,8 @@ async def test_buy(side: str, amount: float) -> dict:
             side=sdk["Side"].BUY,
         ),
         options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
-        order_type=order_type,
     )
+    response = client.post_order(order, order_type)
 
     return {
         "ok": True,
