@@ -97,13 +97,26 @@ def _client(sdk: dict):
     pk = _env("PRIVATE_KEY", "PK", required=True)
     pk = pk if pk.startswith("0x") else "0x" + pk
     eoa = Account.from_key(pk).address
-    print(f"[identity] EOA={eoa}", flush=True)
-    return sdk["ClobClient"](
+
+    sig_type_raw = _env("SIGNATURE_TYPE")
+    funder = _env("FUNDER_ADDRESS")
+    kwargs = dict(
         host=CLOB_HOST,
         chain_id=CHAIN_ID,
         key=pk,
         creds=_api_creds(sdk),
     )
+    if sig_type_raw and sig_type_raw != "0":
+        if not funder:
+            raise LiveClobError(
+                f"SIGNATURE_TYPE={sig_type_raw} requires FUNDER_ADDRESS to be set"
+            )
+        kwargs["signature_type"] = int(sig_type_raw)
+        kwargs["funder"] = funder
+        print(f"[identity] EOA={eoa} funder={funder} sig_type={sig_type_raw}", flush=True)
+    else:
+        print(f"[identity] EOA={eoa} (EOA-only mode)", flush=True)
+    return sdk["ClobClient"](**kwargs)
 
 def env_summary() -> dict:
     """Return non-secret live config status for diagnostics."""
