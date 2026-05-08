@@ -10,7 +10,7 @@ Run with:
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiohttp
 from fastapi import FastAPI, Header, HTTPException
@@ -438,16 +438,31 @@ async def reset_bot():
 
 @app.get("/api/btc-price")
 async def btc_price():
-    """Return the latest BTC/USD price from the Chainlink feed on Polygon."""
+    """Return the latest BTC/USD price — Chainlink preferred, Binance REST fallback."""
+    ts = datetime.now(timezone.utc).isoformat()
+
     try:
         loop = asyncio.get_running_loop()
         price = await loop.run_in_executor(None, get_btc_price)
-        return {
-            "price": round(price, 2),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        return {"price": round(price, 2), "source": "chainlink", "timestamp": ts}
+    except Exception:
+        pass
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "BTCUSDT"},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "price": round(float(data["price"]), 2),
+                        "source": "binance-rest",
+                        "timestamp": ts,
+                    }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail=f"All price sources failed: {e}")
 
 
 @app.get("/api/funding-rates")

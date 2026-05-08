@@ -174,7 +174,7 @@ class PaperBot:
             },
             "open_positions":   self.positions,
             "price_feed": {
-                "source":       "binance",
+                "source":       self._binance_feed.source,
                 "connected":    self._binance_feed.connected,
                 "current_price": round(self._binance_feed.current_price, 2) if self._binance_feed.current_price else None,
                 "last_update":  self._binance_feed.last_update,
