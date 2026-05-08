@@ -15,6 +15,7 @@ Usage (started automatically by api.py endpoints):
 
 import asyncio
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,7 +31,11 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 BYBIT_API = "https://api.bybit.com/v5/market"
 
 INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
-BET_SIZE             = 500.0  # Kelly base cap — 2x hours can go up to $1,000
+INITIAL_WALLET_SIZE  = 97.0
+MAX_STAKE_PCT        = 0.02   # half-Kelly at 52% win prob and 0.50 entry
+MIN_STAKE_PCT        = 0.01   # skip smaller signals instead of forcing oversize bets
+MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT
+MIN_STAKE            = INITIAL_WALLET_SIZE * MIN_STAKE_PCT
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
 MIN_PREV_MOVE        = 25.0   # USD — skip if the reference window moved less than this
 # Data-validated allowed hours (ET = UTC-4). All others blocked.
@@ -50,6 +55,7 @@ CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is 
 BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
+LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
 
 
 # ── PaperBot ───────────────────────────────────────────────────────────────────
@@ -64,10 +70,16 @@ class PaperBot:
         state = db.load_bot_state()
         performance = db.load_bot_performance()
         self.balance:     float = state["balance"]
-        self.positions:   list  = db.load_open_positions()   # up to 2 concurrent positions
+        self.positions:   list  = db.load_open_positions()
         self.wins:        int   = performance["wins"]
         self.losses:      int   = performance["losses"]
         self.total_pnl:   float = performance["total_pnl"]
+        live_perf = db.load_live_performance()
+        live_state = db.load_live_state(LIVE_INITIAL_BALANCE)
+        self.live_balance: float = live_state["balance"]
+        self.live_wins:    int   = live_perf["wins"]
+        self.live_losses:  int   = live_perf["losses"]
+        self.live_pnl:     float = live_perf["total_pnl"]
         self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
         self._binance_task: Optional[asyncio.Task] = None
@@ -143,6 +155,7 @@ class PaperBot:
 
     def get_status(self) -> dict:
         total = self.wins + self.losses
+        live_total = self.live_wins + self.live_losses
         return {
             "running":          self.running,
             "balance":          round(self.balance, 2),
@@ -151,6 +164,14 @@ class PaperBot:
             "losses":           self.losses,
             "win_rate":         round(self.wins / total, 4) if total else 0.0,
             "pnl":              round(self.total_pnl, 2),
+            "live": {
+                "balance":   round(self.live_balance, 4),
+                "wins":      self.live_wins,
+                "losses":    self.live_losses,
+                "total":     live_total,
+                "win_rate":  round(self.live_wins / live_total, 4) if live_total else 0.0,
+                "pnl":       round(self.live_pnl, 4),
+            },
             "open_positions":   self.positions,
             "price_feed": {
                 "source":       "binance",
@@ -163,10 +184,11 @@ class PaperBot:
             "funding_rate_source": self._funding_rate_source,
         }
 
-    def get_recent_trades(self, n: int = 5) -> list:
+    def get_recent_trades(self, n: int = 20, mode: str = "paper") -> list:
         conn = db.get_connection()
         rows = conn.execute(
-            "SELECT * FROM bot_trades ORDER BY opened_at DESC LIMIT %s", (n,)
+            "SELECT * FROM bot_trades WHERE COALESCE(mode,'paper')=%s ORDER BY opened_at DESC LIMIT %s",
+            (mode, n),
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -312,6 +334,7 @@ class PaperBot:
                     seconds_remaining=seconds_remaining,
                     strategy="chainlink-reversal-guard",
                     hour_et=hour_et,
+                    market=market,
                 )
                 break
 
@@ -741,7 +764,8 @@ class PaperBot:
                              diff_at_entry: Optional[float] = None,
                              seconds_remaining: Optional[float] = None,
                              strategy: Optional[str] = None,
-                             hour_et: int = 0):
+                             hour_et: int = 0,
+                             market: Optional[dict] = None):
         # Half-Kelly sizing with data-driven hour multiplier.
         # WIN_PROB is derived from measured trade history (or conservative
         # default of 0.52 when sample size is too small).
@@ -749,14 +773,41 @@ class PaperBot:
         loss_prob      = 1.0 - win_prob
         b              = (1.0 / entry_price) - 1.0   # net payout per dollar risked
         kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
-        multiplier     = HOUR_MULTIPLIER.get(hour_et, 1.0)
-        max_stake      = BET_SIZE * multiplier         # $500 base, $1000 for 2x hours
-        stake          = self.balance * kelly_fraction * 0.5 * multiplier
-        stake          = max(50.0, min(max_stake, stake))  # floor $50, cap by hour tier
+        multiplier     = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
+        max_stake      = MAX_STAKE * multiplier
+        raw_stake      = self.balance * kelly_fraction * 0.5 * multiplier
+        stake          = min(max_stake, raw_stake)
+
+        if stake < MIN_STAKE:
+            print(
+                f"[bot] Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum "
+                f"({MIN_STAKE_PCT:.0%} of ${INITIAL_WALLET_SIZE:.0f}) — skipping",
+                flush=True,
+            )
+            return
 
         if self.balance < stake:
             print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
             return
+
+        # ── Live order (best-effort alongside paper) ───────────────────────────
+        live_order = None
+        if os.getenv("POLYMARKET_LIVE", "false").lower() == "true":
+            if market is None:
+                print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
+            else:
+                try:
+                    from . import live_clob
+                    live_order = await live_clob.place_order(market, side, stake)
+                    self.live_balance -= live_order["stake"]
+                    print(
+                        f"[bot] LIVE: filled orderID={live_order['order_id']}  "
+                        f"stake=${live_order['stake']:.2f}  price={live_order['fill_price']:.4f}  "
+                        f"tx={live_order['tx_hash']}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[bot] LIVE: order failed for {slug} ({exc}) — paper only", flush=True)
 
         self.balance -= stake
         pos = {
@@ -770,6 +821,9 @@ class PaperBot:
             "diff_at_entry":     diff_at_entry,
             "seconds_remaining": seconds_remaining,
             "strategy":          strategy,
+            "live_order_id":     live_order["order_id"] if live_order else None,
+            "live_stake":        live_order["stake"]    if live_order else None,
+            "live_fill_price":   live_order["fill_price"] if live_order else None,
         }
         self.positions.append(pos)
         db.save_open_position(pos)
@@ -789,11 +843,12 @@ class PaperBot:
     async def _force_close(self, pos: dict):
         """Close a position that never received a winner from Polymarket.
         Stake is returned to balance — outcome recorded as 'unresolved'."""
-        # Remove from list first — prevents re-entry if DB write fails
         self.positions = [p for p in self.positions if p["market_slug"] != pos["market_slug"]]
         db.clear_open_position(pos["market_slug"])
 
         self.balance += pos["size"]
+        if pos.get("live_order_id") and pos.get("live_stake"):
+            self.live_balance += pos["live_stake"]
         closed_at = datetime.now(timezone.utc).isoformat()
         print(
             f"[bot] FORCE-CLOSE refund ${pos['size']:.0f} → balance=${self.balance:.2f}",
@@ -802,32 +857,23 @@ class PaperBot:
 
         try:
             conn = db.get_connection()
-            conn.execute(
-                """INSERT INTO bot_trades
+            _INSERT = """INSERT INTO bot_trades
                    (whale_address, market_slug, side, size, entry_price,
-                    price_to_beat, poly_price_to_beat, resolution_price,
-                    outcome, pnl, balance_after, diff_at_entry, seconds_remaining,
-                    strategy, opened_at, closed_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    STRATEGY_TAG,
-                    pos["market_slug"],
-                    pos["side"],
-                    pos["size"],
-                    round(pos.get("entry_price") or 0.5, 4),
-                    round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
-                    None,
-                    None,
-                    "unresolved",
-                    0.0,
-                    round(self.balance, 2),
-                    round(pos["diff_at_entry"], 2) if pos.get("diff_at_entry") is not None else None,
-                    round(pos["seconds_remaining"], 1) if pos.get("seconds_remaining") is not None else None,
-                    pos.get("strategy"),
-                    pos["opened_at"],
-                    closed_at,
-                ),
+                    price_to_beat, outcome, pnl, balance_after, diff_at_entry,
+                    seconds_remaining, strategy, opened_at, closed_at, mode)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+            base = (
+                STRATEGY_TAG, pos["market_slug"], pos["side"],
+                round(pos.get("entry_price") or 0.5, 4),
+                round(pos["price_to_beat"], 2) if pos.get("price_to_beat") else None,
+                "unresolved", 0.0,
+                round(pos["diff_at_entry"], 2) if pos.get("diff_at_entry") is not None else None,
+                round(pos["seconds_remaining"], 1) if pos.get("seconds_remaining") is not None else None,
+                pos.get("strategy"), pos["opened_at"], closed_at,
             )
+            conn.execute(_INSERT, base[:2] + (pos["side"], pos["size"],) + base[3:] + (round(self.balance, 2), "paper",))
+            if pos.get("live_order_id") and pos.get("live_stake"):
+                conn.execute(_INSERT, base[:2] + (pos["side"], pos["live_stake"],) + base[3:] + (round(self.live_balance, 4), "live",))
             conn.commit()
             conn.close()
             db.save_bot_state(self.balance)
@@ -836,7 +882,7 @@ class PaperBot:
             )
         except Exception as exc:
             import traceback
-            print(f"[bot] DB write failed after force-close — trade lost but position cleared: {exc}\n{traceback.format_exc()}", flush=True)
+            print(f"[bot] DB write failed after force-close: {exc}\n{traceback.format_exc()}", flush=True)
 
     async def _backfill_resolution_price(self, slug: str, end_ts: float):
         """Background task: wait until resolution data is available, then settle."""
@@ -1048,6 +1094,7 @@ class PaperBot:
         if entry_price <= 0:
             entry_price = 0.5
 
+        # ── Paper P&L ─────────────────────────────────────────────────────────
         if won:
             pnl = size * (1.0 / entry_price - 1.0)
             self.balance += size + pnl
@@ -1055,44 +1102,65 @@ class PaperBot:
         else:
             pnl = -size
             self.losses += 1
-
         self.total_pnl += pnl
+
+        # ── Live P&L (if this position had a real order) ───────────────────────
+        live_pnl = None
+        if pos.get("live_order_id"):
+            live_size  = pos["live_stake"]
+            live_price = pos.get("live_fill_price") or entry_price
+            if live_price <= 0:
+                live_price = entry_price
+            if won:
+                live_pnl = live_size * (1.0 / live_price - 1.0)
+                self.live_balance += live_size + live_pnl
+                self.live_wins += 1
+            else:
+                live_pnl = -live_size
+                self.live_losses += 1
+            self.live_pnl += live_pnl
+
         closed_at = datetime.now(timezone.utc).isoformat()
 
         print(
             f"[bot] CLOSE {pos['side']:>4}  winner={winner}"
-            f"  pnl=${pnl:+.2f}  balance=${self.balance:.2f}",
+            f"  paper=${pnl:+.2f} (bal=${self.balance:.2f})"
+            + (f"  live=${live_pnl:+.4f} (bal=${self.live_balance:.4f})" if live_pnl is not None else ""),
             flush=True,
         )
 
         try:
             conn = db.get_connection()
-            conn.execute(
-                """INSERT INTO bot_trades
-                   (whale_address, market_slug, side, size, entry_price,
-                    price_to_beat, poly_price_to_beat, resolution_price,
-                    outcome, pnl, balance_after, diff_at_entry, seconds_remaining,
-                    strategy, opened_at, closed_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    STRATEGY_TAG,
-                    pos["market_slug"],
-                    pos["side"],
-                    pos["size"],
-                    round(entry_price, 4),
-                    round(pos.get("price_to_beat"), 2) if pos.get("price_to_beat") else None,
-                    round(poly_price_to_beat, 2) if poly_price_to_beat else None,
-                    round(resolution_price, 2) if resolution_price else None,
-                    winner,
-                    round(pnl, 2),
-                    round(self.balance, 2),
-                    round(pos["diff_at_entry"], 2) if pos.get("diff_at_entry") is not None else None,
-                    round(pos["seconds_remaining"], 1) if pos.get("seconds_remaining") is not None else None,
-                    pos.get("strategy"),
-                    pos["opened_at"],
-                    closed_at,
-                ),
+            common = (
+                pos["market_slug"], pos["side"],
+                round(pos.get("price_to_beat"), 2) if pos.get("price_to_beat") else None,
+                round(poly_price_to_beat, 2) if poly_price_to_beat else None,
+                round(resolution_price, 2) if resolution_price else None,
+                winner,
+                round(pos["diff_at_entry"], 2) if pos.get("diff_at_entry") is not None else None,
+                round(pos["seconds_remaining"], 1) if pos.get("seconds_remaining") is not None else None,
+                pos.get("strategy"),
+                pos["opened_at"],
+                closed_at,
             )
+            _INSERT = """INSERT INTO bot_trades
+                   (market_slug, side, price_to_beat, poly_price_to_beat, resolution_price,
+                    outcome, diff_at_entry, seconds_remaining, strategy, opened_at, closed_at,
+                    whale_address, size, entry_price, pnl, balance_after, mode)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+            # Paper row
+            conn.execute(_INSERT, common + (
+                STRATEGY_TAG, round(size, 4), round(entry_price, 4),
+                round(pnl, 2), round(self.balance, 2), "paper",
+            ))
+            # Live row (only if a real order was placed)
+            if pos.get("live_order_id") and live_pnl is not None:
+                live_size  = pos["live_stake"]
+                live_price = pos.get("live_fill_price") or entry_price
+                conn.execute(_INSERT, common + (
+                    STRATEGY_TAG, round(live_size, 4), round(live_price, 4),
+                    round(live_pnl, 4), round(self.live_balance, 4), "live",
+                ))
             conn.commit()
             conn.close()
             db.save_bot_state(self.balance)

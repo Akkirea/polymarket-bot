@@ -7,5 +7,5 @@ psycopg2-binary>=2.9
 httpx
 web3>=6.0
 python-dotenv
-py-clob-client>=0.34.0
+py-clob-client-v2>=1.0.1rc1
 # force clean rebuild

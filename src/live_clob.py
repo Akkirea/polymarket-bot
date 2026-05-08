@@ -1,5 +1,5 @@
 """
-Live Polymarket CLOB execution helpers.
+Live Polymarket CLOB execution helpers (V2 SDK / sig_type=3 POLY_1271).
 
 This module is deliberately test-first. It exposes read-only health checks and a
 manual $1 FOK buy path; automated bot execution should only call this after the
@@ -57,30 +57,31 @@ def _to_plain(value: Any) -> Any:
 
 def _load_sdk():
     try:
-        from types import SimpleNamespace
-        from py_clob_client.client import ClobClient  # type: ignore
-        from py_clob_client.clob_types import (  # type: ignore
+        from py_clob_client_v2.client import ClobClient  # type: ignore
+        from py_clob_client_v2.clob_types import (  # type: ignore
             ApiCreds,
             AssetType,
             BalanceAllowanceParams,
+            MarketOrderArgs,
             OrderArgs,
             OrderType,
             PartialCreateOrderOptions,
         )
-        from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
     except Exception as exc:
         raise LiveClobError(
-            "py-clob-client is not installed. Deploy with py-clob-client in requirements.txt."
+            "py-clob-client-v2 is not installed. Add py-clob-client-v2>=1.0.1rc1 to requirements.txt."
         ) from exc
     return {
         "ApiCreds": ApiCreds,
         "AssetType": AssetType,
         "BalanceAllowanceParams": BalanceAllowanceParams,
         "ClobClient": ClobClient,
+        "MarketOrderArgs": MarketOrderArgs,
         "OrderArgs": OrderArgs,
         "OrderType": OrderType,
         "PartialCreateOrderOptions": PartialCreateOrderOptions,
-        "Side": SimpleNamespace(BUY=BUY, SELL=SELL),
+        "BUY": "BUY",
+        "SELL": "SELL",
     }
 
 
@@ -118,7 +119,7 @@ def _client(sdk: dict):
         print(f"[identity] EOA={eoa} (EOA-only mode)", flush=True)
     return sdk["ClobClient"](**kwargs)
 
-CODE_VERSION = "safe-mode-v1"
+CODE_VERSION = "v2-poly1271"
 
 
 def env_summary() -> dict:
@@ -185,11 +186,10 @@ def token_for_side(market: dict, side: str) -> str:
 
 async def diagnose() -> dict:
     """
-    Try every known signature_type and the SDK's own derived address so we can see
-    where the CLOB actually thinks our funds live.
+    Try every known signature_type and funder so we can see
+    where the CLOB thinks our funds live.
     """
     sdk = _load_sdk()
-    eoa = None
     pk = _env("PRIVATE_KEY", "PK", required=True)
     pk = pk if pk.startswith("0x") else "0x" + pk
     from eth_account import Account
@@ -198,6 +198,8 @@ async def diagnose() -> dict:
     funder_env = _env("FUNDER_ADDRESS")
     sig_env = _env("SIGNATURE_TYPE")
 
+    OLD_PROXY = "0x53Be71805A26b3e5cb9440Dc7e41D3e47868EED7"
+
     results = {
         "signer_eoa": eoa,
         "funder_env": funder_env,
@@ -205,13 +207,12 @@ async def diagnose() -> dict:
         "attempts": [],
     }
 
-    # Try each (sig_type, funder) combination we know about
     attempts = [
-        (0, None, "EOA only"),
-        (1, funder_env, "POLY_PROXY with env funder"),
-        (2, funder_env, "POLY_GNOSIS_SAFE with env funder"),
-        (1, None, "POLY_PROXY no funder"),
-        (2, None, "POLY_GNOSIS_SAFE no funder"),
+        (0,  None,        "EOA only"),
+        (1,  funder_env,  "POLY_PROXY with env funder"),
+        (2,  funder_env,  "POLY_GNOSIS_SAFE with env funder"),
+        (3,  funder_env,  "POLY_1271 with env funder"),
+        (3,  OLD_PROXY,   "POLY_1271 with old proxy (has pUSD)"),
     ]
 
     for sig_type, funder, label in attempts:
@@ -235,8 +236,67 @@ async def diagnose() -> dict:
     return results
 
 
+async def place_order(market: dict, side: str, stake: float) -> dict:
+    """
+    Place a real FOK buy on the CLOB for the given market/side/stake.
+    Returns fill details. Raises LiveClobError if order not filled or env not set.
+    Only callable when POLYMARKET_LIVE=true.
+    """
+    if os.getenv("POLYMARKET_LIVE", "false").lower() != "true":
+        raise LiveClobError("POLYMARKET_LIVE must be true to place live orders")
+
+    sdk = _load_sdk()
+    client = _client(sdk)
+    token_id = token_for_side(market, side)
+    tick_size = client.get_tick_size(token_id)
+    neg_risk = client.get_neg_risk(token_id)
+
+    # CLOB requires maker amount to have at most 2 decimal places ($0.01 precision)
+    stake = round(stake, 2)
+    if stake < 0.01:
+        raise LiveClobError(f"Stake ${stake:.4f} is below $0.01 minimum")
+
+    estimated_price = float(
+        client.calculate_market_price(token_id, "BUY", stake, sdk["OrderType"].FOK)
+    )
+
+    order = client.create_market_order(
+        order_args=sdk["MarketOrderArgs"](
+            token_id=token_id,
+            amount=stake,
+            side="BUY",
+            price=estimated_price,
+            order_type=sdk["OrderType"].FOK,
+        ),
+        options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
+    )
+    response = client.post_order(order, sdk["OrderType"].FOK)
+    resp = _to_plain(response)
+
+    success = isinstance(resp, dict) and resp.get("success") is True
+    if not success:
+        raise LiveClobError(f"FOK order not filled: {resp}")
+
+    # Derive actual fill price from taking/making amounts
+    fill_price = estimated_price
+    making = resp.get("makingAmount")
+    taking = resp.get("takingAmount")
+    if making and taking and float(taking) > 0:
+        fill_price = float(making) / float(taking)
+
+    return {
+        "token_id": token_id,
+        "stake": stake,
+        "estimated_price": estimated_price,
+        "fill_price": fill_price,
+        "order_id": resp.get("orderID"),
+        "tx_hash": (resp.get("transactionsHashes") or [None])[0],
+        "response": resp,
+    }
+
+
 async def update_balance() -> dict:
-    """Tell the CLOB to re-read on-chain USDC balance + allowances for the funder."""
+    """Tell the CLOB to re-read on-chain pUSD balance + allowances for the funder."""
     sdk = _load_sdk()
     client = _client(sdk)
 
@@ -318,7 +378,7 @@ async def test_buy(side: str, amount: float) -> dict:
         raise LiveClobError("LIVE_ORDER_TYPE must be FOK or FAK for manual test buys")
     order_type = getattr(sdk["OrderType"], order_type_name)
 
-    estimated_price = float(client.calculate_market_price(token_id, sdk["Side"].BUY, amount, order_type))
+    estimated_price = float(client.calculate_market_price(token_id, sdk["BUY"], amount, order_type))
     min_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
     max_price = float(os.getenv("MAX_LIVE_PRICE", "0.70"))
     if estimated_price < min_price or estimated_price > max_price:
@@ -326,13 +386,14 @@ async def test_buy(side: str, amount: float) -> dict:
             f"Estimated price {estimated_price:.4f} outside [{min_price:.2f}, {max_price:.2f}]"
         )
 
-    size = round(amount / estimated_price, 4)
-    order = client.create_order(
-        order_args=sdk["OrderArgs"](
+    # Use create_market_order so makerAmount = amount exactly (preserves $0.01 precision)
+    order = client.create_market_order(
+        order_args=sdk["MarketOrderArgs"](
             token_id=token_id,
+            amount=amount,
+            side=sdk["BUY"],
             price=estimated_price,
-            size=size,
-            side=sdk["Side"].BUY,
+            order_type=order_type,
         ),
         options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
     )
@@ -348,7 +409,6 @@ async def test_buy(side: str, amount: float) -> dict:
         "side": side,
         "token_id": token_id,
         "amount": amount,
-        "size": size,
         "order_type": order_type_name,
         "estimated_price": estimated_price,
         "tick_size": tick_size,

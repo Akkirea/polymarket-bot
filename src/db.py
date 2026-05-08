@@ -195,7 +195,8 @@ def init_db():
             seconds_remaining  REAL,
             strategy           TEXT,
             opened_at          TEXT NOT NULL,
-            closed_at          TEXT
+            closed_at          TEXT,
+            mode               TEXT NOT NULL DEFAULT 'paper'
         );
 
         CREATE TABLE IF NOT EXISTS bot_state (
@@ -225,7 +226,10 @@ def init_db():
             opened_at         TEXT NOT NULL,
             diff_at_entry     REAL,
             seconds_remaining REAL,
-            strategy          TEXT
+            strategy          TEXT,
+            live_order_id     TEXT,
+            live_stake        REAL,
+            live_fill_price   REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_whale_wallets_winrate ON whale_wallets(win_rate DESC);
@@ -251,7 +255,11 @@ def init_db():
     # Migrate existing bot_trades tables that predate these columns.
     # PostgreSQL: ADD COLUMN IF NOT EXISTS is idempotent — no exception, no broken transaction.
     # SQLite:     IF NOT EXISTS in ALTER TABLE requires 3.37+; use try/except instead.
-    for col, typ in [("price_to_beat", "REAL"), ("poly_price_to_beat", "REAL"), ("resolution_price", "REAL"), ("balance_after", "REAL"), ("diff_at_entry", "REAL"), ("seconds_remaining", "REAL"), ("strategy", "TEXT")]:
+    for col, typ in [
+        ("price_to_beat", "REAL"), ("poly_price_to_beat", "REAL"), ("resolution_price", "REAL"),
+        ("balance_after", "REAL"), ("diff_at_entry", "REAL"), ("seconds_remaining", "REAL"),
+        ("strategy", "TEXT"), ("mode", "TEXT NOT NULL DEFAULT 'paper'"),
+    ]:
         if _USE_PG:
             conn.execute(f"ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS {col} {typ}")
             conn.commit()
@@ -263,7 +271,10 @@ def init_db():
                 pass  # column already exists
 
     # Migrate bot_open_positions (new table — may have been created before these columns were added)
-    for col, typ in [("diff_at_entry", "REAL"), ("seconds_remaining", "REAL"), ("strategy", "TEXT")]:
+    for col, typ in [
+        ("diff_at_entry", "REAL"), ("seconds_remaining", "REAL"), ("strategy", "TEXT"),
+        ("live_order_id", "TEXT"), ("live_stake", "REAL"), ("live_fill_price", "REAL"),
+    ]:
         if _USE_PG:
             conn.execute(f"ALTER TABLE bot_open_positions ADD COLUMN IF NOT EXISTS {col} {typ}")
             conn.commit()
@@ -480,13 +491,14 @@ INITIAL_BALANCE = 10_000.0
 
 
 def load_bot_state() -> dict:
-    """Return balance derived from the trade ledger and open positions."""
+    """Return paper balance derived from the paper trade ledger and open positions."""
     conn = get_connection()
     realized = conn.execute(
         """SELECT COALESCE(SUM(pnl), 0) AS total
              FROM bot_trades
             WHERE pnl IS NOT NULL
-              AND COALESCE(outcome, '') != 'unresolved'"""
+              AND COALESCE(outcome, '') != 'unresolved'
+              AND COALESCE(mode, 'paper') = 'paper'"""
     ).fetchone()
     reserved = conn.execute(
         "SELECT COALESCE(SUM(size), 0) AS total FROM bot_open_positions"
@@ -496,8 +508,47 @@ def load_bot_state() -> dict:
     return {"balance": balance}
 
 
+def load_live_state(initial_balance: float) -> dict:
+    """Return live balance derived from settled live trades and open live stakes."""
+    conn = get_connection()
+    realized = conn.execute(
+        """SELECT COALESCE(SUM(pnl), 0) AS total
+             FROM bot_trades
+            WHERE pnl IS NOT NULL
+              AND COALESCE(outcome, '') != 'unresolved'
+              AND mode = 'live'"""
+    ).fetchone()
+    reserved = conn.execute(
+        "SELECT COALESCE(SUM(live_stake), 0) AS total FROM bot_open_positions WHERE live_order_id IS NOT NULL"
+    ).fetchone()
+    conn.close()
+    balance = initial_balance + float(realized["total"] or 0.0) - float(reserved["total"] or 0.0)
+    return {"balance": balance}
+
+
+def load_live_performance() -> dict:
+    """Return aggregate win/loss/P&L from resolved live trades."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT
+               COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+               COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses,
+               COALESCE(SUM(pnl), 0) AS total_pnl
+           FROM bot_trades
+           WHERE pnl IS NOT NULL
+             AND COALESCE(outcome, '') != 'unresolved'
+             AND mode = 'live'"""
+    ).fetchone()
+    conn.close()
+    return {
+        "wins": int(row["wins"] or 0),
+        "losses": int(row["losses"] or 0),
+        "total_pnl": float(row["total_pnl"] or 0.0),
+    }
+
+
 def load_bot_performance() -> dict:
-    """Return aggregate win/loss/P&L from resolved bot trades."""
+    """Return aggregate win/loss/P&L from resolved paper trades."""
     conn = get_connection()
     row = conn.execute(
         """SELECT
@@ -507,7 +558,8 @@ def load_bot_performance() -> dict:
                COALESCE(SUM(pnl), 0) AS total_pnl
            FROM bot_trades
            WHERE pnl IS NOT NULL
-             AND COALESCE(outcome, '') != 'unresolved'"""
+             AND COALESCE(outcome, '') != 'unresolved'
+             AND COALESCE(mode, 'paper') = 'paper'"""
     ).fetchone()
     conn.close()
     return {
@@ -537,13 +589,14 @@ def save_bot_state(balance: float):
 
 
 def save_open_position(pos: dict):
-    """Upsert a position row keyed by market_slug (supports up to 2 concurrent positions)."""
+    """Upsert a position row keyed by market_slug (supports up to 3 concurrent positions)."""
     conn = get_connection()
     conn.execute(
         """INSERT INTO bot_open_positions
                (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at,
-                diff_at_entry, seconds_remaining, strategy)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                diff_at_entry, seconds_remaining, strategy,
+                live_order_id, live_stake, live_fill_price)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT(market_slug) DO UPDATE SET
                side              = excluded.side,
                size              = excluded.size,
@@ -553,12 +606,16 @@ def save_open_position(pos: dict):
                opened_at         = excluded.opened_at,
                diff_at_entry     = excluded.diff_at_entry,
                seconds_remaining = excluded.seconds_remaining,
-               strategy          = excluded.strategy"""
+               strategy          = excluded.strategy,
+               live_order_id     = excluded.live_order_id,
+               live_stake        = excluded.live_stake,
+               live_fill_price   = excluded.live_fill_price"""
         if _USE_PG else
         """INSERT OR REPLACE INTO bot_open_positions
                (market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at,
-                diff_at_entry, seconds_remaining, strategy)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                diff_at_entry, seconds_remaining, strategy,
+                live_order_id, live_stake, live_fill_price)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             pos["market_slug"],
             pos["side"],
@@ -570,6 +627,9 @@ def save_open_position(pos: dict):
             pos.get("diff_at_entry"),
             pos.get("seconds_remaining"),
             pos.get("strategy"),
+            pos.get("live_order_id"),
+            pos.get("live_stake"),
+            pos.get("live_fill_price"),
         ),
     )
     conn.commit()
@@ -577,11 +637,12 @@ def save_open_position(pos: dict):
 
 
 def load_open_positions() -> list:
-    """Return all persisted open positions (up to 2)."""
+    """Return all persisted open positions."""
     conn = get_connection()
     rows = conn.execute(
         "SELECT market_slug, side, size, entry_price, price_to_beat, end_ts, opened_at, "
-        "diff_at_entry, seconds_remaining, strategy FROM bot_open_positions"
+        "diff_at_entry, seconds_remaining, strategy, "
+        "live_order_id, live_stake, live_fill_price FROM bot_open_positions"
     ).fetchall()
     conn.close()
     positions = []
@@ -606,6 +667,9 @@ def load_open_positions() -> list:
                 "diff_at_entry":     float(row["diff_at_entry"]) if row["diff_at_entry"] is not None else None,
                 "seconds_remaining": float(row["seconds_remaining"]) if row["seconds_remaining"] is not None else None,
                 "strategy":          row["strategy"],
+                "live_order_id":     row["live_order_id"],
+                "live_stake":        float(row["live_stake"]) if row["live_stake"] is not None else None,
+                "live_fill_price":   float(row["live_fill_price"]) if row["live_fill_price"] is not None else None,
             }
         )
     return positions

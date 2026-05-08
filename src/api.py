@@ -202,20 +202,22 @@ def get_bot_status():
 
 
 @app.get("/api/bot/trades")
-def get_bot_trades():
-    """Last 5 completed bot trades."""
-    return bot.get_recent_trades(n=20)
+def get_bot_trades(mode: str = "paper"):
+    """Last 20 completed bot trades. mode=paper|live"""
+    return bot.get_recent_trades(n=20, mode=mode)
 
 
 @app.get("/api/bot/stats")
-def get_bot_stats():
-    """Aggregate performance stats across all resolved bot_trades."""
+def get_bot_stats(mode: str = "paper"):
+    """Aggregate performance stats. mode=paper|live"""
     conn = db.get_connection()
     try:
         rows = conn.execute(
             "SELECT pnl, outcome, side, opened_at FROM bot_trades "
             "WHERE pnl IS NOT NULL AND COALESCE(outcome, '') != 'unresolved' "
-            "ORDER BY opened_at"
+            "AND COALESCE(mode,'paper')=%s "
+            "ORDER BY opened_at",
+            (mode,),
         ).fetchall()
     finally:
         conn.close()
@@ -257,14 +259,16 @@ def get_bot_stats():
 
 
 @app.get("/api/bot/stats/hourly")
-def get_hourly_stats():
-    """Per-ET-hour breakdown of win rate and P&L across all resolved trades."""
+def get_hourly_stats(mode: str = "paper"):
+    """Per-ET-hour breakdown. mode=paper|live"""
     conn = db.get_connection()
     try:
         rows = conn.execute(
             "SELECT pnl, opened_at FROM bot_trades "
             "WHERE pnl IS NOT NULL AND COALESCE(outcome, '') != 'unresolved' "
-            "ORDER BY opened_at"
+            "AND COALESCE(mode,'paper')=%s "
+            "ORDER BY opened_at",
+            (mode,),
         ).fetchall()
     finally:
         conn.close()
