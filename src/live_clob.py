@@ -260,17 +260,29 @@ async def place_order(market: dict, side: str, stake: float) -> dict:
     if order_type_name not in {"FOK", "FAK"}:
         raise LiveClobError("LIVE_ORDER_TYPE must be FOK or FAK for live orders")
     order_type = getattr(sdk["OrderType"], order_type_name)
+    min_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
+    max_price = float(os.getenv("MAX_LIVE_PRICE", "0.70"))
 
     estimated_price = float(
         client.calculate_market_price(token_id, "BUY", stake, order_type)
     )
+    if estimated_price < min_price:
+        raise LiveClobError(
+            f"Estimated price {estimated_price:.4f} below MIN_LIVE_PRICE={min_price:.2f}"
+        )
+    if order_type_name == "FOK" and estimated_price > max_price:
+        raise LiveClobError(
+            f"Estimated price {estimated_price:.4f} above MAX_LIVE_PRICE={max_price:.2f}"
+        )
+
+    order_price = estimated_price if order_type_name == "FOK" else max_price
 
     order = client.create_market_order(
         order_args=sdk["MarketOrderArgs"](
             token_id=token_id,
             amount=stake,
             side="BUY",
-            price=estimated_price,
+            price=order_price,
             order_type=order_type,
         ),
         options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
@@ -304,6 +316,7 @@ async def place_order(market: dict, side: str, stake: float) -> dict:
         "requested_stake": stake,
         "order_type": order_type_name,
         "estimated_price": estimated_price,
+        "order_price": order_price,
         "fill_price": fill_price,
         "order_id": resp.get("orderID"),
         "tx_hash": (resp.get("transactionsHashes") or [None])[0],
