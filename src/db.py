@@ -487,7 +487,7 @@ def get_stats() -> dict:
     return stats
 
 
-INITIAL_BALANCE = 10_000.0
+INITIAL_BALANCE = float(os.getenv("PAPER_INITIAL_BALANCE", "97.0"))
 
 
 def load_bot_state() -> dict:

@@ -385,6 +385,59 @@ async def live_test_buy(body: dict, x_live_test_token: str = Header(default=""))
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.post("/api/admin/archive-paper-legacy")
+async def archive_paper_legacy(body: dict, x_live_test_token: str = Header(default="")):
+    """Archive pre-current-era paper rows so current stats stay comparable."""
+    expected_token = os.getenv("LIVE_TEST_TOKEN")
+    if not expected_token or x_live_test_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing live test token")
+    if body.get("confirm") != "ARCHIVE_PAPER_LEGACY":
+        raise HTTPException(status_code=400, detail="confirm must be ARCHIVE_PAPER_LEGACY")
+
+    cutoff = body.get("cutoff") or "2026-05-11T14:14:00+00:00"
+    conn = db.get_connection()
+    try:
+        before = conn.execute(
+            """SELECT COUNT(*) AS trades, COALESCE(SUM(pnl), 0) AS pnl
+                 FROM bot_trades
+                WHERE COALESCE(mode, 'paper') = 'paper'
+                  AND opened_at < %s""",
+            (cutoff,),
+        ).fetchone()
+        conn.execute(
+            """UPDATE bot_trades
+                  SET mode = 'paper_legacy'
+                WHERE COALESCE(mode, 'paper') = 'paper'
+                  AND opened_at < %s""",
+            (cutoff,),
+        )
+        current = conn.execute(
+            """SELECT COUNT(*) AS trades, COALESCE(SUM(pnl), 0) AS pnl
+                 FROM bot_trades
+                WHERE COALESCE(mode, 'paper') = 'paper'
+                  AND pnl IS NOT NULL
+                  AND COALESCE(outcome, '') != 'unresolved'""",
+        ).fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+
+    bot._reload_accounting_state()
+    return {
+        "ok": True,
+        "cutoff": cutoff,
+        "archived": {
+            "trades": int(before["trades"] or 0),
+            "pnl": round(float(before["pnl"] or 0.0), 2),
+        },
+        "current_paper": {
+            "trades": int(current["trades"] or 0),
+            "pnl": round(float(current["pnl"] or 0.0), 2),
+            "balance": round(bot.balance, 2),
+        },
+    }
+
+
 @app.get("/api/live/signer")
 def live_signer():
     """Return the public address derived from PRIVATE_KEY/PK — no secrets exposed."""
