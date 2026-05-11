@@ -126,8 +126,6 @@ async def _run_startup_whale_tracker():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[startup] lifespan begin")
-    db.init_db()
-    print("[startup] db.init_db() done")
 
     # Auto-start the trading bot so it survives Railway redeploys without
     # needing a manual POST /api/bot/start each time.
