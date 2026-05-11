@@ -134,7 +134,11 @@ async def lifespan(app: FastAPI):
     bot.start()
     print("[startup] bot auto-started")
 
-    whale_tracker_task = asyncio.create_task(_run_startup_whale_tracker())
+    whale_tracker_task = None
+    if os.getenv("RUN_STARTUP_WHALE_TRACKER", "false").lower() == "true":
+        whale_tracker_task = asyncio.create_task(_run_startup_whale_tracker())
+    else:
+        print("[startup] whale_tracker startup run disabled", flush=True)
 
     # Keep retrying resolution_price for settled trades whose finalPrice was late.
     resolution_backfill_task = asyncio.create_task(_periodic_resolution_backfill())
@@ -142,12 +146,14 @@ async def lifespan(app: FastAPI):
     print("[startup] lifespan ready")
     yield
     print("[shutdown] lifespan end")
-    whale_tracker_task.cancel()
+    if whale_tracker_task:
+        whale_tracker_task.cancel()
     resolution_backfill_task.cancel()
-    try:
-        await whale_tracker_task
-    except asyncio.CancelledError:
-        pass
+    if whale_tracker_task:
+        try:
+            await whale_tracker_task
+        except asyncio.CancelledError:
+            pass
     try:
         await resolution_backfill_task
     except asyncio.CancelledError:
