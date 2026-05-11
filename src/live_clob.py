@@ -2,7 +2,7 @@
 Live Polymarket CLOB execution helpers (V2 SDK / sig_type=3 POLY_1271).
 
 This module is deliberately test-first. It exposes read-only health checks and a
-manual $1 FOK buy path; automated bot execution should only call this after the
+manual $1 FOK/FAK buy path; automated bot execution should only call this after the
 manual path has been proven with production credentials and allowances.
 """
 
@@ -144,7 +144,7 @@ def env_summary() -> dict:
         "live_bet_size": float(os.getenv("LIVE_BET_SIZE", "1.0")),
         "max_live_price": float(os.getenv("MAX_LIVE_PRICE", "0.70")),
         "min_live_price": float(os.getenv("MIN_LIVE_PRICE", "0.30")),
-        "live_order_type": os.getenv("LIVE_ORDER_TYPE", "FOK"),
+        "live_order_type": os.getenv("LIVE_ORDER_TYPE", "FAK"),
         "has_live_test_token": bool(os.getenv("LIVE_TEST_TOKEN")),
     }
 
@@ -238,7 +238,7 @@ async def diagnose() -> dict:
 
 async def place_order(market: dict, side: str, stake: float) -> dict:
     """
-    Place a real FOK buy on the CLOB for the given market/side/stake.
+    Place a real live buy on the CLOB for the given market/side/stake.
     Returns fill details. Raises LiveClobError if order not filled or env not set.
     Only callable when POLYMARKET_LIVE=true.
     """
@@ -256,8 +256,13 @@ async def place_order(market: dict, side: str, stake: float) -> dict:
     if stake < 0.01:
         raise LiveClobError(f"Stake ${stake:.4f} is below $0.01 minimum")
 
+    order_type_name = os.getenv("LIVE_ORDER_TYPE", "FAK").upper()
+    if order_type_name not in {"FOK", "FAK"}:
+        raise LiveClobError("LIVE_ORDER_TYPE must be FOK or FAK for live orders")
+    order_type = getattr(sdk["OrderType"], order_type_name)
+
     estimated_price = float(
-        client.calculate_market_price(token_id, "BUY", stake, sdk["OrderType"].FOK)
+        client.calculate_market_price(token_id, "BUY", stake, order_type)
     )
 
     order = client.create_market_order(
@@ -266,27 +271,38 @@ async def place_order(market: dict, side: str, stake: float) -> dict:
             amount=stake,
             side="BUY",
             price=estimated_price,
-            order_type=sdk["OrderType"].FOK,
+            order_type=order_type,
         ),
         options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
     )
-    response = client.post_order(order, sdk["OrderType"].FOK)
+    response = client.post_order(order, order_type)
     resp = _to_plain(response)
 
-    success = isinstance(resp, dict) and resp.get("success") is True
-    if not success:
-        raise LiveClobError(f"FOK order not filled: {resp}")
+    if not isinstance(resp, dict):
+        raise LiveClobError(f"{order_type_name} order returned unexpected response: {resp}")
 
-    # Derive actual fill price from taking/making amounts
+    # Derive actual filled stake and fill price from taking/making amounts.
+    # FAK may partially fill, so success=true alone is not enough context.
     fill_price = estimated_price
     making = resp.get("makingAmount")
     taking = resp.get("takingAmount")
-    if making and taking and float(taking) > 0:
-        fill_price = float(making) / float(taking)
+    filled_stake = stake
+    if making is not None and taking is not None:
+        making_float = float(making)
+        taking_float = float(taking)
+        if taking_float > 0:
+            fill_price = making_float / taking_float
+        filled_stake = making_float
+
+    success = resp.get("success") is True and filled_stake > 0
+    if not success:
+        raise LiveClobError(f"{order_type_name} order not filled: {resp}")
 
     return {
         "token_id": token_id,
-        "stake": stake,
+        "stake": round(filled_stake, 2),
+        "requested_stake": stake,
+        "order_type": order_type_name,
         "estimated_price": estimated_price,
         "fill_price": fill_price,
         "order_id": resp.get("orderID"),
@@ -373,7 +389,7 @@ async def test_buy(side: str, amount: float) -> dict:
     tick_size = client.get_tick_size(token_id)
     neg_risk = client.get_neg_risk(token_id)
 
-    order_type_name = os.getenv("LIVE_ORDER_TYPE", "FOK").upper()
+    order_type_name = os.getenv("LIVE_ORDER_TYPE", "FAK").upper()
     if order_type_name not in {"FOK", "FAK"}:
         raise LiveClobError("LIVE_ORDER_TYPE must be FOK or FAK for manual test buys")
     order_type = getattr(sdk["OrderType"], order_type_name)
