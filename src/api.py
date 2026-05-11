@@ -203,13 +203,13 @@ def get_bot_status():
 
 @app.get("/api/bot/trades")
 def get_bot_trades(mode: str = "paper"):
-    """Last 20 completed bot trades. mode=paper|live"""
+    """Last 20 completed bot trades. mode=paper|live|shadow"""
     return bot.get_recent_trades(n=20, mode=mode)
 
 
 @app.get("/api/bot/stats")
 def get_bot_stats(mode: str = "paper"):
-    """Aggregate performance stats. mode=paper|live"""
+    """Aggregate performance stats. mode=paper|live|shadow"""
     conn = db.get_connection()
     try:
         rows = conn.execute(

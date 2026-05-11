@@ -2,8 +2,8 @@
 SIGNAL/ZERO — Timing-based signal bot.
 
 Monitors active BTC 5-minute markets and enters a $500 paper position
-in the last 5-12 seconds before close when momentum, funding rate,
-and market price range all agree on direction.
+in the last 5-12 seconds before close when momentum and market price
+range agree on direction. Meaningful non-neutral funding must agree too.
 
 All paper only — no real money.
 
@@ -47,12 +47,13 @@ POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 20    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 45    # enter when seconds_remaining <= this
 MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
-FUNDING_THRESHOLD    = 0.02  # % — above = bullish, below negative = bearish
+FUNDING_THRESHOLD    = 0.02  # % — outside this band, funding must agree with direction
 PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to enter
 REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is 70%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
+MIN_MARKET_VOLUME    = 5000.0  # USDC — only enforced during the entry window
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
@@ -62,7 +63,8 @@ LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # start
 class PaperBot:
     """
     Enters BTC 5-min markets in the last 5-12 s before close when
-    momentum + funding rate agree and market price is in the 0.40-0.70 range.
+    momentum agrees and market price is in the 0.40-0.70 range.
+    Meaningful non-neutral funding must agree too.
     """
 
     def __init__(self):
@@ -86,6 +88,7 @@ class PaperBot:
         self._session:    Optional[aiohttp.ClientSession] = None
         self._binance_feed = BinancePriceFeed()
         self._entered_slugs: set = set()           # avoid re-entering the same market
+        self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows for one market
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {start_ts: finalPrice} for recent closed markets
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
@@ -128,6 +131,7 @@ class PaperBot:
         loop = asyncio.get_running_loop()
         self._binance_task = loop.create_task(self._binance_feed.connect())
         loop.create_task(self._reconcile_unresolved_trades())
+        loop.create_task(self._reconcile_unresolved_shadow_trades())
         self._task = loop.create_task(self._loop())
         print("[bot] Started — task created")
 
@@ -264,12 +268,6 @@ class PaperBot:
             if start_ts is None or end_ts is None:
                 continue
 
-            # Minimum volume filter — thin markets cause large slippage
-            volume = float(market.get("volume") or 0)
-            if volume < 5000.0:
-                print(f"[bot] SKIP: {slug} volume=${volume:.0f} < $5,000 minimum", flush=True)
-                continue
-
             seconds_remaining = end_ts - now
             print(f"[bot] market {slug} — {seconds_remaining:.1f}s remaining")
 
@@ -289,6 +287,19 @@ class PaperBot:
             # ── chainlink-reversal-guard (last 6-15s of market)
             if (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI
                     and slug not in self._entered_slugs):
+                shadow_already_recorded = slug in self._shadow_entered_slugs or db.shadow_trade_exists(slug)
+                # Minimum volume filter — thin markets cause large slippage.
+                # Only enforce/log this inside the entry window; early-window
+                # volume is often low and can make normal markets look blocked.
+                volume = float(market.get("volume") or 0)
+                if volume < MIN_MARKET_VOLUME:
+                    print(
+                        f"[bot] SKIP: {slug} volume=${volume:.0f} < "
+                        f"${MIN_MARKET_VOLUME:,.0f} minimum  secs={seconds_remaining:.1f}",
+                        flush=True,
+                    )
+                    continue
+
                 if self._evaluating:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
                     continue
@@ -315,6 +326,22 @@ class PaperBot:
                     )
                     db.log_bot_signal(slug, filter_hit="crowd_price", outcome="skipped",
                                       direction=direction, diff=signals.get("diff_initial"))
+                    continue
+
+                if signals.get("shadow_only"):
+                    if shadow_already_recorded:
+                        print(f"[bot] SHADOW: {slug} already recorded — no duplicate", flush=True)
+                    else:
+                        self._record_shadow_entry(
+                            slug=slug,
+                            side=direction,
+                            entry_price=entry_price,
+                            end_ts=end_ts,
+                            price_to_beat=signals.get("price_to_beat") or price_to_beat,
+                            diff_at_entry=signals.get("diff_initial"),
+                            seconds_remaining=seconds_remaining,
+                            hour_et=hour_et,
+                        )
                     continue
 
                 self._market_start_prices.pop(slug, None)
@@ -633,22 +660,23 @@ class PaperBot:
             else:
                 if abs(funding_rate) < FUNDING_THRESHOLD:
                     print(
-                        f"[bot] SKIP (funding): {funding_rate:+.4f}% inside neutral band ±{FUNDING_THRESHOLD:.2f}%",
+                        f"[bot] funding neutral: {funding_rate:+.4f}% inside ±{FUNDING_THRESHOLD:.2f}% — "
+                        "proceeding without funding direction filter",
                         flush=True,
                     )
-                    db.log_bot_signal(slug, filter_hit="funding_neutral", outcome="skipped",
+                    db.log_bot_signal(slug, filter_hit="funding_neutral_ignored", outcome="continued",
                                       direction=direction, diff=diff_initial)
-                    return None, {"source": "none", "momentum": None}
-                funding_direction = "Up" if funding_rate > 0 else "Down"
-                if funding_direction != direction:
-                    print(
-                        f"[bot] SKIP (funding): signal={direction} but funding={funding_rate:+.4f}% ({funding_direction})",
-                        flush=True,
-                    )
-                    db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
-                                      direction=direction, diff=diff_initial)
-                    return None, {"source": "none", "momentum": None}
-                print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
+                else:
+                    funding_direction = "Up" if funding_rate > 0 else "Down"
+                    if funding_direction != direction:
+                        print(
+                            f"[bot] SKIP (funding): signal={direction} but funding={funding_rate:+.4f}% ({funding_direction})",
+                            flush=True,
+                        )
+                        db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
+                                          direction=direction, diff=diff_initial)
+                        return None, {"source": "none", "momentum": None}
+                    print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
 
             # Condition b1: chop filter — 10s price range must show real movement
             price_10s_ago = self._get_price_n_seconds_ago(10)
@@ -757,6 +785,101 @@ class PaperBot:
         return None
 
     # ── Position lifecycle ─────────────────────────────────────────────────────
+
+    def _shadow_stake(self, entry_price: float, hour_et: int = 0) -> tuple[float, float, float]:
+        """Mirror paper sizing without reserving balance or placing orders."""
+        win_prob       = self._get_measured_win_prob()
+        loss_prob      = 1.0 - win_prob
+        b              = (1.0 / entry_price) - 1.0
+        kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
+        multiplier     = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
+        stake          = min(MAX_STAKE * multiplier, self.balance * kelly_fraction * 0.5 * multiplier)
+        return stake, kelly_fraction, multiplier
+
+    def _record_shadow_entry(
+        self,
+        slug: str,
+        side: str,
+        entry_price: float,
+        end_ts: float,
+        price_to_beat: Optional[float] = None,
+        diff_at_entry: Optional[float] = None,
+        seconds_remaining: Optional[float] = None,
+        hour_et: int = 0,
+    ) -> None:
+        """Record a hypothetical trade blocked only by funding neutral."""
+        stake, kelly_fraction, multiplier = self._shadow_stake(entry_price, hour_et)
+        if stake < MIN_STAKE:
+            print(
+                f"[bot] SHADOW SKIP: Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum",
+                flush=True,
+            )
+            db.log_bot_signal(slug, filter_hit="funding_neutral_shadow_size", outcome="skipped",
+                              direction=side, diff=diff_at_entry)
+            return
+
+        inserted = db.log_shadow_trade(
+            {
+                "whale_address": STRATEGY_TAG,
+                "market_slug": slug,
+                "side": side,
+                "size": stake,
+                "entry_price": entry_price,
+                "price_to_beat": price_to_beat,
+                "diff_at_entry": diff_at_entry,
+                "seconds_remaining": seconds_remaining,
+                "strategy": "funding-neutral-shadow",
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        self._shadow_entered_slugs.add(slug)
+        self._market_start_prices.pop(slug, None)
+        self._market_start_sources.pop(slug, None)
+
+        if not inserted:
+            print(f"[bot] SHADOW: {slug} already exists in DB — no duplicate", flush=True)
+            return
+
+        print(
+            f"[bot] SHADOW OPEN {side:>4} ${stake:.2f} "
+            f"(kelly={kelly_fraction:.3f} ×{multiplier}) slug={slug} entry={entry_price:.3f}",
+            flush=True,
+        )
+        asyncio.create_task(self._backfill_shadow_trade(slug, end_ts))
+
+    async def _backfill_shadow_trade(self, slug: str, end_ts: float) -> None:
+        """Background task: resolve a shadow trade without touching accounting."""
+        wait = max(0.0, (end_ts + 900) - time.time())
+        print(f"[bot] shadow backfill: waiting {wait:.0f}s to fetch finalPrice for {slug}", flush=True)
+        await asyncio.sleep(wait)
+
+        for attempt in range(3):
+            try:
+                winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
+                if winner is not None:
+                    settled = db.settle_unresolved_shadow_trade(
+                        slug,
+                        winner,
+                        resolution_price=final_price,
+                        poly_price_to_beat=poly_price_to_beat,
+                    )
+                    if settled:
+                        print(
+                            f"[bot] shadow backfill: {slug} settled → {winner} "
+                            f"pnl=${settled['pnl']:+.2f}",
+                            flush=True,
+                        )
+                    return
+                print(
+                    f"[bot] shadow backfill: attempt {attempt + 1}/3 — "
+                    f"resolution not yet available for {slug}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[bot] shadow backfill error ({slug}) attempt {attempt + 1}/3: {exc}", flush=True)
+            await asyncio.sleep(300)
+
+        print(f"[bot] shadow backfill: gave up on finalPrice for {slug}", flush=True)
 
     async def _open_position(self, slug: str, side: str, entry_price: float, end_ts: float,
                              start_ts: Optional[float] = None,
@@ -967,6 +1090,38 @@ class PaperBot:
                 )
         if settled_count:
             self._reload_accounting_state()
+
+    async def _reconcile_unresolved_shadow_trades(self) -> None:
+        unresolved = db.load_unresolved_shadow_trades()
+        if not unresolved:
+            return
+        print(f"[bot] shadow reconcile: checking {len(unresolved)} unresolved shadow trades", flush=True)
+        settled_count = 0
+        for row in unresolved:
+            slug = row["market_slug"]
+            self._shadow_entered_slugs.add(slug)
+            start_ts = _extract_start_ts(slug)
+            if start_ts is None:
+                continue
+            end_ts = start_ts + 300.0
+            winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
+            if winner is None:
+                continue
+            settled = db.settle_unresolved_shadow_trade(
+                slug,
+                winner,
+                resolution_price=final_price,
+                poly_price_to_beat=poly_price_to_beat,
+            )
+            if settled:
+                settled_count += 1
+                print(
+                    f"[bot] shadow reconcile: {slug} settled → {winner} "
+                    f"pnl=${settled['pnl']:+.2f}",
+                    flush=True,
+                )
+        if settled_count:
+            print(f"[bot] shadow reconcile: settled {settled_count} trades", flush=True)
 
     async def _try_resolve(self, pos: dict):
         slug   = pos["market_slug"]

@@ -702,6 +702,7 @@ def load_unresolved_bot_trades(limit: int = 200) -> list:
         """SELECT market_slug, side, size, entry_price, opened_at
              FROM bot_trades
             WHERE outcome = 'unresolved'
+              AND COALESCE(mode, 'paper') IN ('paper', 'live')
             ORDER BY opened_at DESC
             LIMIT %s""",
         (limit,),
@@ -723,6 +724,7 @@ def settle_unresolved_bot_trade(
              FROM bot_trades
             WHERE market_slug = %s
               AND outcome = 'unresolved'
+              AND COALESCE(mode, 'paper') IN ('paper', 'live')
             ORDER BY opened_at DESC
             LIMIT 1""",
         (market_slug,),
@@ -744,13 +746,128 @@ def settle_unresolved_bot_trade(
                   resolution_price = COALESCE(%s, resolution_price),
                   poly_price_to_beat = COALESCE(%s, poly_price_to_beat)
             WHERE market_slug = %s
-              AND outcome = 'unresolved'""",
+              AND outcome = 'unresolved'
+              AND COALESCE(mode, 'paper') IN ('paper', 'live')""",
         (
             winner,
             round(pnl, 2),
             round(resolution_price, 2) if resolution_price is not None else None,
             round(poly_price_to_beat, 2) if poly_price_to_beat is not None else None,
             market_slug,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"won": won, "pnl": round(pnl, 2)}
+
+
+def shadow_trade_exists(market_slug: str, strategy: str = "funding-neutral-shadow") -> bool:
+    """Return True if a shadow entry was already recorded for this slug."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT 1
+             FROM bot_trades
+            WHERE market_slug = %s
+              AND mode = 'shadow'
+              AND strategy = %s
+            LIMIT 1""",
+        (market_slug, strategy),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def log_shadow_trade(trade: dict) -> bool:
+    """Insert a hypothetical trade that never affects paper/live balance."""
+    strategy = trade.get("strategy", "funding-neutral-shadow")
+    if shadow_trade_exists(trade["market_slug"], strategy):
+        return False
+
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO bot_trades
+              (whale_address, market_slug, side, size, entry_price,
+               price_to_beat, outcome, pnl, balance_after, diff_at_entry,
+               seconds_remaining, strategy, opened_at, closed_at, mode)
+           VALUES (%s, %s, %s, %s, %s, %s, 'unresolved', NULL, NULL, %s, %s, %s, %s, NULL, 'shadow')""",
+        (
+            trade.get("whale_address", "SHADOW_STRATEGY"),
+            trade["market_slug"],
+            trade["side"],
+            round(float(trade.get("size") or 0.0), 4),
+            round(float(trade.get("entry_price") or 0.5), 4),
+            round(float(trade["price_to_beat"]), 2) if trade.get("price_to_beat") is not None else None,
+            round(float(trade["diff_at_entry"]), 2) if trade.get("diff_at_entry") is not None else None,
+            round(float(trade["seconds_remaining"]), 1) if trade.get("seconds_remaining") is not None else None,
+            strategy,
+            trade.get("opened_at") or datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def load_unresolved_shadow_trades(limit: int = 200) -> list:
+    """Return unresolved shadow trades only."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT market_slug, side, size, entry_price, opened_at
+             FROM bot_trades
+            WHERE outcome = 'unresolved'
+              AND mode = 'shadow'
+            ORDER BY opened_at DESC
+            LIMIT %s""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def settle_unresolved_shadow_trade(
+    market_slug: str,
+    winner: str,
+    resolution_price: Optional[float] = None,
+    poly_price_to_beat: Optional[float] = None,
+) -> Optional[dict]:
+    """Settle one unresolved shadow row without touching paper/live accounting."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT id, side, size, entry_price
+             FROM bot_trades
+            WHERE market_slug = %s
+              AND outcome = 'unresolved'
+              AND mode = 'shadow'
+            ORDER BY opened_at DESC
+            LIMIT 1""",
+        (market_slug,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    side = row["side"]
+    size = float(row["size"] or 0.0)
+    entry_price = float(row["entry_price"] or 0.5)
+    won = side == winner
+    pnl = size * (1.0 / entry_price - 1.0) if won else -size
+
+    conn.execute(
+        """UPDATE bot_trades
+              SET outcome = %s,
+                  pnl = %s,
+                  resolution_price = COALESCE(%s, resolution_price),
+                  poly_price_to_beat = COALESCE(%s, poly_price_to_beat),
+                  closed_at = %s
+            WHERE id = %s
+              AND mode = 'shadow'""",
+        (
+            winner,
+            round(pnl, 2),
+            round(resolution_price, 2) if resolution_price is not None else None,
+            round(poly_price_to_beat, 2) if poly_price_to_beat is not None else None,
+            datetime.utcnow().isoformat(),
+            row["id"],
         ),
     )
     conn.commit()
