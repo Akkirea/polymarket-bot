@@ -15,6 +15,7 @@ Usage (started automatically by api.py endpoints):
 
 import asyncio
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ INITIAL_WALLET_SIZE  = 97.0
 MAX_STAKE_PCT        = 0.02   # half-Kelly at 52% win prob and 0.50 entry
 MIN_STAKE_PCT        = 0.01   # skip smaller signals instead of forcing oversize bets
 LIVE_MIN_ORDER_SIZE  = 1.00   # Polymarket marketable BUY minimum
+ORDER_SIZE_INCREMENT = 1.00   # Send whole-dollar USDC order sizes only
 MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT
 MIN_STAKE            = max(LIVE_MIN_ORDER_SIZE, INITIAL_WALLET_SIZE * MIN_STAKE_PCT)
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
@@ -58,6 +60,12 @@ MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
+
+
+def _round_order_size(amount: float) -> float:
+    """Round up to the next whole-dollar order size."""
+    increment = max(0.01, ORDER_SIZE_INCREMENT)
+    return round(math.ceil(amount / increment) * increment, 2)
 
 MARKET_FAMILIES = [
     {
@@ -1002,7 +1010,7 @@ class PaperBot:
         max_stake      = MAX_STAKE * multiplier
         raw_stake      = self.balance * kelly_fraction * 0.5 * multiplier
         kelly_stake    = min(max_stake, raw_stake)
-        stake          = max(MIN_STAKE, kelly_stake)
+        stake          = _round_order_size(max(MIN_STAKE, kelly_stake))
 
         if max_stake < MIN_STAKE:
             print(
