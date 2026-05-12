@@ -1000,16 +1000,23 @@ class PaperBot:
         multiplier     = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
         max_stake      = MAX_STAKE * multiplier
         raw_stake      = self.balance * kelly_fraction * 0.5 * multiplier
-        stake          = min(max_stake, raw_stake)
+        kelly_stake    = min(max_stake, raw_stake)
+        stake          = max(MIN_STAKE, kelly_stake)
 
-        if stake < MIN_STAKE:
+        if max_stake < MIN_STAKE:
             print(
                 f"[bot] OPEN SKIP: {slug} {side} entry={entry_price:.3f} "
-                f"Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum "
+                f"max stake ${max_stake:.2f} below ${MIN_STAKE:.2f} minimum "
                 f"({MIN_STAKE_PCT:.0%} of ${INITIAL_WALLET_SIZE:.0f})",
                 flush=True,
             )
             return
+        if kelly_stake < MIN_STAKE:
+            print(
+                f"[bot] OPEN: {slug} {side} entry={entry_price:.3f} "
+                f"using minimum stake ${stake:.2f}; Kelly suggested ${kelly_stake:.2f}",
+                flush=True,
+            )
 
         if self.balance < stake:
             print(f"[bot] OPEN SKIP: {slug} insufficient balance (${self.balance:.2f})", flush=True)
