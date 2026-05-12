@@ -1,6 +1,8 @@
-"""Market catalog helpers for short-horizon Polymarket dashboards."""
+"""Market catalog helpers for Polymarket dashboards."""
 
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 
 FIVE_MINUTE_MARKETS = [
@@ -47,6 +49,19 @@ FIFTEEN_MINUTE_MARKETS = [
         "timeframe": "15m",
         "trade_enabled": False,
         "status": "paper-shadow",
+    },
+]
+
+DAILY_MARKETS = [
+    {
+        "symbol": "BTCD",
+        "pair": "BTC/USD",
+        "slug_prefix": "bitcoin-up-or-down-on-",
+        "binance_symbol": "BTCUSDT",
+        "category": "crypto",
+        "timeframe": "daily",
+        "trade_enabled": False,
+        "status": "shadow-watch",
     },
 ]
 
@@ -98,5 +113,16 @@ def current_interval_slugs(market: dict) -> list[str]:
     ]
 
 
+def current_daily_slugs(market: dict) -> list[str]:
+    """Return likely current/next daily Polymarket slugs for date-named markets."""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    slugs = []
+    for offset in (0, 1):
+        market_date = now_et + timedelta(days=offset)
+        month = market_date.strftime("%B").lower()
+        slugs.append(f"{market['slug_prefix']}{month}-{market_date.day}")
+    return slugs
+
+
 def catalog() -> list[dict]:
-    return FIVE_MINUTE_MARKETS + FIFTEEN_MINUTE_MARKETS + PLANNED_MARKETS
+    return FIVE_MINUTE_MARKETS + FIFTEEN_MINUTE_MARKETS + DAILY_MARKETS + PLANNED_MARKETS

@@ -20,7 +20,47 @@ from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
 from . import live_clob
-from .markets import FIVE_MINUTE_MARKETS, FIFTEEN_MINUTE_MARKETS, catalog, current_interval_slugs
+from .markets import (
+    DAILY_MARKETS,
+    FIVE_MINUTE_MARKETS,
+    FIFTEEN_MINUTE_MARKETS,
+    catalog,
+    current_daily_slugs,
+    current_interval_slugs,
+)
+
+
+SHADOW_FAMILIES = {
+    "btc5": {
+        "label": "BTC 5m Shadow",
+        "slug_like": "btc-updown-5m-%",
+        "strategy": None,
+    },
+    "btc15": {
+        "label": "BTC 15m Shadow",
+        "slug_like": "btc-updown-15m-%",
+        "strategy": "btc-15m-paper-shadow",
+    },
+    "btcdaily": {
+        "label": "BTC Daily Shadow",
+        "slug_like": "bitcoin-up-or-down-on-%",
+        "strategy": "btc-daily-shadow",
+    },
+}
+
+
+def _family_filter_sql(family: str | None) -> tuple[str, tuple]:
+    if not family:
+        return "", ()
+    spec = SHADOW_FAMILIES.get(family)
+    if not spec:
+        raise HTTPException(status_code=400, detail=f"Unknown family: {family}")
+    clauses = ["market_slug LIKE %s"]
+    params: list = [spec["slug_like"]]
+    if spec.get("strategy"):
+        clauses.append("strategy = %s")
+        params.append(spec["strategy"])
+    return " AND " + " AND ".join(clauses), tuple(params)
 
 
 async def _backfill_resolution_prices():
@@ -218,22 +258,42 @@ def get_bot_status():
 
 
 @app.get("/api/bot/trades")
-def get_bot_trades(mode: str = "paper"):
-    """Last 20 completed bot trades. mode=paper|live|shadow"""
-    return bot.get_recent_trades(n=20, mode=mode)
+def get_bot_trades(mode: str = "paper", family: str | None = None, strategy: str | None = None):
+    """Last 20 bot trades. mode=paper|live|shadow; family can split shadow buckets."""
+    if not family and not strategy:
+        return bot.get_recent_trades(n=20, mode=mode)
+
+    family_sql, family_params = _family_filter_sql(family)
+    strategy_sql = " AND strategy = %s" if strategy else ""
+    params = (mode,) + family_params + ((strategy,) if strategy else ()) + (20,)
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM bot_trades "
+            "WHERE COALESCE(mode,'paper')=%s "
+            f"{family_sql}{strategy_sql} "
+            "ORDER BY opened_at DESC LIMIT %s",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/bot/stats")
-def get_bot_stats(mode: str = "paper"):
-    """Aggregate performance stats. mode=paper|live|shadow"""
+def get_bot_stats(mode: str = "paper", family: str | None = None, strategy: str | None = None):
+    """Aggregate performance stats. mode=paper|live|shadow; family can split shadow buckets."""
+    family_sql, family_params = _family_filter_sql(family)
+    strategy_sql = "AND strategy = %s " if strategy else ""
     conn = db.get_connection()
     try:
         rows = conn.execute(
             "SELECT pnl, outcome, side, opened_at FROM bot_trades "
             "WHERE pnl IS NOT NULL AND COALESCE(outcome, '') != 'unresolved' "
             "AND COALESCE(mode,'paper')=%s "
+            f"{family_sql} {strategy_sql}"
             "ORDER BY opened_at",
-            (mode,),
+            (mode,) + family_params + ((strategy,) if strategy else ()),
         ).fetchall()
     finally:
         conn.close()
@@ -274,6 +334,55 @@ def get_bot_stats(mode: str = "paper"):
     }
 
 
+@app.get("/api/bot/shadow/summary")
+def get_shadow_summary():
+    """Dashboard-ready shadow stats split by BTC market family."""
+    conn = db.get_connection()
+    try:
+        summaries = []
+        for key, spec in SHADOW_FAMILIES.items():
+            strategy_clause = "AND strategy = %s" if spec.get("strategy") else ""
+            params = ("shadow", spec["slug_like"]) + ((spec["strategy"],) if spec.get("strategy") else ())
+            row = conn.execute(
+                """SELECT
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN outcome = 'unresolved' THEN 1 ELSE 0 END) AS unresolved,
+                       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses,
+                       COALESCE(SUM(pnl), 0) AS pnl
+                     FROM bot_trades
+                    WHERE mode = %s
+                      AND market_slug LIKE %s """
+                + strategy_clause,
+                params,
+            ).fetchone()
+            recent = conn.execute(
+                """SELECT *
+                     FROM bot_trades
+                    WHERE mode = %s
+                      AND market_slug LIKE %s """
+                + strategy_clause
+                + " ORDER BY opened_at DESC LIMIT 10",
+                params,
+            ).fetchall()
+            resolved = int(row["wins"] or 0) + int(row["losses"] or 0)
+            summaries.append({
+                "family": key,
+                "label": spec["label"],
+                "strategy": spec.get("strategy"),
+                "total_trades": int(row["total"] or 0),
+                "unresolved": int(row["unresolved"] or 0),
+                "wins": int(row["wins"] or 0),
+                "losses": int(row["losses"] or 0),
+                "win_rate": round((int(row["wins"] or 0) / resolved), 4) if resolved else 0.0,
+                "total_pnl": round(float(row["pnl"] or 0.0), 2),
+                "recent_trades": [dict(r) for r in recent],
+            })
+    finally:
+        conn.close()
+    return {"ok": True, "families": summaries}
+
+
 @app.get("/api/markets")
 async def get_markets():
     """Configured markets plus current/next short-horizon Polymarket windows when available."""
@@ -282,8 +391,13 @@ async def get_markets():
         for item in catalog():
             row = dict(item)
             row["markets"] = []
-            if item in FIVE_MINUTE_MARKETS or item in FIFTEEN_MINUTE_MARKETS:
-                for slug in current_interval_slugs(item):
+            if item in FIVE_MINUTE_MARKETS or item in FIFTEEN_MINUTE_MARKETS or item in DAILY_MARKETS:
+                slug_candidates = (
+                    current_daily_slugs(item)
+                    if item in DAILY_MARKETS
+                    else current_interval_slugs(item)
+                )
+                for slug in slug_candidates:
                     try:
                         async with session.get(
                             "https://gamma-api.polymarket.com/markets",
