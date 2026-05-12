@@ -44,8 +44,8 @@ ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
 # Hour 19: 2x (70.6% WR, n=17, p<0.01). Hour 18: 1x until n≥20 (77.8% WR but n=9).
 HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
-ENTRY_WINDOW_LO      = 20    # enter when seconds_remaining >= this
-ENTRY_WINDOW_HI      = 45    # enter when seconds_remaining <= this
+ENTRY_WINDOW_LO      = 75    # enter when seconds_remaining >= this
+ENTRY_WINDOW_HI      = 150   # enter when seconds_remaining <= this
 MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — outside this band, funding must agree with direction
 PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to enter
