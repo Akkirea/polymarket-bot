@@ -58,6 +58,23 @@ MIN_MARKET_VOLUME    = 5000.0  # USDC — only enforced during the entry window
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
 
+MARKET_FAMILIES = [
+    {
+        "label": "BTC 5m",
+        "slug_prefix": "btc-updown-5m",
+        "interval": 300,
+        "strategy": "chainlink-reversal-guard",
+        "live_enabled": True,
+    },
+    {
+        "label": "BTC 15m",
+        "slug_prefix": "btc-updown-15m",
+        "interval": 900,
+        "strategy": "btc-15m-paper-shadow",
+        "live_enabled": False,
+    },
+]
+
 
 # ── PaperBot ───────────────────────────────────────────────────────────────────
 class PaperBot:
@@ -90,7 +107,7 @@ class PaperBot:
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows for one market
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
-        self._final_price_cache:    dict = {}      # {start_ts: finalPrice} for recent closed markets
+        self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._market_start_sources: dict = {}     # slug → source name for cached first-sight price
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
@@ -252,7 +269,7 @@ class PaperBot:
         #     print(f"[bot] entry blocked: ET hour={hour_et} not in ALLOWED_HOURS")
         #     return
 
-        # Scan active BTC 5m markets
+        # Scan active BTC short-horizon markets.
         markets = await self._fetch_active_markets()
         now = time.time()
         slugs = [m.get("slug", "?") for m in markets]
@@ -359,9 +376,10 @@ class PaperBot:
                     price_to_beat=price_to_beat,
                     diff_at_entry=diff_at_entry,
                     seconds_remaining=seconds_remaining,
-                    strategy="chainlink-reversal-guard",
+                    strategy=market.get("_sz_strategy", "chainlink-reversal-guard"),
                     hour_et=hour_et,
                     market=market,
+                    live_enabled=bool(market.get("_sz_live_enabled", True)),
                 )
                 break
 
@@ -399,22 +417,24 @@ class PaperBot:
     async def _fetch_active_markets(self) -> list:
         """
         Gamma API only supports exact slug lookups — a prefix query returns nothing.
-        BTC 5m market slugs are 'btc-updown-5m-{ts}' where ts is the market
-        start timestamp, always a multiple of 300. We compute the current and
-        next window starts and fetch each by exact slug.
+        Short-horizon BTC market slugs are '{prefix}-{ts}' where ts is the
+        market start timestamp. We compute the current and next window starts
+        for each configured interval and fetch each by exact slug.
         """
         now = int(time.time())
-        # Fetch the current window start plus the next window start as fallback.
-        candidates = [
-            (now // 300) * 300,
-            (now // 300 + 1) * 300,
-        ]
-        slugs = [f"btc-updown-5m-{ts}" for ts in candidates]
-        print(f"[bot] fetching slugs: {slugs}")
+        slugs: list[tuple[str, dict]] = []
+        for spec in MARKET_FAMILIES:
+            interval = spec["interval"]
+            start = (now // interval) * interval
+            slugs.extend([
+                (f"{spec['slug_prefix']}-{start}", spec),
+                (f"{spec['slug_prefix']}-{start + interval}", spec),
+            ])
+        print(f"[bot] fetching slugs: {[slug for slug, _ in slugs]}")
 
         session = await self._get_session()
         markets = []
-        for slug in slugs:
+        for slug, spec in slugs:
             try:
                 async with session.get(
                     f"{GAMMA_API}/markets", params={"slug": slug}
@@ -424,7 +444,12 @@ class PaperBot:
                         continue
                     data = await resp.json()
                     if data and not data[0].get("closed", True):
-                        markets.append(data[0])
+                        market = data[0]
+                        market["_sz_interval"] = spec["interval"]
+                        market["_sz_strategy"] = spec["strategy"]
+                        market["_sz_live_enabled"] = spec["live_enabled"]
+                        market["_sz_label"] = spec["label"]
+                        markets.append(market)
                         print(f"[bot] found open market: {slug}  closed={data[0].get('closed')}")
                     elif data:
                         print(f"[bot] market {slug} is closed — skipping")
@@ -438,41 +463,44 @@ class PaperBot:
     # ── Signals ────────────────────────────────────────────────────────────────
 
     async def _collect_final_prices(self) -> None:
-        """Each tick: fetch finalPrice for the last 6 closed BTC 5m markets.
-        Cache is keyed by market start_ts."""
+        """Each tick: fetch finalPrice for recent closed BTC short-horizon markets.
+        Cache is keyed by market slug because 5m and 15m markets can share a
+        start timestamp but settle at different times."""
         now_ts   = int(time.time())
-        boundary = (now_ts // 300) * 300  # start_ts of the current market
         print(f"[bot] finalPrice cache size={len(self._final_price_cache)}  keys={sorted(self._final_price_cache)}", flush=True)
         session  = await self._get_session()
-        for i in range(1, 7):
-            start_ts = boundary - i * 300
-            if start_ts in self._final_price_cache:
-                continue
-            slug = f"btc-updown-5m-{start_ts}"
-            try:
-                async with session.get(
-                    f"{GAMMA_API}/markets", params={"slug": slug, "closed": "true"}
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    markets = await resp.json()
-                if not markets:
+        for spec in MARKET_FAMILIES:
+            interval = spec["interval"]
+            boundary = (now_ts // interval) * interval
+            for i in range(1, 7):
+                start_ts = boundary - i * interval
+                slug = f"{spec['slug_prefix']}-{start_ts}"
+                if slug in self._final_price_cache:
                     continue
-                m      = markets[0]
-                events = m.get("events", [])
-                meta   = (events[0].get("eventMetadata") or {}) if events else {}
-                print(
-                    f"[bot] cache probe {slug}: meta_keys={list(meta.keys())}  "
-                    f"market_keys_sample={[k for k in m.keys() if 'price' in k.lower() or 'beat' in k.lower()]}",
-                    flush=True,
-                )
-                if meta.get("finalPrice") is not None and start_ts not in self._final_price_cache:
-                    fp = float(meta["finalPrice"])
-                    self._final_price_cache[start_ts] = fp
-                    print(f"[bot] finalPrice cache: {slug} start_ts={start_ts} → ${fp:,.2f}", flush=True)
+                try:
+                    async with session.get(
+                        f"{GAMMA_API}/markets", params={"slug": slug, "closed": "true"}
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        markets = await resp.json()
+                    if not markets:
+                        continue
+                    m      = markets[0]
+                    events = m.get("events", [])
+                    meta   = (events[0].get("eventMetadata") or {}) if events else {}
+                    print(
+                        f"[bot] cache probe {slug}: meta_keys={list(meta.keys())}  "
+                        f"market_keys_sample={[k for k in m.keys() if 'price' in k.lower() or 'beat' in k.lower()]}",
+                        flush=True,
+                    )
+                    if meta.get("finalPrice") is not None and slug not in self._final_price_cache:
+                        fp = float(meta["finalPrice"])
+                        self._final_price_cache[slug] = fp
+                        print(f"[bot] finalPrice cache: {slug} start_ts={start_ts} → ${fp:,.2f}", flush=True)
 
-            except Exception as exc:
-                print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
+                except Exception as exc:
+                    print(f"[bot] _collect_final_prices error for {slug}: {exc}", flush=True)
 
     async def _get_btc_price(self) -> Optional[float]:
         """Fetch live BTC/USD from Chainlink on Polygon and append to both history stores."""
@@ -599,17 +627,20 @@ class PaperBot:
         2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD
         Reference price is previous window's finalPrice if cached, else Chainlink first-sight.
         """
-        # Use previous market's finalPrice as reference if cached, else fall back to
-        # first-sight price. The slug number is the market start_ts.
-        start_ts = _extract_start_ts(market["slug"])
+        # Use previous same-interval market's finalPrice as reference if cached,
+        # else fall back to first-sight price. The slug number is the market start_ts.
+        slug = market["slug"]
+        start_ts = _extract_start_ts(slug)
         if start_ts is None:
             db.log_bot_signal(slug, filter_hit="bad_slug_ts", outcome="skipped")
             return None, {"source": "none", "momentum": None}
-        prev_final  = self._final_price_cache.get(start_ts - 300)
+        spec = _market_spec_for_slug(slug)
+        interval = spec["interval"] if spec else int(market.get("_sz_interval") or 300)
+        prefix = spec["slug_prefix"] if spec else slug.rsplit("-", 1)[0]
+        prev_slug = f"{prefix}-{int(start_ts - interval)}"
+        prev_final  = self._final_price_cache.get(prev_slug)
         reference_price = prev_final if prev_final is not None else price_to_beat
         ref_source  = "prev-finalPrice" if prev_final is not None else f"{price_source or 'unknown'}-first-sight"
-
-        slug = market["slug"]
 
         if reference_price is None:
             print("[bot] SKIP: no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
@@ -618,7 +649,8 @@ class PaperBot:
 
         # Condition 0: minimum prev-window move — only enter if the reference window had momentum
         if prev_final is not None:
-            prev_prev_final = self._final_price_cache.get(start_ts - 600)
+            prev_prev_slug = f"{prefix}-{int(start_ts - interval * 2)}"
+            prev_prev_final = self._final_price_cache.get(prev_prev_slug)
             if prev_prev_final is not None:
                 prev_move = abs(reference_price - prev_prev_final)
                 if prev_move < MIN_PREV_MOVE:
@@ -888,7 +920,8 @@ class PaperBot:
                              seconds_remaining: Optional[float] = None,
                              strategy: Optional[str] = None,
                              hour_et: int = 0,
-                             market: Optional[dict] = None):
+                             market: Optional[dict] = None,
+                             live_enabled: bool = True):
         # Half-Kelly sizing with data-driven hour multiplier.
         # WIN_PROB is derived from measured trade history (or conservative
         # default of 0.52 when sample size is too small).
@@ -915,7 +948,7 @@ class PaperBot:
 
         # ── Live order (best-effort alongside paper) ───────────────────────────
         live_order = None
-        if os.getenv("POLYMARKET_LIVE", "false").lower() == "true":
+        if os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and live_enabled:
             if market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
             else:
@@ -931,6 +964,8 @@ class PaperBot:
                     )
                 except Exception as exc:
                     print(f"[bot] LIVE: order failed for {slug} ({exc}) — paper only", flush=True)
+        elif os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and not live_enabled:
+            print(f"[bot] LIVE: disabled for {slug} strategy={strategy} — paper/shadow only", flush=True)
 
         self.balance -= stake
         pos = {
@@ -1072,7 +1107,7 @@ class PaperBot:
             start_ts = _extract_start_ts(slug)
             if start_ts is None:
                 continue
-            end_ts = start_ts + 300.0
+            end_ts = start_ts + float(_market_interval(slug))
             winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
             if winner is None:
                 continue
@@ -1103,7 +1138,7 @@ class PaperBot:
             start_ts = _extract_start_ts(slug)
             if start_ts is None:
                 continue
-            end_ts = start_ts + 300.0
+            end_ts = start_ts + float(_market_interval(slug))
             winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
             if winner is None:
                 continue
@@ -1224,16 +1259,14 @@ class PaperBot:
             # outcomePrices gives us the winner but not the actual settlement BTC price.
             # Pull it from _final_price_cache if _collect_final_prices() already fetched it.
             if final_price is None:
-                start_ts_for_cache = _extract_start_ts(slug)
-                if start_ts_for_cache is not None:
-                    cached_fp = self._final_price_cache.get(start_ts_for_cache)
-                    if cached_fp is not None:
-                        final_price = cached_fp
-                        print(
-                            f"[bot] resolve: pulled finalPrice=${final_price:,.2f} "
-                            f"from _final_price_cache for {slug}",
-                            flush=True,
-                        )
+                cached_fp = self._final_price_cache.get(slug)
+                if cached_fp is not None:
+                    final_price = cached_fp
+                    print(
+                        f"[bot] resolve: pulled finalPrice=${final_price:,.2f} "
+                        f"from _final_price_cache for {slug}",
+                        flush=True,
+                    )
 
         return winner, final_price, price_to_beat
 
@@ -1337,8 +1370,20 @@ def _extract_start_ts(slug: str) -> Optional[float]:
         return None
 
 
+def _market_spec_for_slug(slug: str) -> Optional[dict]:
+    for spec in MARKET_FAMILIES:
+        if slug.startswith(f"{spec['slug_prefix']}-"):
+            return spec
+    return None
+
+
+def _market_interval(slug: str) -> int:
+    spec = _market_spec_for_slug(slug)
+    return int(spec["interval"]) if spec else 300
+
+
 def _market_end_ts(market: dict) -> Optional[float]:
-    """Return market close timestamp from API payload, falling back to start+300."""
+    """Return market close timestamp from API payload, falling back to start+interval."""
     end_date = market.get("endDate")
     if isinstance(end_date, str) and end_date:
         try:
@@ -1346,7 +1391,8 @@ def _market_end_ts(market: dict) -> Optional[float]:
         except ValueError:
             pass
     start_ts = _extract_start_ts(market.get("slug", ""))
-    return (start_ts + 300.0) if start_ts is not None else None
+    interval = int(market.get("_sz_interval") or _market_interval(market.get("slug", "")))
+    return (start_ts + float(interval)) if start_ts is not None else None
 
 
 def _side_price(market: dict, side: str) -> float:

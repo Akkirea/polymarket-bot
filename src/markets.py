@@ -37,6 +37,20 @@ FIVE_MINUTE_MARKETS = [
 ]
 
 
+FIFTEEN_MINUTE_MARKETS = [
+    {
+        "symbol": "BTC15",
+        "pair": "BTC/USD",
+        "slug_prefix": "btc-updown-15m",
+        "binance_symbol": "BTCUSDT",
+        "category": "crypto",
+        "timeframe": "15m",
+        "trade_enabled": False,
+        "status": "paper-shadow",
+    },
+]
+
+
 PLANNED_MARKETS = [
     {
         "symbol": "SOL",
@@ -74,5 +88,15 @@ def current_five_minute_slugs(market: dict) -> list[str]:
     ]
 
 
+def current_interval_slugs(market: dict) -> list[str]:
+    interval = 900 if market.get("timeframe") == "15m" else 300
+    now = int(time.time())
+    start = (now // interval) * interval
+    return [
+        f"{market['slug_prefix']}-{start}",
+        f"{market['slug_prefix']}-{start + interval}",
+    ]
+
+
 def catalog() -> list[dict]:
-    return FIVE_MINUTE_MARKETS + PLANNED_MARKETS
+    return FIVE_MINUTE_MARKETS + FIFTEEN_MINUTE_MARKETS + PLANNED_MARKETS

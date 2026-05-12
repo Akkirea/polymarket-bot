@@ -20,7 +20,7 @@ from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
 from . import live_clob
-from .markets import FIVE_MINUTE_MARKETS, catalog, current_five_minute_slugs
+from .markets import FIVE_MINUTE_MARKETS, FIFTEEN_MINUTE_MARKETS, catalog, current_interval_slugs
 
 
 async def _backfill_resolution_prices():
@@ -276,14 +276,14 @@ def get_bot_stats(mode: str = "paper"):
 
 @app.get("/api/markets")
 async def get_markets():
-    """Configured markets plus current/next 5m Polymarket windows when available."""
+    """Configured markets plus current/next short-horizon Polymarket windows when available."""
     results = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         for item in catalog():
             row = dict(item)
             row["markets"] = []
-            if item in FIVE_MINUTE_MARKETS:
-                for slug in current_five_minute_slugs(item):
+            if item in FIVE_MINUTE_MARKETS or item in FIFTEEN_MINUTE_MARKETS:
+                for slug in current_interval_slugs(item):
                     try:
                         async with session.get(
                             "https://gamma-api.polymarket.com/markets",
