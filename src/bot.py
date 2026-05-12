@@ -384,7 +384,7 @@ class PaperBot:
                 direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
 
                 if direction is None:
-                    print(f"[bot] SKIP: no clear signal — {signals}", flush=True)
+                    print(f"[bot] SKIP: {slug} no clear signal — {signals}", flush=True)
                     continue
 
                 entry_price = _side_price(market, direction)
@@ -704,7 +704,7 @@ class PaperBot:
         ref_source  = "prev-finalPrice" if prev_final is not None else f"{price_source or 'unknown'}-first-sight"
 
         if reference_price is None:
-            print("[bot] SKIP: no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
+            print(f"[bot] SKIP: {slug} no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
             db.log_bot_signal(slug, filter_hit="no_reference", outcome="skipped")
             return None, {"source": "none", "momentum": None}
 
@@ -716,7 +716,8 @@ class PaperBot:
                 prev_move = abs(reference_price - prev_prev_final)
                 if prev_move < MIN_PREV_MOVE:
                     print(
-                        f"[bot] SKIP: prev_move ${prev_move:.2f} < MIN_PREV_MOVE ${MIN_PREV_MOVE:.0f} (flat reference window)",
+                        f"[bot] SKIP: {slug} prev_move ${prev_move:.2f} < "
+                        f"MIN_PREV_MOVE ${MIN_PREV_MOVE:.0f} (flat reference window)",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="prev_move", outcome="skipped")
@@ -726,7 +727,7 @@ class PaperBot:
         try:
             live_price, live_source = await self._get_signal_price()
             if live_price is None:
-                print("[bot] BTC: unavailable — skipping, no trade", flush=True)
+                print(f"[bot] BTC: unavailable for {slug} — skipping, no trade", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_btc_price", outcome="skipped")
                 return None, {"source": "none", "momentum": None}
 
@@ -740,7 +741,8 @@ class PaperBot:
             direction = "Up" if diff_initial > 0 else "Down"
             if abs(diff_initial) < diff_threshold:
                 print(
-                    f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${diff_threshold:.0f}",
+                    f"[bot] SKIP: {slug} {direction} diff ${abs(diff_initial):.2f} "
+                    f"< threshold ${diff_threshold:.0f}",
                     flush=True,
                 )
                 db.log_bot_signal(slug, filter_hit="diff_threshold", outcome="skipped",
@@ -749,11 +751,11 @@ class PaperBot:
 
             funding_rate = await self._get_btc_funding_rate()
             if funding_rate is None:
-                print("[bot] funding unavailable — proceeding without funding filter", flush=True)
+                print(f"[bot] funding unavailable for {slug} — proceeding without funding filter", flush=True)
             else:
                 if abs(funding_rate) < FUNDING_THRESHOLD:
                     print(
-                        f"[bot] funding neutral: {funding_rate:+.4f}% inside ±{FUNDING_THRESHOLD:.2f}% — "
+                        f"[bot] funding neutral: {slug} {funding_rate:+.4f}% inside ±{FUNDING_THRESHOLD:.2f}% — "
                         "proceeding without funding direction filter",
                         flush=True,
                     )
@@ -763,13 +765,14 @@ class PaperBot:
                     funding_direction = "Up" if funding_rate > 0 else "Down"
                     if funding_direction != direction:
                         print(
-                            f"[bot] SKIP (funding): signal={direction} but funding={funding_rate:+.4f}% ({funding_direction})",
+                            f"[bot] SKIP (funding): {slug} signal={direction} "
+                            f"but funding={funding_rate:+.4f}% ({funding_direction})",
                             flush=True,
                         )
                         db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
                                           direction=direction, diff=diff_initial)
                         return None, {"source": "none", "momentum": None}
-                    print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
+                    print(f"[bot] funding OK: {slug} {funding_rate:+.4f}%  direction={direction}", flush=True)
 
             # Condition b1: chop filter — configured price range must show real movement
             price_chop_window_ago = self._get_price_n_seconds_ago(chop_window)
@@ -777,7 +780,7 @@ class PaperBot:
             if price_chop_window_ago is not None:
                 if chop_range < chop_min_move:
                     print(
-                        f"[bot] SKIP (chop): {chop_window:.0f}s range=${chop_range:.2f} < ${chop_min_move:.0f}  "
+                        f"[bot] SKIP (chop): {slug} {chop_window:.0f}s range=${chop_range:.2f} < ${chop_min_move:.0f}  "
                         f"now=${live_price:,.2f}  {chop_window:.0f}s_ago=${price_chop_window_ago:,.2f}",
                         flush=True,
                     )
@@ -785,7 +788,7 @@ class PaperBot:
                                       direction=direction, diff=diff_initial, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
             else:
-                print(f"[bot] SKIP (chop): no {chop_window:.0f}s reading", flush=True)
+                print(f"[bot] SKIP (chop): {slug} no {chop_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_chop_history", outcome="skipped",
                                   direction=direction, diff=diff_initial)
                 return None, {"source": "none", "momentum": None}
@@ -796,7 +799,8 @@ class PaperBot:
             if price_momentum_window_ago is not None:
                 if direction == "Up" and momentum < 0:
                     print(
-                        f"[bot] SKIP (momentum): signal=Up but {momentum_window:.0f}s momentum=${momentum:+.2f} (falling)",
+                        f"[bot] SKIP (momentum): {slug} signal=Up but "
+                        f"{momentum_window:.0f}s momentum=${momentum:+.2f} (falling)",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
@@ -805,16 +809,17 @@ class PaperBot:
                     return None, {"source": "none", "momentum": None}
                 if direction == "Down" and momentum > 0:
                     print(
-                        f"[bot] SKIP (momentum): signal=Down but {momentum_window:.0f}s momentum=${momentum:+.2f} (rising)",
+                        f"[bot] SKIP (momentum): {slug} signal=Down but "
+                        f"{momentum_window:.0f}s momentum=${momentum:+.2f} (rising)",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
                                       direction=direction, diff=diff_initial,
                                       momentum=momentum, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
-                print(f"[bot] momentum OK: {momentum_window:.0f}s=${momentum:+.2f}  direction={direction}", flush=True)
+                print(f"[bot] momentum OK: {slug} {momentum_window:.0f}s=${momentum:+.2f}  direction={direction}", flush=True)
             else:
-                print(f"[bot] SKIP (momentum): no {momentum_window:.0f}s reading", flush=True)
+                print(f"[bot] SKIP (momentum): {slug} no {momentum_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_momentum_history", outcome="skipped",
                                   direction=direction, diff=diff_initial, chop_range=chop_range)
                 return None, {"source": "none", "momentum": None}
@@ -823,7 +828,7 @@ class PaperBot:
             await asyncio.sleep(3)
             live_price_b, confirm_source = await self._get_signal_price()
             if live_price_b is None:
-                print("[bot] SKIP: reversal check fetch failed", flush=True)
+                print(f"[bot] SKIP: {slug} reversal check fetch failed", flush=True)
                 db.log_bot_signal(slug, filter_hit="reversal_fetch_failed", outcome="skipped",
                                   direction=direction, diff=diff_initial,
                                   momentum=momentum, chop_range=chop_range)
@@ -833,7 +838,7 @@ class PaperBot:
             reversed_direction = (diff_final > 0) != (diff_initial > 0)
             if reversed_direction or abs(diff_final) < reversal_threshold:
                 print(
-                    f"[bot] SKIP: momentum faded/reversed — "
+                    f"[bot] SKIP: {slug} momentum faded/reversed — "
                     f"initial=${diff_initial:+.2f}  now=${diff_final:+.2f}",
                     flush=True,
                 )
