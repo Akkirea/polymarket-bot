@@ -1155,7 +1155,7 @@ class PaperBot:
         if market is None or slug in self._live_retry_slugs:
             return
 
-        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.65"))
+        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
         live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
         retry_interval = max(0.5, float(os.getenv("LIVE_RETRY_INTERVAL_SEC", "3.0")))
         stop_before_close = max(0.0, float(os.getenv("LIVE_RETRY_STOP_BEFORE_CLOSE_SEC", "20.0")))
