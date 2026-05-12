@@ -130,6 +130,7 @@ class PaperBot:
         self._binance_feed = BinancePriceFeed()
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
+        self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows for one market
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
@@ -1055,6 +1056,7 @@ class PaperBot:
 
         # ── Live order (best-effort alongside paper) ───────────────────────────
         live_order = None
+        live_should_retry = False
         if os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and live_enabled:
             if market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
@@ -1103,6 +1105,7 @@ class PaperBot:
                     )
                 except Exception as exc:
                     print(f"[bot] LIVE: order failed for {slug} ({exc}) — paper only", flush=True)
+                    live_should_retry = True
         elif os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and not live_enabled:
             print(f"[bot] LIVE: disabled for {slug} strategy={strategy} — paper/shadow only", flush=True)
 
@@ -1125,6 +1128,8 @@ class PaperBot:
         self.positions.append(pos)
         db.save_open_position(pos)
         db.save_bot_state(self.balance)
+        if live_should_retry:
+            asyncio.create_task(self._retry_live_fill(pos, market, side, stake, entry_price))
         if start_ts is None:
             start_ts = _extract_start_ts(slug)
         win_start = datetime.utcfromtimestamp(start_ts).strftime("%H:%M") if start_ts is not None else "?"
@@ -1136,6 +1141,78 @@ class PaperBot:
             f"positions={len(self.positions)}",
             flush=True,
         )
+
+    async def _retry_live_fill(
+        self,
+        pos: dict,
+        market: Optional[dict],
+        side: str,
+        stake: float,
+        paper_entry_price: float,
+    ) -> None:
+        """Keep trying to attach a live fill to an already-open paper position."""
+        slug = pos["market_slug"]
+        if market is None or slug in self._live_retry_slugs:
+            return
+
+        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.65"))
+        live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
+        retry_interval = max(0.5, float(os.getenv("LIVE_RETRY_INTERVAL_SEC", "3.0")))
+        stop_before_close = max(0.0, float(os.getenv("LIVE_RETRY_STOP_BEFORE_CLOSE_SEC", "20.0")))
+        max_attempts = max(0, int(os.getenv("LIVE_RETRY_MAX_ATTEMPTS", "12")))
+        live_cap = min(CROWD_MAX, max_profit_price, paper_entry_price + live_slippage)
+
+        if live_cap < CROWD_MIN:
+            print(
+                f"[bot] LIVE RETRY: disabled for {slug}; cap={live_cap:.4f} below CROWD_MIN={CROWD_MIN:.2f}",
+                flush=True,
+            )
+            return
+
+        self._live_retry_slugs.add(slug)
+        try:
+            for attempt in range(1, max_attempts + 1):
+                if time.time() >= (float(pos["end_ts"]) - stop_before_close):
+                    print(f"[bot] LIVE RETRY: stop for {slug}; too close to close", flush=True)
+                    return
+
+                current_pos = next((p for p in self.positions if p["market_slug"] == slug), None)
+                if current_pos is None or current_pos.get("live_order_id"):
+                    return
+
+                try:
+                    from . import live_clob
+                    live_order = await live_clob.place_order(
+                        market,
+                        side,
+                        stake,
+                        max_fill_price=live_cap,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[bot] LIVE RETRY: {slug} attempt {attempt}/{max_attempts} failed "
+                        f"cap={live_cap:.4f}: {exc}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(retry_interval)
+                    continue
+
+                current_pos["live_order_id"] = live_order["order_id"]
+                current_pos["live_stake"] = live_order["stake"]
+                current_pos["live_fill_price"] = live_order["fill_price"]
+                db.save_open_position(current_pos)
+                self.live_balance -= live_order["stake"]
+                print(
+                    f"[bot] LIVE RETRY FILLED {side:>4} {slug} "
+                    f"stake=${live_order['stake']:.2f} price={live_order['fill_price']:.4f} "
+                    f"cap={live_cap:.4f} tx={live_order['tx_hash']}",
+                    flush=True,
+                )
+                return
+
+            print(f"[bot] LIVE RETRY: gave up on {slug} after {max_attempts} attempts", flush=True)
+        finally:
+            self._live_retry_slugs.discard(slug)
 
     async def _force_close(self, pos: dict):
         """Close a position that never received a winner from Polymarket.
