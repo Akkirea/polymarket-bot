@@ -481,6 +481,54 @@ async def archive_paper_legacy(body: dict, x_live_test_token: str = Header(defau
     }
 
 
+@app.post("/api/admin/delete-shadow-btc5")
+async def delete_shadow_btc5(body: dict, x_live_test_token: str = Header(default="")):
+    """Delete old BTC 5m shadow rows so shadow stats can start clean for BTC15."""
+    expected_token = os.getenv("LIVE_TEST_TOKEN")
+    if not expected_token or x_live_test_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing live test token")
+    if body.get("confirm") != "DELETE_SHADOW_BTC5":
+        raise HTTPException(status_code=400, detail="confirm must be DELETE_SHADOW_BTC5")
+
+    conn = db.get_connection()
+    try:
+        before = conn.execute(
+            """SELECT COUNT(*) AS trades, COALESCE(SUM(pnl), 0) AS pnl
+                 FROM bot_trades
+                WHERE mode = 'shadow'
+                  AND market_slug LIKE 'btc-updown-5m-%'"""
+        ).fetchone()
+        conn.execute(
+            """DELETE FROM bot_trades
+                WHERE mode = 'shadow'
+                  AND market_slug LIKE 'btc-updown-5m-%'"""
+        )
+        remaining = conn.execute(
+            """SELECT
+                    SUM(CASE WHEN market_slug LIKE 'btc-updown-5m-%' THEN 1 ELSE 0 END) AS btc5,
+                    SUM(CASE WHEN market_slug LIKE 'btc-updown-15m-%' THEN 1 ELSE 0 END) AS btc15,
+                    COUNT(*) AS total
+                 FROM bot_trades
+                WHERE mode = 'shadow'"""
+        ).fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "deleted": {
+            "trades": int(before["trades"] or 0),
+            "pnl": round(float(before["pnl"] or 0.0), 2),
+        },
+        "remaining_shadow": {
+            "btc5": int(remaining["btc5"] or 0),
+            "btc15": int(remaining["btc15"] or 0),
+            "total": int(remaining["total"] or 0),
+        },
+    }
+
+
 @app.get("/api/live/signer")
 def live_signer():
     """Return the public address derived from PRIVATE_KEY/PK — no secrets exposed."""
