@@ -420,7 +420,7 @@ class PaperBot:
                 self._entered_slugs.add(slug)
                 diff_at_entry = signals.get("diff_initial")
                 print(
-                    f"[bot] reversal-guard ENTRY: {direction} on {slug}  "
+                    f"[bot] reversal-guard SIGNAL PASSED: {direction} on {slug}  "
                     f"price={entry_price:.3f}  diff=${diff_at_entry:+.2f}  secs={seconds_remaining:.1f}",
                     flush=True,
                 )
@@ -1004,14 +1004,15 @@ class PaperBot:
 
         if stake < MIN_STAKE:
             print(
-                f"[bot] Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum "
-                f"({MIN_STAKE_PCT:.0%} of ${INITIAL_WALLET_SIZE:.0f}) — skipping",
+                f"[bot] OPEN SKIP: {slug} {side} entry={entry_price:.3f} "
+                f"Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum "
+                f"({MIN_STAKE_PCT:.0%} of ${INITIAL_WALLET_SIZE:.0f})",
                 flush=True,
             )
             return
 
         if self.balance < stake:
-            print(f"[bot] Insufficient balance (${self.balance:.2f}) — skipping")
+            print(f"[bot] OPEN SKIP: {slug} insufficient balance (${self.balance:.2f})", flush=True)
             return
 
         # ── Live order (best-effort alongside paper) ───────────────────────────
