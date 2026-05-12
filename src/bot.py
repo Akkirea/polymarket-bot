@@ -49,6 +49,8 @@ HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 75    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 150   # enter when seconds_remaining <= this
+VOLUME_RETRY_LO      = 30    # late retry only after a volume skip in the main window
+VOLUME_RETRY_HI      = ENTRY_WINDOW_LO
 MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — outside this band, funding must agree with direction
 PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to enter
@@ -127,6 +129,7 @@ class PaperBot:
         self._session:    Optional[aiohttp.ClientSession] = None
         self._binance_feed = BinancePriceFeed()
         self._entered_slugs: set = set()           # avoid re-entering the same market
+        self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows for one market
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
@@ -341,6 +344,8 @@ class PaperBot:
 
             seconds_remaining = end_ts - now
             print(f"[bot] market {slug} — {seconds_remaining:.1f}s remaining")
+            if seconds_remaining < VOLUME_RETRY_LO:
+                self._volume_retry_slugs.discard(slug)
 
             # Cache BTC price at first sight — used by reversal-guard as baseline
             if slug not in self._market_start_prices and slug not in self._entered_slugs:
@@ -356,8 +361,15 @@ class PaperBot:
                     print(f"[bot] BTC price unavailable — cannot cache start price for {slug}", flush=True)
 
             entry_lo, entry_hi = market.get("_sz_entry_window", (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI))
+            in_main_window = entry_lo <= seconds_remaining <= entry_hi
+            volume_retry_enabled = bool(market.get("_sz_live_enabled", True))
+            in_volume_retry_window = (
+                volume_retry_enabled
+                and VOLUME_RETRY_LO <= seconds_remaining < VOLUME_RETRY_HI
+                and slug in self._volume_retry_slugs
+            )
             # ── configured reversal window per market family
-            if (entry_lo <= seconds_remaining <= entry_hi
+            if ((in_main_window or in_volume_retry_window)
                     and slug not in self._entered_slugs):
                 strategy = market.get("_sz_strategy", "chainlink-reversal-guard")
                 shadow_mode = market.get("_sz_mode") == "shadow"
@@ -370,12 +382,21 @@ class PaperBot:
                 # volume is often low and can make normal markets look blocked.
                 volume = float(market.get("volume") or 0)
                 if volume < MIN_MARKET_VOLUME:
+                    if in_main_window and volume_retry_enabled:
+                        self._volume_retry_slugs.add(slug)
                     print(
                         f"[bot] SKIP: {slug} volume=${volume:.0f} < "
-                        f"${MIN_MARKET_VOLUME:,.0f} minimum  secs={seconds_remaining:.1f}",
+                        f"${MIN_MARKET_VOLUME:,.0f} minimum  secs={seconds_remaining:.1f}"
+                        f"{' — eligible for late retry' if in_main_window and volume_retry_enabled else ''}",
                         flush=True,
                     )
                     continue
+                if in_volume_retry_window:
+                    print(
+                        f"[bot] LATE RETRY: {slug} volume=${volume:.0f} now clears "
+                        f"${MIN_MARKET_VOLUME:,.0f} minimum  secs={seconds_remaining:.1f}",
+                        flush=True,
+                    )
 
                 if self._evaluating:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
@@ -427,6 +448,7 @@ class PaperBot:
                 self._market_start_prices.pop(slug, None)
                 self._market_start_sources.pop(slug, None)
                 self._entered_slugs.add(slug)
+                self._volume_retry_slugs.discard(slug)
                 diff_at_entry = signals.get("diff_initial")
                 print(
                     f"[bot] reversal-guard SIGNAL PASSED: {direction} on {slug}  "
