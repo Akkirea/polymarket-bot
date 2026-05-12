@@ -643,6 +643,63 @@ async def delete_shadow_btc5(body: dict, x_live_test_token: str = Header(default
     }
 
 
+@app.post("/api/admin/reconcile-live-balance")
+async def reconcile_live_balance(body: dict, x_live_test_token: str = Header(default="")):
+    """Adjust the latest live ledger row so derived live balance matches Polymarket cash."""
+    expected_token = os.getenv("LIVE_TEST_TOKEN")
+    if not expected_token or x_live_test_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing live test token")
+
+    actual_balance = round(float(body.get("actual_balance")), 4)
+    current_balance = round(float(bot.live_balance), 4)
+    delta = round(actual_balance - current_balance, 4)
+    if abs(delta) < 0.0001:
+        return {
+            "ok": True,
+            "changed": False,
+            "balance": actual_balance,
+            "delta": 0.0,
+        }
+
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            """SELECT id, pnl, balance_after
+                 FROM bot_trades
+                WHERE mode = 'live'
+                  AND pnl IS NOT NULL
+                ORDER BY opened_at DESC
+                LIMIT 1"""
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="No live trade row to reconcile")
+
+        new_pnl = round(float(row["pnl"] or 0.0) + delta, 4)
+        conn.execute(
+            """UPDATE bot_trades
+                  SET pnl = %s,
+                      balance_after = %s
+                WHERE id = %s""",
+            (new_pnl, actual_balance, row["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    bot.live_balance = actual_balance
+    bot.live_pnl = round(bot.live_pnl + delta, 4)
+    return {
+        "ok": True,
+        "changed": True,
+        "trade_id": row["id"],
+        "old_balance": current_balance,
+        "new_balance": actual_balance,
+        "delta": delta,
+        "old_pnl": round(float(row["pnl"] or 0.0), 4),
+        "new_pnl": new_pnl,
+    }
+
+
 @app.get("/api/live/signer")
 def live_signer():
     """Return the public address derived from PRIVATE_KEY/PK — no secrets exposed."""
