@@ -78,6 +78,7 @@ MARKET_FAMILIES = [
         "interval": 900,
         "strategy": "btc-15m-paper-shadow",
         "live_enabled": False,
+        "mode": "shadow",
         "entry_window": (180, 300),
         "diff_threshold": 25.0,
         "reversal_threshold": 20.0,
@@ -317,7 +318,12 @@ class PaperBot:
             # ── configured reversal window per market family
             if (entry_lo <= seconds_remaining <= entry_hi
                     and slug not in self._entered_slugs):
-                shadow_already_recorded = slug in self._shadow_entered_slugs or db.shadow_trade_exists(slug)
+                strategy = market.get("_sz_strategy", "chainlink-reversal-guard")
+                shadow_mode = market.get("_sz_mode") == "shadow"
+                shadow_already_recorded = (
+                    slug in self._shadow_entered_slugs
+                    or db.shadow_trade_exists(slug, strategy if shadow_mode else "funding-neutral-shadow")
+                )
                 # Minimum volume filter — thin markets cause large slippage.
                 # Only enforce/log this inside the entry window; early-window
                 # volume is often low and can make normal markets look blocked.
@@ -360,7 +366,7 @@ class PaperBot:
                                       direction=direction, diff=signals.get("diff_initial"))
                     continue
 
-                if signals.get("shadow_only"):
+                if shadow_mode or signals.get("shadow_only"):
                     if shadow_already_recorded:
                         print(f"[bot] SHADOW: {slug} already recorded — no duplicate", flush=True)
                     else:
@@ -373,6 +379,7 @@ class PaperBot:
                             diff_at_entry=signals.get("diff_initial"),
                             seconds_remaining=seconds_remaining,
                             hour_et=hour_et,
+                            strategy=strategy if shadow_mode else "funding-neutral-shadow",
                         )
                     continue
 
@@ -391,7 +398,7 @@ class PaperBot:
                     price_to_beat=price_to_beat,
                     diff_at_entry=diff_at_entry,
                     seconds_remaining=seconds_remaining,
-                    strategy=market.get("_sz_strategy", "chainlink-reversal-guard"),
+                    strategy=strategy,
                     hour_et=hour_et,
                     market=market,
                     live_enabled=bool(market.get("_sz_live_enabled", True)),
@@ -465,6 +472,7 @@ class PaperBot:
                         market["_sz_live_enabled"] = spec["live_enabled"]
                         market["_sz_label"] = spec["label"]
                         market["_sz_entry_window"] = spec["entry_window"]
+                        market["_sz_mode"] = spec.get("mode", "paper")
                         markets.append(market)
                         print(f"[bot] found open market: {slug}  closed={data[0].get('closed')}")
                     elif data:
@@ -859,8 +867,9 @@ class PaperBot:
         diff_at_entry: Optional[float] = None,
         seconds_remaining: Optional[float] = None,
         hour_et: int = 0,
+        strategy: str = "funding-neutral-shadow",
     ) -> None:
-        """Record a hypothetical trade blocked only by funding neutral."""
+        """Record a hypothetical shadow trade without touching paper/live accounting."""
         stake, kelly_fraction, multiplier = self._shadow_stake(entry_price, hour_et)
         if stake < MIN_STAKE:
             print(
@@ -881,7 +890,7 @@ class PaperBot:
                 "price_to_beat": price_to_beat,
                 "diff_at_entry": diff_at_entry,
                 "seconds_remaining": seconds_remaining,
-                "strategy": "funding-neutral-shadow",
+                "strategy": strategy,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -895,7 +904,8 @@ class PaperBot:
 
         print(
             f"[bot] SHADOW OPEN {side:>4} ${stake:.2f} "
-            f"(kelly={kelly_fraction:.3f} ×{multiplier}) slug={slug} entry={entry_price:.3f}",
+            f"(kelly={kelly_fraction:.3f} ×{multiplier}) strategy={strategy} "
+            f"slug={slug} entry={entry_price:.3f}",
             flush=True,
         )
         asyncio.create_task(self._backfill_shadow_trade(slug, end_ts))
