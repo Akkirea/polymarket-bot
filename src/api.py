@@ -20,6 +20,7 @@ from .bot import bot
 from . import db
 from .whale_tracker import WhaleTracker
 from . import live_clob
+from .markets import FIVE_MINUTE_MARKETS, catalog, current_five_minute_slugs
 
 
 async def _backfill_resolution_prices():
@@ -271,6 +272,48 @@ def get_bot_stats(mode: str = "paper"):
         "worst_trade":  round(min(pnls), 2),
         "trades_by_day": list(by_day.values()),
     }
+
+
+@app.get("/api/markets")
+async def get_markets():
+    """Configured markets plus current/next 5m Polymarket windows when available."""
+    results = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        for item in catalog():
+            row = dict(item)
+            row["markets"] = []
+            if item in FIVE_MINUTE_MARKETS:
+                for slug in current_five_minute_slugs(item):
+                    try:
+                        async with session.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"slug": slug},
+                        ) as resp:
+                            if resp.status != 200:
+                                continue
+                            data = await resp.json()
+                    except Exception as exc:
+                        row["error"] = str(exc)
+                        continue
+                    if not data:
+                        continue
+                    market = data[0]
+                    row["markets"].append(
+                        {
+                            "slug": market.get("slug"),
+                            "question": market.get("question"),
+                            "closed": market.get("closed"),
+                            "active": market.get("active"),
+                            "volume": float(market.get("volume") or 0),
+                            "liquidity": float(market.get("liquidity") or 0),
+                            "outcomePrices": market.get("outcomePrices"),
+                            "bestBid": market.get("bestBid"),
+                            "bestAsk": market.get("bestAsk"),
+                            "lastTradePrice": market.get("lastTradePrice"),
+                        }
+                    )
+            results.append(row)
+    return results
 
 
 @app.get("/api/bot/stats/hourly")
