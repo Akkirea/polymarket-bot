@@ -225,7 +225,39 @@ class PaperBot:
             (mode, n),
         ).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        trades = [dict(r) for r in rows]
+
+        if mode in {"paper", "live"}:
+            for pos in db.load_open_positions():
+                if mode == "live" and not pos.get("live_order_id"):
+                    continue
+                size = pos.get("live_stake") if mode == "live" else pos.get("size")
+                entry_price = pos.get("live_fill_price") if mode == "live" else pos.get("entry_price")
+                trades.append(
+                    {
+                        "id": f"open:{mode}:{pos['market_slug']}",
+                        "whale_address": STRATEGY_TAG,
+                        "market_slug": pos["market_slug"],
+                        "side": pos["side"],
+                        "size": size,
+                        "entry_price": entry_price,
+                        "price_to_beat": pos.get("price_to_beat"),
+                        "poly_price_to_beat": None,
+                        "resolution_price": None,
+                        "outcome": "open",
+                        "pnl": None,
+                        "balance_after": None,
+                        "diff_at_entry": pos.get("diff_at_entry"),
+                        "seconds_remaining": pos.get("seconds_remaining"),
+                        "strategy": pos.get("strategy"),
+                        "opened_at": pos.get("opened_at"),
+                        "closed_at": None,
+                        "mode": mode,
+                    }
+                )
+
+        trades.sort(key=lambda r: r.get("opened_at") or "", reverse=True)
+        return trades[:n]
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
