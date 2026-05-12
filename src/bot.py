@@ -36,7 +36,7 @@ INITIAL_WALLET_SIZE  = 97.0
 MAX_STAKE_PCT        = 0.02   # half-Kelly at 52% win prob and 0.50 entry
 MIN_STAKE_PCT        = 0.01   # skip smaller signals instead of forcing oversize bets
 LIVE_MIN_ORDER_SIZE  = 1.00   # Polymarket marketable BUY minimum
-ORDER_SIZE_INCREMENT = 1.00   # Send whole-dollar USDC order sizes only
+ORDER_SIZE_INCREMENT = 0.01   # Keep cent precision; MIN_STAKE protects Polymarket's $1 floor
 MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT
 MIN_STAKE            = max(LIVE_MIN_ORDER_SIZE, INITIAL_WALLET_SIZE * MIN_STAKE_PCT)
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
@@ -76,7 +76,7 @@ LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # start
 
 
 def _round_order_size(amount: float) -> float:
-    """Round up to the next whole-dollar order size."""
+    """Round up to the configured order-size increment."""
     increment = max(0.01, ORDER_SIZE_INCREMENT)
     return round(math.ceil(amount / increment) * increment, 2)
 

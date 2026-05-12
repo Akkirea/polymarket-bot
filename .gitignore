@@ -1,11 +1,14 @@
 # Database
 signal_zero.db
 *.db
+*.db-shm
+*.db-wal
 
 # Virtual environment
 venv/
 
 # Python
+.python-version
 __pycache__/
 *.pyc
 *.pyo
@@ -18,3 +21,38 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Local CLOB / wallet diagnostics
+approve_usdce.py
+check_balances.py
+check_clob.py
+check_deposit.py
+check_sdk_exchange.py
+crack_selector.py
+create_fresh_key.py
+debug_batch_sig.py
+debug_clob.py
+debug_order.py
+decode_proxy_abi.py
+diagnose_clob.py
+diagnose_clob2.py
+extract_typehash.py
+find_execute.py
+find_proxy_txs.py
+find_typehash.py
+find_typehash_storage.py
+fix_clob_account.py
+fund_proxy.py
+probe_proxy.py
+proxy_approve.py
+proxy_batch_approve.py
+proxy_meta_tx.py
+proxy_signed_tx.py
+relayer_setup.py
+set_allowances.py
+test_balance.py
+test_v2_order.py
+trace_execute.py
+trace_execute2.py
+trace_execute3.py
+verify_sig.py
