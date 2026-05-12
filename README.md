@@ -45,6 +45,15 @@ Edit `src/config.py` to adjust:
 python -m src.analyze
 ```
 
+## Deploying
+
+Use the repo-local deploy script so Railway uploads this project directory as
+the archive root and does not index unrelated macOS folders:
+
+```bash
+./scripts/deploy.sh
+```
+
 ## Project structure
 
 ```
