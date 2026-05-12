@@ -49,6 +49,8 @@ HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 75    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 150   # enter when seconds_remaining <= this
+EARLY_LIVE_WINDOW_LO = 150   # stricter live-only detector starts here
+EARLY_LIVE_WINDOW_HI = 240
 VOLUME_RETRY_LO      = 30    # late retry only after a volume skip in the main window
 VOLUME_RETRY_HI      = ENTRY_WINDOW_LO
 MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
@@ -57,6 +59,8 @@ PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to ente
 REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is 70%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
+EARLY_LIVE_MAX_PRICE = 0.60  # early entries need better risk/reward than regular entries
+LIVE_MIN_SECONDS_BEFORE_CLOSE = 60.0  # avoid last-minute live fills with collapsed upside
 BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's 30s/60s checks
 MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research shadows
@@ -370,6 +374,14 @@ class PaperBot:
 
             entry_lo, entry_hi = market.get("_sz_entry_window", (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI))
             in_main_window = entry_lo <= seconds_remaining <= entry_hi
+            early_live_enabled = (
+                bool(market.get("_sz_live_enabled", True))
+                and slug.startswith("btc-updown-5m-")
+            )
+            in_early_live_window = (
+                early_live_enabled
+                and EARLY_LIVE_WINDOW_LO <= seconds_remaining <= EARLY_LIVE_WINDOW_HI
+            )
             volume_retry_enabled = bool(market.get("_sz_live_enabled", True))
             in_volume_retry_window = (
                 volume_retry_enabled
@@ -379,9 +391,11 @@ class PaperBot:
             if market.get("_sz_live_enabled", True):
                 await self._record_research_shadows(market, end_ts, seconds_remaining, hour_et)
             # ── configured reversal window per market family
-            if ((in_main_window or in_volume_retry_window)
+            if ((in_early_live_window or in_main_window or in_volume_retry_window)
                     and slug not in self._entered_slugs):
                 strategy = market.get("_sz_strategy", "chainlink-reversal-guard")
+                if in_early_live_window:
+                    strategy = "btc5-early-lag-live"
                 shadow_mode = market.get("_sz_mode") == "shadow"
                 shadow_strategy = strategy if shadow_mode else "funding-neutral-shadow"
                 shadow_already_recorded = (
@@ -414,12 +428,14 @@ class PaperBot:
                     continue
                 price_to_beat = self._market_start_prices.get(slug)
                 price_source = self._market_start_sources.get(slug)
+                target_label = (
+                    f"{EARLY_LIVE_WINDOW_LO}-{EARLY_LIVE_WINDOW_HI}s early-live"
+                    if in_early_live_window else f"{entry_lo}-{entry_hi}s"
+                )
+                ref_label = f"${price_to_beat:,.2f} ({price_source})" if price_to_beat else "None"
                 print(
                     f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s "
-                    f"(target {entry_lo}-{entry_hi}s)  "
-                    f"ref=${price_to_beat:,.2f} ({price_source})" if price_to_beat else
-                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s "
-                    f"(target {entry_lo}-{entry_hi}s)  ref=None",
+                    f"(target {target_label})  ref={ref_label}",
                     flush=True,
                 )
                 direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
@@ -438,6 +454,14 @@ class PaperBot:
                     db.log_bot_signal(slug, filter_hit="crowd_price", outcome="skipped",
                                       direction=direction, diff=signals.get("diff_initial"))
                     continue
+
+                if in_early_live_window:
+                    early_ok, early_reason = self._early_live_confirmation(market, direction, signals)
+                    if not early_ok:
+                        print(f"[bot] SKIP EARLY LIVE: {slug} {early_reason}", flush=True)
+                        db.log_bot_signal(slug, filter_hit="early_live_confirmation", outcome="skipped",
+                                          direction=direction, diff=signals.get("diff_initial"))
+                        continue
 
                 if shadow_mode or signals.get("shadow_only"):
                     if shadow_already_recorded:
@@ -718,6 +742,49 @@ class PaperBot:
 
     def _research_shadow_exists(self, slug: str, strategy: str) -> bool:
         return (slug, strategy) in self._shadow_entered_slugs or db.shadow_trade_exists(slug, strategy)
+
+    def _early_live_confirmation(self, market: dict, direction: str, signals: dict) -> tuple[bool, str]:
+        """
+        Stricter early-live gate: only enter before the normal 75-150s window
+        when the lag-follow direction and early-momentum direction are aligned.
+        """
+        diff = signals.get("diff_final")
+        if diff is None:
+            diff = signals.get("diff_initial")
+        if diff is None:
+            return False, "missing confirmed diff"
+
+        lag_side = "Up" if diff > 0 else "Down"
+        if lag_side != direction:
+            return False, f"lag side {lag_side} disagrees with signal {direction}"
+        if abs(diff) < PRICE_DIFF_THRESHOLD:
+            return False, f"lag diff ${abs(diff):.2f} below ${PRICE_DIFF_THRESHOLD:.0f}"
+
+        side_price = _side_price(market, direction)
+        early_cap = min(EARLY_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
+        if not (CROWD_MIN <= side_price <= early_cap):
+            return False, f"{direction} price={side_price:.3f} outside early range [{CROWD_MIN}, {early_cap}]"
+
+        live_price = signals.get("live_price")
+        if live_price is None:
+            return False, "missing live confirmation price"
+
+        price_10s_ago = self._get_price_n_seconds_ago(10)
+        price_30s_ago = self._get_price_n_seconds_ago(30)
+        if price_10s_ago is None or price_30s_ago is None:
+            return False, "missing 10s/30s momentum history"
+
+        momentum_10 = live_price - price_10s_ago
+        momentum_30 = live_price - price_30s_ago
+        if direction == "Up" and not (momentum_10 > 0 and momentum_30 > 0):
+            return False, f"Up momentum not aligned: 10s=${momentum_10:+.2f}, 30s=${momentum_30:+.2f}"
+        if direction == "Down" and not (momentum_10 < 0 and momentum_30 < 0):
+            return False, f"Down momentum not aligned: 10s=${momentum_10:+.2f}, 30s=${momentum_30:+.2f}"
+
+        return True, (
+            f"early live confirmed: price={side_price:.3f}, diff=${diff:+.2f}, "
+            f"10s=${momentum_10:+.2f}, 30s=${momentum_30:+.2f}"
+        )
 
     async def _record_research_shadows(
         self,
@@ -1158,13 +1225,20 @@ class PaperBot:
         live_order = None
         live_should_retry = False
         if os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and live_enabled:
-            if market is None:
+            if seconds_remaining is not None and seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
+                print(
+                    f"[bot] LIVE: skipped for {slug}; {seconds_remaining:.1f}s before close "
+                    f"< {LIVE_MIN_SECONDS_BEFORE_CLOSE:.0f}s minimum",
+                    flush=True,
+                )
+            elif market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
             else:
                 try:
                     from . import live_clob
                     live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
-                    live_cap = min(CROWD_MAX, entry_price + live_slippage)
+                    max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
+                    live_cap = min(CROWD_MAX, max_profit_price, entry_price + live_slippage)
                     live_retries = max(0, int(os.getenv("LIVE_FAK_RETRIES", "1")))
                     live_retry_delay = max(0.0, float(os.getenv("LIVE_FAK_RETRY_DELAY_SEC", "1.0")))
 
@@ -1258,7 +1332,10 @@ class PaperBot:
         max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
         live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
         retry_interval = max(0.5, float(os.getenv("LIVE_RETRY_INTERVAL_SEC", "3.0")))
-        stop_before_close = max(0.0, float(os.getenv("LIVE_RETRY_STOP_BEFORE_CLOSE_SEC", "20.0")))
+        stop_before_close = max(
+            LIVE_MIN_SECONDS_BEFORE_CLOSE,
+            float(os.getenv("LIVE_RETRY_STOP_BEFORE_CLOSE_SEC", str(LIVE_MIN_SECONDS_BEFORE_CLOSE))),
+        )
         max_attempts = max(0, int(os.getenv("LIVE_RETRY_MAX_ATTEMPTS", "12")))
         live_cap = min(CROWD_MAX, max_profit_price, paper_entry_price + live_slippage)
 
