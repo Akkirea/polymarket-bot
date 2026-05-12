@@ -59,6 +59,13 @@ CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's 30s/60s checks
 MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
+MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research shadows
+SHADOW_MAX_FOLLOW_PRICE = 0.67
+EARLY_SHADOW_WINDOW  = (150, 240)
+FADE_SHADOW_WINDOW   = (75, 240)
+FADE_CROWD_PRICE     = 0.75
+FADE_MAX_DIFF        = 35.0
+FADE_MAX_MOMENTUM    = 8.0
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
@@ -131,7 +138,7 @@ class PaperBot:
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
-        self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows for one market
+        self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows per (slug, strategy)
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
@@ -369,14 +376,17 @@ class PaperBot:
                 and VOLUME_RETRY_LO <= seconds_remaining < VOLUME_RETRY_HI
                 and slug in self._volume_retry_slugs
             )
+            if market.get("_sz_live_enabled", True):
+                await self._record_research_shadows(market, end_ts, seconds_remaining, hour_et)
             # ── configured reversal window per market family
             if ((in_main_window or in_volume_retry_window)
                     and slug not in self._entered_slugs):
                 strategy = market.get("_sz_strategy", "chainlink-reversal-guard")
                 shadow_mode = market.get("_sz_mode") == "shadow"
+                shadow_strategy = strategy if shadow_mode else "funding-neutral-shadow"
                 shadow_already_recorded = (
-                    slug in self._shadow_entered_slugs
-                    or db.shadow_trade_exists(slug, strategy if shadow_mode else "funding-neutral-shadow")
+                    (slug, shadow_strategy) in self._shadow_entered_slugs
+                    or db.shadow_trade_exists(slug, shadow_strategy)
                 )
                 # Minimum volume filter — thin markets cause large slippage.
                 # Only enforce/log this inside the entry window; early-window
@@ -442,7 +452,7 @@ class PaperBot:
                             diff_at_entry=signals.get("diff_initial"),
                             seconds_remaining=seconds_remaining,
                             hour_et=hour_et,
-                            strategy=strategy if shadow_mode else "funding-neutral-shadow",
+                            strategy=shadow_strategy,
                         )
                     continue
 
@@ -706,6 +716,91 @@ class PaperBot:
             print(f"[bot] funding parse error from binance: {exc}", flush=True)
             return None
 
+    def _research_shadow_exists(self, slug: str, strategy: str) -> bool:
+        return (slug, strategy) in self._shadow_entered_slugs or db.shadow_trade_exists(slug, strategy)
+
+    async def _record_research_shadows(
+        self,
+        market: dict,
+        end_ts: float,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> None:
+        """Record shadow-only BTC 5m strategy variants for tradability research."""
+        slug = market["slug"]
+        if not slug.startswith("btc-updown-5m-"):
+            return
+
+        volume = float(market.get("volume") or 0.0)
+        if volume < MIN_SHADOW_VOLUME:
+            return
+
+        reference_price = self._market_start_prices.get(slug)
+        if reference_price is None:
+            return
+
+        live_price, _source = await self._get_signal_price()
+        if live_price is None:
+            return
+
+        diff = live_price - reference_price
+        momentum_10_price = self._get_price_n_seconds_ago(10)
+        momentum_30_price = self._get_price_n_seconds_ago(30)
+        momentum_10 = live_price - momentum_10_price if momentum_10_price is not None else None
+        momentum_30 = live_price - momentum_30_price if momentum_30_price is not None else None
+        up_price = _side_price(market, "Up")
+        down_price = _side_price(market, "Down")
+
+        def record(strategy: str, side: str) -> None:
+            if self._research_shadow_exists(slug, strategy):
+                return
+            self._record_shadow_entry(
+                slug=slug,
+                side=side,
+                entry_price=_side_price(market, side),
+                end_ts=end_ts,
+                price_to_beat=reference_price,
+                diff_at_entry=diff,
+                seconds_remaining=seconds_remaining,
+                hour_et=hour_et,
+                strategy=strategy,
+                preserve_reference=True,
+                force_min_stake=True,
+            )
+
+        # 1) Lag-follow: current direction is strong and still executable.
+        if 75 <= seconds_remaining <= 150 and abs(diff) >= PRICE_DIFF_THRESHOLD:
+            side = "Up" if diff > 0 else "Down"
+            side_price = _side_price(market, side)
+            momentum_ok = (
+                momentum_10 is not None
+                and ((side == "Up" and momentum_10 >= 0) or (side == "Down" and momentum_10 <= 0))
+            )
+            if momentum_ok and CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE:
+                record("btc5-lag-follow-shadow", side)
+
+        # 2) Early momentum: enter before the obvious late signal if price is still tradable.
+        early_lo, early_hi = EARLY_SHADOW_WINDOW
+        if early_lo <= seconds_remaining <= early_hi and abs(diff) >= 8.0:
+            side = "Up" if diff > 0 else "Down"
+            side_price = _side_price(market, side)
+            momentum_ok = (
+                momentum_10 is not None
+                and momentum_30 is not None
+                and ((side == "Up" and momentum_10 > 0 and momentum_30 > 0)
+                     or (side == "Down" and momentum_10 < 0 and momentum_30 < 0))
+            )
+            if momentum_ok and CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE:
+                record("btc5-early-momentum-shadow", side)
+
+        # 3) Overpriced fade: crowd is extreme, but BTC edge/momentum does not justify it.
+        fade_lo, fade_hi = FADE_SHADOW_WINDOW
+        if fade_lo <= seconds_remaining <= fade_hi and abs(diff) <= FADE_MAX_DIFF and momentum_10 is not None:
+            if up_price >= FADE_CROWD_PRICE and momentum_10 <= FADE_MAX_MOMENTUM:
+                record("btc5-overpriced-fade-shadow", "Down")
+            elif down_price >= FADE_CROWD_PRICE and momentum_10 >= -FADE_MAX_MOMENTUM:
+                record("btc5-overpriced-fade-shadow", "Up")
+
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float], price_source: Optional[str]
     ) -> tuple[Optional[str], dict]:
@@ -937,9 +1032,13 @@ class PaperBot:
         seconds_remaining: Optional[float] = None,
         hour_et: int = 0,
         strategy: str = "funding-neutral-shadow",
+        preserve_reference: bool = False,
+        force_min_stake: bool = False,
     ) -> None:
         """Record a hypothetical shadow trade without touching paper/live accounting."""
         stake, kelly_fraction, multiplier = self._shadow_stake(entry_price, hour_et)
+        if force_min_stake:
+            stake = _round_order_size(max(MIN_STAKE, stake))
         if stake < MIN_STAKE:
             print(
                 f"[bot] SHADOW SKIP: Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum",
@@ -963,9 +1062,10 @@ class PaperBot:
                 "opened_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-        self._shadow_entered_slugs.add(slug)
-        self._market_start_prices.pop(slug, None)
-        self._market_start_sources.pop(slug, None)
+        self._shadow_entered_slugs.add((slug, strategy))
+        if not preserve_reference:
+            self._market_start_prices.pop(slug, None)
+            self._market_start_sources.pop(slug, None)
 
         if not inserted:
             print(f"[bot] SHADOW: {slug} already exists in DB — no duplicate", flush=True)

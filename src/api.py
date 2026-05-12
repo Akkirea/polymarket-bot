@@ -36,6 +36,21 @@ SHADOW_FAMILIES = {
         "slug_like": "btc-updown-5m-%",
         "strategy": None,
     },
+    "btc5_lag_follow": {
+        "label": "BTC 5m Lag Follow",
+        "slug_like": "btc-updown-5m-%",
+        "strategy": "btc5-lag-follow-shadow",
+    },
+    "btc5_early_momentum": {
+        "label": "BTC 5m Early Momentum",
+        "slug_like": "btc-updown-5m-%",
+        "strategy": "btc5-early-momentum-shadow",
+    },
+    "btc5_overpriced_fade": {
+        "label": "BTC 5m Overpriced Fade",
+        "slug_like": "btc-updown-5m-%",
+        "strategy": "btc5-overpriced-fade-shadow",
+    },
     "btc15": {
         "label": "BTC 15m Shadow",
         "slug_like": "btc-updown-15m-%",
