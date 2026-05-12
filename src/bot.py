@@ -53,7 +53,7 @@ REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-ch
 CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is 70%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's 30s/60s checks
-MIN_MARKET_VOLUME    = 5000.0  # USDC — only enforced during the entry window
+MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
