@@ -1017,11 +1017,19 @@ class PaperBot:
             else:
                 try:
                     from . import live_clob
-                    live_order = await live_clob.place_order(market, side, stake)
+                    live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
+                    live_cap = min(CROWD_MAX, entry_price + live_slippage)
+                    live_order = await live_clob.place_order(
+                        market,
+                        side,
+                        stake,
+                        max_fill_price=live_cap,
+                    )
                     self.live_balance -= live_order["stake"]
                     print(
                         f"[bot] LIVE: filled orderID={live_order['order_id']}  "
                         f"stake=${live_order['stake']:.2f}  price={live_order['fill_price']:.4f}  "
+                        f"cap={live_order.get('max_fill_price', live_cap):.4f}  "
                         f"tx={live_order['tx_hash']}",
                         flush=True,
                     )
