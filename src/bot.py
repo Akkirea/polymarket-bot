@@ -52,7 +52,7 @@ PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to ente
 REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is 70%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
-BINANCE_STALE_AFTER  = 5.0   # seconds — after this, fall back to Chainlink for live reads
+BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's 30s/60s checks
 MIN_MARKET_VOLUME    = 5000.0  # USDC — only enforced during the entry window
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
@@ -65,6 +65,12 @@ MARKET_FAMILIES = [
         "interval": 300,
         "strategy": "chainlink-reversal-guard",
         "live_enabled": True,
+        "entry_window": (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI),
+        "diff_threshold": PRICE_DIFF_THRESHOLD,
+        "reversal_threshold": REVERSAL_THRESHOLD,
+        "chop_window": 10,
+        "momentum_window": 5,
+        "chop_min_move": MIN_MOMENTUM_MOVE,
     },
     {
         "label": "BTC 15m",
@@ -72,6 +78,12 @@ MARKET_FAMILIES = [
         "interval": 900,
         "strategy": "btc-15m-paper-shadow",
         "live_enabled": False,
+        "entry_window": (180, 300),
+        "diff_threshold": 25.0,
+        "reversal_threshold": 20.0,
+        "chop_window": 60,
+        "momentum_window": 30,
+        "chop_min_move": 15.0,
     },
 ]
 
@@ -301,8 +313,9 @@ class PaperBot:
                 else:
                     print(f"[bot] BTC price unavailable — cannot cache start price for {slug}", flush=True)
 
-            # ── chainlink-reversal-guard (last 6-15s of market)
-            if (ENTRY_WINDOW_LO <= seconds_remaining <= ENTRY_WINDOW_HI
+            entry_lo, entry_hi = market.get("_sz_entry_window", (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI))
+            # ── configured reversal window per market family
+            if (entry_lo <= seconds_remaining <= entry_hi
                     and slug not in self._entered_slugs):
                 shadow_already_recorded = slug in self._shadow_entered_slugs or db.shadow_trade_exists(slug)
                 # Minimum volume filter — thin markets cause large slippage.
@@ -323,9 +336,11 @@ class PaperBot:
                 price_to_beat = self._market_start_prices.get(slug)
                 price_source = self._market_start_sources.get(slug)
                 print(
-                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s  "
+                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s "
+                    f"(target {entry_lo}-{entry_hi}s)  "
                     f"ref=${price_to_beat:,.2f} ({price_source})" if price_to_beat else
-                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s  ref=None",
+                    f"[bot] reversal-guard window: {slug}  {seconds_remaining:.1f}s "
+                    f"(target {entry_lo}-{entry_hi}s)  ref=None",
                     flush=True,
                 )
                 direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
@@ -449,6 +464,7 @@ class PaperBot:
                         market["_sz_strategy"] = spec["strategy"]
                         market["_sz_live_enabled"] = spec["live_enabled"]
                         market["_sz_label"] = spec["label"]
+                        market["_sz_entry_window"] = spec["entry_window"]
                         markets.append(market)
                         print(f"[bot] found open market: {slug}  closed={data[0].get('closed')}")
                     elif data:
@@ -636,6 +652,11 @@ class PaperBot:
             return None, {"source": "none", "momentum": None}
         spec = _market_spec_for_slug(slug)
         interval = spec["interval"] if spec else int(market.get("_sz_interval") or 300)
+        diff_threshold = float(spec.get("diff_threshold", PRICE_DIFF_THRESHOLD)) if spec else PRICE_DIFF_THRESHOLD
+        reversal_threshold = float(spec.get("reversal_threshold", REVERSAL_THRESHOLD)) if spec else REVERSAL_THRESHOLD
+        chop_window = float(spec.get("chop_window", 10)) if spec else 10.0
+        momentum_window = float(spec.get("momentum_window", 5)) if spec else 5.0
+        chop_min_move = float(spec.get("chop_min_move", MIN_MOMENTUM_MOVE)) if spec else MIN_MOMENTUM_MOVE
         prefix = spec["slug_prefix"] if spec else slug.rsplit("-", 1)[0]
         prev_slug = f"{prefix}-{int(start_ts - interval)}"
         prev_final  = self._final_price_cache.get(prev_slug)
@@ -677,9 +698,9 @@ class PaperBot:
                 flush=True,
             )
             direction = "Up" if diff_initial > 0 else "Down"
-            if abs(diff_initial) < PRICE_DIFF_THRESHOLD:
+            if abs(diff_initial) < diff_threshold:
                 print(
-                    f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${PRICE_DIFF_THRESHOLD:.0f}",
+                    f"[bot] SKIP: {direction} diff ${abs(diff_initial):.2f} < threshold ${diff_threshold:.0f}",
                     flush=True,
                 )
                 db.log_bot_signal(slug, filter_hit="diff_threshold", outcome="skipped",
@@ -710,32 +731,32 @@ class PaperBot:
                         return None, {"source": "none", "momentum": None}
                     print(f"[bot] funding OK: {funding_rate:+.4f}%  direction={direction}", flush=True)
 
-            # Condition b1: chop filter — 10s price range must show real movement
-            price_10s_ago = self._get_price_n_seconds_ago(10)
-            chop_range = abs(live_price - price_10s_ago) if price_10s_ago is not None else None
-            if price_10s_ago is not None:
-                if chop_range < MIN_MOMENTUM_MOVE:
+            # Condition b1: chop filter — configured price range must show real movement
+            price_chop_window_ago = self._get_price_n_seconds_ago(chop_window)
+            chop_range = abs(live_price - price_chop_window_ago) if price_chop_window_ago is not None else None
+            if price_chop_window_ago is not None:
+                if chop_range < chop_min_move:
                     print(
-                        f"[bot] SKIP (chop): 10s range=${chop_range:.2f} < ${MIN_MOMENTUM_MOVE:.0f}  "
-                        f"now=${live_price:,.2f}  10s_ago=${price_10s_ago:,.2f}",
+                        f"[bot] SKIP (chop): {chop_window:.0f}s range=${chop_range:.2f} < ${chop_min_move:.0f}  "
+                        f"now=${live_price:,.2f}  {chop_window:.0f}s_ago=${price_chop_window_ago:,.2f}",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="chop", outcome="skipped",
                                       direction=direction, diff=diff_initial, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
             else:
-                print("[bot] SKIP (chop): no 10s reading", flush=True)
+                print(f"[bot] SKIP (chop): no {chop_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_chop_history", outcome="skipped",
                                   direction=direction, diff=diff_initial)
                 return None, {"source": "none", "momentum": None}
 
-            # Condition b2: momentum filter — short-term momentum must agree with direction
-            price_5s_ago = self._get_price_n_seconds_ago(5)
-            momentum = (live_price - price_5s_ago) if price_5s_ago is not None else None
-            if price_5s_ago is not None:
+            # Condition b2: momentum filter — configured momentum must agree with direction
+            price_momentum_window_ago = self._get_price_n_seconds_ago(momentum_window)
+            momentum = (live_price - price_momentum_window_ago) if price_momentum_window_ago is not None else None
+            if price_momentum_window_ago is not None:
                 if direction == "Up" and momentum < 0:
                     print(
-                        f"[bot] SKIP (momentum): signal=Up but 5s momentum=${momentum:+.2f} (falling)",
+                        f"[bot] SKIP (momentum): signal=Up but {momentum_window:.0f}s momentum=${momentum:+.2f} (falling)",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
@@ -744,16 +765,16 @@ class PaperBot:
                     return None, {"source": "none", "momentum": None}
                 if direction == "Down" and momentum > 0:
                     print(
-                        f"[bot] SKIP (momentum): signal=Down but 5s momentum=${momentum:+.2f} (rising)",
+                        f"[bot] SKIP (momentum): signal=Down but {momentum_window:.0f}s momentum=${momentum:+.2f} (rising)",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
                                       direction=direction, diff=diff_initial,
                                       momentum=momentum, chop_range=chop_range)
                     return None, {"source": "none", "momentum": None}
-                print(f"[bot] momentum OK: 5s=${momentum:+.2f}  direction={direction}", flush=True)
+                print(f"[bot] momentum OK: {momentum_window:.0f}s=${momentum:+.2f}  direction={direction}", flush=True)
             else:
-                print("[bot] SKIP (momentum): no 5s reading", flush=True)
+                print(f"[bot] SKIP (momentum): no {momentum_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_momentum_history", outcome="skipped",
                                   direction=direction, diff=diff_initial, chop_range=chop_range)
                 return None, {"source": "none", "momentum": None}
@@ -770,7 +791,7 @@ class PaperBot:
 
             diff_final = live_price_b - reference_price
             reversed_direction = (diff_final > 0) != (diff_initial > 0)
-            if reversed_direction or abs(diff_final) < REVERSAL_THRESHOLD:
+            if reversed_direction or abs(diff_final) < reversal_threshold:
                 print(
                     f"[bot] SKIP: momentum faded/reversed — "
                     f"initial=${diff_initial:+.2f}  now=${diff_final:+.2f}",
