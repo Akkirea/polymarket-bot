@@ -34,8 +34,9 @@ INITIAL_BALANCE      = db.INITIAL_BALANCE  # keep in sync with db.py
 INITIAL_WALLET_SIZE  = 97.0
 MAX_STAKE_PCT        = 0.02   # half-Kelly at 52% win prob and 0.50 entry
 MIN_STAKE_PCT        = 0.01   # skip smaller signals instead of forcing oversize bets
+LIVE_MIN_ORDER_SIZE  = 1.00   # Polymarket marketable BUY minimum
 MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT
-MIN_STAKE            = INITIAL_WALLET_SIZE * MIN_STAKE_PCT
+MIN_STAKE            = max(LIVE_MIN_ORDER_SIZE, INITIAL_WALLET_SIZE * MIN_STAKE_PCT)
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
 MIN_PREV_MOVE        = 25.0   # USD — skip if the reference window moved less than this
 # Data-validated allowed hours (ET = UTC-4). All others blocked.
@@ -1032,12 +1033,36 @@ class PaperBot:
                     from . import live_clob
                     live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
                     live_cap = min(CROWD_MAX, entry_price + live_slippage)
-                    live_order = await live_clob.place_order(
-                        market,
-                        side,
-                        stake,
-                        max_fill_price=live_cap,
-                    )
+                    live_retries = max(0, int(os.getenv("LIVE_FAK_RETRIES", "1")))
+                    live_retry_delay = max(0.0, float(os.getenv("LIVE_FAK_RETRY_DELAY_SEC", "1.0")))
+
+                    for attempt in range(live_retries + 1):
+                        try:
+                            live_order = await live_clob.place_order(
+                                market,
+                                side,
+                                stake,
+                                max_fill_price=live_cap,
+                            )
+                            break
+                        except Exception as exc:
+                            order_type = os.getenv("LIVE_ORDER_TYPE", "FAK").upper()
+                            no_fak_match = "no orders found to match with FAK order" in str(exc)
+                            can_retry = order_type == "FAK" and no_fak_match and attempt < live_retries
+                            if not can_retry:
+                                raise
+                            print(
+                                f"[bot] LIVE: FAK no-fill for {slug}; retrying "
+                                f"{attempt + 1}/{live_retries} in {live_retry_delay:.1f}s "
+                                f"at cap={live_cap:.4f}",
+                                flush=True,
+                            )
+                            if live_retry_delay:
+                                await asyncio.sleep(live_retry_delay)
+
+                    if live_order is None:
+                        raise RuntimeError("live retry loop exited without an order")
+
                     self.live_balance -= live_order["stake"]
                     print(
                         f"[bot] LIVE: filled orderID={live_order['order_id']}  "
