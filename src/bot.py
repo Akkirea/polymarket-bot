@@ -65,6 +65,8 @@ BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's
 MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research shadows
 SHADOW_MAX_FOLLOW_PRICE = 0.67
+LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
+LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
 FADE_SHADOW_WINDOW   = (75, 240)
 FADE_CROWD_PRICE     = 0.75
@@ -395,6 +397,24 @@ class PaperBot:
             )
             if market.get("_sz_live_enabled", True):
                 await self._record_research_shadows(market, end_ts, seconds_remaining, hour_et, markets)
+
+            if (
+                LAG_FOLLOW_LIVE_ENABLED
+                and market.get("_sz_live_enabled", True)
+                and slug.startswith("btc-updown-5m-")
+                and in_main_window
+                and slug not in self._entered_slugs
+            ):
+                opened_lag_follow = await self._maybe_open_lag_follow_live(
+                    market=market,
+                    end_ts=end_ts,
+                    start_ts=start_ts,
+                    seconds_remaining=seconds_remaining,
+                    hour_et=hour_et,
+                )
+                if opened_lag_follow:
+                    break
+
             # ── configured reversal window per market family
             if ((in_early_live_window or in_main_window or in_volume_retry_window)
                     and slug not in self._entered_slugs):
@@ -833,6 +853,73 @@ class PaperBot:
             f"early live confirmed: price={side_price:.3f}, diff=${diff:+.2f}, "
             f"10s=${momentum_10:+.2f}, 30s=${momentum_30:+.2f}"
         )
+
+    async def _maybe_open_lag_follow_live(
+        self,
+        market: dict,
+        end_ts: float,
+        start_ts: Optional[float],
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> bool:
+        """Promote the validated btc5-lag-follow-shadow rule into conservative live execution."""
+        slug = market["slug"]
+        volume = float(market.get("volume") or 0.0)
+        if volume < MIN_MARKET_VOLUME:
+            return False
+
+        reference_price = self._market_start_prices.get(slug)
+        if reference_price is None:
+            return False
+
+        live_price, live_source = await self._get_signal_price()
+        if live_price is None:
+            return False
+
+        diff = live_price - reference_price
+        if abs(diff) < PRICE_DIFF_THRESHOLD:
+            return False
+
+        side = "Up" if diff > 0 else "Down"
+        side_price = _side_price(market, side)
+        live_max_price = min(LAG_FOLLOW_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
+        if not (CROWD_MIN <= side_price <= live_max_price):
+            return False
+
+        price_10s_ago = self._get_price_n_seconds_ago(10)
+        if price_10s_ago is None:
+            return False
+        momentum_10 = live_price - price_10s_ago
+        if side == "Up" and momentum_10 < 0:
+            return False
+        if side == "Down" and momentum_10 > 0:
+            return False
+
+        self._market_start_prices.pop(slug, None)
+        self._market_start_sources.pop(slug, None)
+        self._entered_slugs.add(slug)
+        self._volume_retry_slugs.discard(slug)
+        print(
+            f"[bot] LAG-FOLLOW LIVE SIGNAL PASSED: {side} on {slug} "
+            f"price={side_price:.3f} diff=${diff:+.2f} 10s=${momentum_10:+.2f} "
+            f"secs={seconds_remaining:.1f} source={live_source}",
+            flush=True,
+        )
+        await self._open_position(
+            slug,
+            side,
+            side_price,
+            end_ts,
+            start_ts=start_ts,
+            price_to_beat=reference_price,
+            diff_at_entry=diff,
+            seconds_remaining=seconds_remaining,
+            strategy="btc5-lag-follow-live",
+            hour_et=hour_et,
+            market=market,
+            live_enabled=True,
+        )
+        return True
 
     async def _record_research_shadows(
         self,
