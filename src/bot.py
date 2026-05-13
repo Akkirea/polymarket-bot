@@ -497,6 +497,13 @@ class PaperBot:
                 official_price_to_beat = _extract_official_price_to_beat(market)
                 local_price_to_beat = self._market_start_prices.get(slug)
                 local_price_source = self._market_start_sources.get(slug)
+                if bool(market.get("_sz_live_enabled", True)) and official_price_to_beat is None:
+                    print(
+                        f"[bot] SKIP: {slug} official priceToBeat unavailable; "
+                        "not opening live/paper reversal entry on local proxy",
+                        flush=True,
+                    )
+                    continue
                 price_to_beat = official_price_to_beat or local_price_to_beat
                 price_source = "polymarket-official" if official_price_to_beat is not None else local_price_source
                 live_reference_ok = official_price_to_beat is not None
