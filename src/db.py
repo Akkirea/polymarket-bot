@@ -412,12 +412,21 @@ def settle_live_order_attempts(
 
 
 def get_live_order_attempts(limit: int = 100) -> list:
-    """Return recent failed live attempts for dashboard display."""
+    """Return recent failed live opportunities, collapsed to the latest attempt per market/side/strategy."""
     conn = get_connection()
     rows = conn.execute(
-        """SELECT *
-             FROM live_order_attempts
-            ORDER BY attempted_at DESC
+        """SELECT loa.*
+             FROM live_order_attempts loa
+             JOIN (
+                   SELECT market_slug, side, COALESCE(strategy, '') AS strategy_key, MAX(attempted_at) AS latest_at
+                     FROM live_order_attempts
+                    GROUP BY market_slug, side, COALESCE(strategy, '')
+                  ) latest
+               ON latest.market_slug = loa.market_slug
+              AND latest.side = loa.side
+              AND latest.strategy_key = COALESCE(loa.strategy, '')
+              AND latest.latest_at = loa.attempted_at
+            ORDER BY loa.attempted_at DESC
             LIMIT %s""",
         (limit,),
     ).fetchall()
@@ -435,22 +444,36 @@ def get_live_order_attempts(limit: int = 100) -> list:
 
 
 def get_live_order_attempt_summary() -> dict:
-    """Aggregate failed live attempts by reason/would-have-won for dashboard cards."""
+    """Aggregate missed live opportunities by latest attempt per market/side/strategy."""
     conn = get_connection()
-    total = conn.execute("SELECT COUNT(*) AS n FROM live_order_attempts").fetchone()
+    deduped_sql = """
+        WITH latest AS (
+            SELECT market_slug, side, COALESCE(strategy, '') AS strategy_key, MAX(attempted_at) AS latest_at
+              FROM live_order_attempts
+             GROUP BY market_slug, side, COALESCE(strategy, '')
+        )
+        SELECT loa.*
+          FROM live_order_attempts loa
+          JOIN latest
+            ON latest.market_slug = loa.market_slug
+           AND latest.side = loa.side
+           AND latest.strategy_key = COALESCE(loa.strategy, '')
+           AND latest.latest_at = loa.attempted_at
+    """
+    total = conn.execute(f"SELECT COUNT(*) AS n FROM ({deduped_sql}) deduped").fetchone()
     resolved = conn.execute(
-        """SELECT
+        f"""SELECT
                COUNT(*) AS n,
                COALESCE(SUM(CASE WHEN would_have_won = 1 THEN 1 ELSE 0 END), 0) AS wins,
                COALESCE(SUM(CASE WHEN would_have_won = 0 THEN 1 ELSE 0 END), 0) AS losses,
                COALESCE(SUM(hypothetical_pnl), 0) AS hypothetical_pnl
-             FROM live_order_attempts
+             FROM ({deduped_sql}) deduped
             WHERE outcome IS NOT NULL
               AND outcome != 'unresolved'"""
     ).fetchone()
     by_reason = conn.execute(
-        """SELECT reason, COUNT(*) AS count
-             FROM live_order_attempts
+        f"""SELECT reason, COUNT(*) AS count
+             FROM ({deduped_sql}) deduped
             GROUP BY reason
             ORDER BY count DESC
             LIMIT 10"""
