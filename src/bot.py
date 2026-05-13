@@ -69,6 +69,10 @@ MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research s
 SHADOW_MAX_FOLLOW_PRICE = 0.67
 LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
 RTDS_PREVCLOSE_SHADOW_STRATEGY = "btc5-rtds-prevclose-shadow"
+RTDS_LIVE_FALLBACK_SOURCE = "rtds-live-fallback"
+RTDS_LIVE_FALLBACK_ENABLED = os.getenv("RTDS_LIVE_FALLBACK_ENABLED", "true").lower() == "true"
+RTDS_LIVE_UP_DIFF = float(os.getenv("RTDS_LIVE_UP_DIFF", "60"))
+RTDS_LIVE_DOWN_DIFF = float(os.getenv("RTDS_LIVE_DOWN_DIFF", "80"))
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
@@ -521,18 +525,32 @@ class PaperBot:
                     continue
                 official_price_to_beat = _extract_official_price_to_beat(market)
                 prev_final_price_to_beat, prev_final_source = self._previous_final_reference(market)
+                rtds_price_to_beat, rtds_source = (None, None)
+                if official_price_to_beat is None and prev_final_price_to_beat is None:
+                    rtds_price_to_beat, rtds_source = self._rtds_live_fallback_reference(market)
                 local_price_to_beat = self._market_start_prices.get(slug)
                 local_price_source = self._market_start_sources.get(slug)
-                if bool(market.get("_sz_live_enabled", True)) and official_price_to_beat is None and prev_final_price_to_beat is None:
+                if (
+                    bool(market.get("_sz_live_enabled", True))
+                    and official_price_to_beat is None
+                    and prev_final_price_to_beat is None
+                    and rtds_price_to_beat is None
+                ):
                     print(
                         f"[bot] SKIP: {slug} official priceToBeat and prev-finalPrice unavailable; "
-                        "not opening live/paper reversal entry on local proxy",
+                        "RTDS fallback unavailable; not opening live/paper reversal entry on local proxy",
                         flush=True,
                     )
                     continue
                 if bool(market.get("_sz_live_enabled", True)):
-                    price_to_beat = official_price_to_beat or prev_final_price_to_beat
-                    price_source = "polymarket-official" if official_price_to_beat is not None else prev_final_source
+                    price_to_beat = official_price_to_beat or prev_final_price_to_beat or rtds_price_to_beat
+                    price_source = (
+                        "polymarket-official"
+                        if official_price_to_beat is not None
+                        else prev_final_source
+                        if prev_final_price_to_beat is not None
+                        else rtds_source
+                    )
                 else:
                     price_to_beat = official_price_to_beat or prev_final_price_to_beat or local_price_to_beat
                     price_source = (
@@ -542,7 +560,11 @@ class PaperBot:
                         if prev_final_price_to_beat is not None
                         else local_price_source
                     )
-                live_reference_ok = official_price_to_beat is not None or prev_final_price_to_beat is not None
+                live_reference_ok = (
+                    official_price_to_beat is not None
+                    or prev_final_price_to_beat is not None
+                    or rtds_price_to_beat is not None
+                )
                 target_label = (
                     f"{EARLY_LIVE_WINDOW_LO}-{EARLY_LIVE_WINDOW_HI}s early-live"
                     if in_early_live_window else f"{entry_lo}-{entry_hi}s"
@@ -553,6 +575,8 @@ class PaperBot:
                     f"(target {target_label})  ref={ref_label}",
                     flush=True,
                 )
+                if price_source == RTDS_LIVE_FALLBACK_SOURCE and not shadow_mode:
+                    strategy = f"{strategy}-rtds-fallback"
                 direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
 
                 if direction is None:
@@ -809,6 +833,30 @@ class PaperBot:
             return float(price), f"polymarket-rtds-{symbol}-prev-close"
         return None, None
 
+    def _rtds_live_fallback_reference(self, market: dict) -> tuple[Optional[float], Optional[str]]:
+        """Use RTDS as a live fallback only when the later edge gate is large."""
+        if not RTDS_LIVE_FALLBACK_ENABLED:
+            return None, None
+        if not bool(market.get("_sz_live_enabled", True)):
+            return None, None
+        slug = market.get("slug", "")
+        if not slug.startswith("btc-updown-5m-"):
+            return None, None
+        price, _source = self._rtds_previous_close_reference(market)
+        if price is None:
+            return None, None
+        return float(price), RTDS_LIVE_FALLBACK_SOURCE
+
+    def _rtds_live_edge_ok(self, diff: float) -> tuple[bool, str]:
+        """Asymmetric fallback gate. RTDS samples have been high vs official beat."""
+        if diff >= RTDS_LIVE_UP_DIFF:
+            return True, f"Up RTDS edge ${diff:+.2f} >= ${RTDS_LIVE_UP_DIFF:.0f}"
+        if diff <= -RTDS_LIVE_DOWN_DIFF:
+            return True, f"Down RTDS edge ${diff:+.2f} <= -${RTDS_LIVE_DOWN_DIFF:.0f}"
+        if diff >= 0:
+            return False, f"Up RTDS edge ${diff:+.2f} < ${RTDS_LIVE_UP_DIFF:.0f}"
+        return False, f"Down RTDS edge ${diff:+.2f} > -${RTDS_LIVE_DOWN_DIFF:.0f}"
+
     def _record_rtds_reference_samples(self, market: dict) -> None:
         """Store RTDS ticks around 5m open so settlement can reveal best timing offset."""
         slug = market.get("slug", "")
@@ -1042,9 +1090,11 @@ class PaperBot:
         if reference_price is None:
             reference_price, reference_source = self._previous_final_reference(market)
         if reference_price is None:
+            reference_price, reference_source = self._rtds_live_fallback_reference(market)
+        if reference_price is None:
             print(
                 f"[bot] LAG-FOLLOW LIVE SKIP: {slug} official priceToBeat and prev-finalPrice unavailable; "
-                "not risking live on local proxy",
+                "RTDS fallback unavailable; not risking live on local proxy",
                 flush=True,
             )
             return False
@@ -1054,10 +1104,16 @@ class PaperBot:
             return False
 
         diff = live_price - reference_price
-        if abs(diff) < PRICE_DIFF_THRESHOLD:
+        side = "Up" if diff > 0 else "Down"
+        if reference_source == RTDS_LIVE_FALLBACK_SOURCE:
+            edge_ok, edge_reason = self._rtds_live_edge_ok(diff)
+            if not edge_ok:
+                print(f"[bot] LAG-FOLLOW RTDS LIVE SKIP: {slug} {edge_reason}", flush=True)
+                return False
+            print(f"[bot] LAG-FOLLOW RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
+        elif abs(diff) < PRICE_DIFF_THRESHOLD:
             return False
 
-        side = "Up" if diff > 0 else "Down"
         side_price = _side_price(market, side)
         live_max_price = min(LAG_FOLLOW_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
         if not (CROWD_MIN <= side_price <= live_max_price):
@@ -1082,6 +1138,9 @@ class PaperBot:
             f"secs={seconds_remaining:.1f} source={live_source} ref={reference_source}",
             flush=True,
         )
+        strategy = "btc5-lag-follow-live"
+        if reference_source == RTDS_LIVE_FALLBACK_SOURCE:
+            strategy = "btc5-lag-follow-live-rtds-fallback"
         await self._open_position(
             slug,
             side,
@@ -1091,7 +1150,7 @@ class PaperBot:
             price_to_beat=reference_price,
             diff_at_entry=diff,
             seconds_remaining=seconds_remaining,
-            strategy="btc5-lag-follow-live",
+            strategy=strategy,
             hour_et=hour_et,
             market=market,
             live_enabled=True,
@@ -1401,9 +1460,10 @@ class PaperBot:
         prev_final  = self._final_price_cache.get(prev_slug)
         has_official_reference = price_source == "polymarket-official" and price_to_beat is not None
         has_prev_final_reference = price_source == "prev-finalPrice" and price_to_beat is not None
-        if live_enabled and not (has_official_reference or has_prev_final_reference):
+        has_rtds_live_fallback = price_source == RTDS_LIVE_FALLBACK_SOURCE and price_to_beat is not None
+        if live_enabled and not (has_official_reference or has_prev_final_reference or has_rtds_live_fallback):
             print(
-                f"[bot] SKIP: {slug} live-enabled market has no official/prev-final reference; "
+                f"[bot] SKIP: {slug} live-enabled market has no official/prev-final/RTDS-fallback reference; "
                 "local proxy disabled",
                 flush=True,
             )
@@ -1416,6 +1476,9 @@ class PaperBot:
         elif has_prev_final_reference:
             reference_price = price_to_beat
             ref_source = "prev-finalPrice"
+        elif has_rtds_live_fallback:
+            reference_price = price_to_beat
+            ref_source = RTDS_LIVE_FALLBACK_SOURCE
         elif prev_final is not None:
             reference_price = prev_final
             ref_source = "prev-finalPrice"
@@ -1459,7 +1522,15 @@ class PaperBot:
                 flush=True,
             )
             direction = "Up" if diff_initial > 0 else "Down"
-            if abs(diff_initial) < diff_threshold:
+            if has_rtds_live_fallback:
+                edge_ok, edge_reason = self._rtds_live_edge_ok(diff_initial)
+                if not edge_ok:
+                    print(f"[bot] SKIP RTDS LIVE: {slug} {edge_reason}", flush=True)
+                    db.log_bot_signal(slug, filter_hit="rtds_live_edge", outcome="skipped",
+                                      direction=direction, diff=diff_initial)
+                    return None, {"source": "none", "momentum": None}
+                print(f"[bot] RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
+            elif abs(diff_initial) < diff_threshold:
                 print(
                     f"[bot] SKIP: {slug} {direction} diff ${abs(diff_initial):.2f} "
                     f"< threshold ${diff_threshold:.0f}",
@@ -1566,6 +1637,14 @@ class PaperBot:
                                   direction=direction, diff=diff_initial,
                                   momentum=momentum, chop_range=chop_range)
                 return None, {"source": "none", "momentum": None}
+            if has_rtds_live_fallback:
+                edge_ok, edge_reason = self._rtds_live_edge_ok(diff_final)
+                if not edge_ok:
+                    print(f"[bot] SKIP RTDS LIVE: {slug} post-guard {edge_reason}", flush=True)
+                    db.log_bot_signal(slug, filter_hit="rtds_live_reversal_edge", outcome="skipped",
+                                      direction=direction, diff=diff_initial,
+                                      momentum=momentum, chop_range=chop_range)
+                    return None, {"source": "none", "momentum": None}
 
             print(
                 f"[bot] ENTRY: {direction}  diff_initial=${diff_initial:+.2f}  "
