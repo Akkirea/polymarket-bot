@@ -276,7 +276,25 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_live_attempts_slug ON live_order_attempts(market_slug);
         CREATE INDEX IF NOT EXISTS idx_live_attempts_status ON live_order_attempts(status);
-        CREATE INDEX IF NOT EXISTS idx_live_attempts_attempted ON live_order_attempts(attempted_at)
+        CREATE INDEX IF NOT EXISTS idx_live_attempts_attempted ON live_order_attempts(attempted_at);
+
+        CREATE TABLE IF NOT EXISTS rtds_reference_samples (
+            id                   {_PK},
+            market_slug          TEXT NOT NULL,
+            market_start_ts      REAL NOT NULL,
+            sample_ts            REAL NOT NULL,
+            offset_sec           REAL NOT NULL,
+            price                REAL NOT NULL,
+            symbol               TEXT,
+            official_price_to_beat REAL,
+            error                REAL,
+            created_at           TEXT NOT NULL,
+            resolved_at          TEXT,
+            UNIQUE(market_slug, sample_ts, symbol)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_rtds_samples_slug ON rtds_reference_samples(market_slug);
+        CREATE INDEX IF NOT EXISTS idx_rtds_samples_error ON rtds_reference_samples(error)
     """)
     conn.commit()
 
@@ -314,6 +332,89 @@ def init_db():
                 pass  # column already exists
 
     conn.close()
+
+
+def log_rtds_reference_samples(market_slug: str, market_start_ts: float, samples: list[tuple[float, float, str]]) -> int:
+    """Persist RTDS ticks around a market open for later priceToBeat comparison."""
+    if not samples:
+        return 0
+    conn = get_connection()
+    inserted = 0
+    sql = (
+        """INSERT INTO rtds_reference_samples
+              (market_slug, market_start_ts, sample_ts, offset_sec, price, symbol, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (market_slug, sample_ts, symbol) DO NOTHING"""
+        if _USE_PG else
+        """INSERT OR IGNORE INTO rtds_reference_samples
+              (market_slug, market_start_ts, sample_ts, offset_sec, price, symbol, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)"""
+    )
+    now = datetime.utcnow().isoformat()
+    for sample_ts, price, symbol in samples:
+        cur = conn.execute(
+            sql,
+            (
+                market_slug,
+                float(market_start_ts),
+                float(sample_ts),
+                round(float(sample_ts) - float(market_start_ts), 3),
+                round(float(price), 8),
+                symbol,
+                now,
+            ),
+        )
+        if getattr(cur, "rowcount", 0) and cur.rowcount > 0:
+            inserted += 1
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def settle_rtds_reference_samples(market_slug: str, official_price_to_beat: Optional[float]) -> int:
+    """Attach official priceToBeat to RTDS samples and calculate sample error."""
+    if official_price_to_beat is None:
+        return 0
+    conn = get_connection()
+    cur = conn.execute(
+        """UPDATE rtds_reference_samples
+              SET official_price_to_beat = %s,
+                  error = price - %s,
+                  resolved_at = %s
+            WHERE market_slug = %s
+              AND official_price_to_beat IS NULL""",
+        (
+            round(float(official_price_to_beat), 8),
+            round(float(official_price_to_beat), 8),
+            datetime.utcnow().isoformat(),
+            market_slug,
+        ),
+    )
+    count = getattr(cur, "rowcount", 0) or 0
+    conn.commit()
+    conn.close()
+    return int(count)
+
+
+def get_rtds_reference_comparisons(limit: int = 200, market_slug: Optional[str] = None) -> list:
+    """Return RTDS samples with official priceToBeat/error, closest-to-open first per slug."""
+    limit = max(1, min(int(limit), 1000))
+    conn = get_connection()
+    where = ""
+    params: list = []
+    if market_slug:
+        where = "WHERE market_slug = %s"
+        params.append(market_slug)
+    rows = conn.execute(
+        f"""SELECT *
+              FROM rtds_reference_samples
+              {where}
+             ORDER BY market_start_ts DESC, ABS(offset_sec) ASC, sample_ts ASC
+             LIMIT %s""",
+        tuple(params + [limit]),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def log_live_order_attempt(attempt: dict):
@@ -1034,49 +1135,54 @@ def settle_unresolved_shadow_trade(
     resolution_price: Optional[float] = None,
     poly_price_to_beat: Optional[float] = None,
 ) -> Optional[dict]:
-    """Settle one unresolved shadow row without touching paper/live accounting."""
+    """Settle all unresolved shadow rows for a slug without touching paper/live accounting."""
     conn = get_connection()
-    row = conn.execute(
+    rows = conn.execute(
         """SELECT id, side, size, entry_price
              FROM bot_trades
             WHERE market_slug = %s
               AND outcome = 'unresolved'
               AND mode = 'shadow'
-            ORDER BY opened_at DESC
-            LIMIT 1""",
+            ORDER BY opened_at DESC""",
         (market_slug,),
-    ).fetchone()
-    if not row:
+    ).fetchall()
+    if not rows:
         conn.close()
         return None
 
-    side = row["side"]
-    size = float(row["size"] or 0.0)
-    entry_price = float(row["entry_price"] or 0.5)
-    won = side == winner
-    pnl = size * (1.0 / entry_price - 1.0) if won else -size
-
-    conn.execute(
-        """UPDATE bot_trades
-              SET outcome = %s,
-                  pnl = %s,
-                  resolution_price = COALESCE(%s, resolution_price),
-                  poly_price_to_beat = COALESCE(%s, poly_price_to_beat),
-                  closed_at = %s
-            WHERE id = %s
-              AND mode = 'shadow'""",
-        (
-            winner,
-            round(pnl, 2),
-            round(resolution_price, 2) if resolution_price is not None else None,
-            round(poly_price_to_beat, 2) if poly_price_to_beat is not None else None,
-            datetime.utcnow().isoformat(),
-            row["id"],
-        ),
-    )
+    total_pnl = 0.0
+    won_count = 0
+    closed_at = datetime.utcnow().isoformat()
+    for row in rows:
+        side = row["side"]
+        size = float(row["size"] or 0.0)
+        entry_price = float(row["entry_price"] or 0.5)
+        won = side == winner
+        pnl = size * (1.0 / entry_price - 1.0) if won else -size
+        total_pnl += pnl
+        if won:
+            won_count += 1
+        conn.execute(
+            """UPDATE bot_trades
+                  SET outcome = %s,
+                      pnl = %s,
+                      resolution_price = COALESCE(%s, resolution_price),
+                      poly_price_to_beat = COALESCE(%s, poly_price_to_beat),
+                      closed_at = %s
+                WHERE id = %s
+                  AND mode = 'shadow'""",
+            (
+                winner,
+                round(pnl, 2),
+                round(resolution_price, 2) if resolution_price is not None else None,
+                round(poly_price_to_beat, 2) if poly_price_to_beat is not None else None,
+                closed_at,
+                row["id"],
+            ),
+        )
     conn.commit()
     conn.close()
-    return {"won": won, "pnl": round(pnl, 2)}
+    return {"count": len(rows), "won": won_count, "pnl": round(total_pnl, 2)}
 
 
 def get_top_whale_wallets(limit: int = 5) -> list:

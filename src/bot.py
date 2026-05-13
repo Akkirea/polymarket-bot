@@ -428,6 +428,9 @@ class PaperBot:
                 else:
                     print(f"[bot] BTC price unavailable — cannot cache start price for {slug}", flush=True)
 
+            if bool(market.get("_sz_live_enabled", True)) and slug.startswith("btc-updown-5m-"):
+                self._record_rtds_reference_samples(market)
+
             entry_lo, entry_hi = market.get("_sz_entry_window", (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI))
             in_main_window = entry_lo <= seconds_remaining <= entry_hi
             early_live_enabled = (
@@ -805,6 +808,20 @@ class PaperBot:
             symbol = self._rtds_feed.current_symbol or "btc"
             return float(price), f"polymarket-rtds-{symbol}-prev-close"
         return None, None
+
+    def _record_rtds_reference_samples(self, market: dict) -> None:
+        """Store RTDS ticks around 5m open so settlement can reveal best timing offset."""
+        slug = market.get("slug", "")
+        start_ts = _extract_start_ts(slug)
+        if start_ts is None:
+            return
+        samples = self._rtds_feed.get_ticks_around(float(start_ts), radius=10.0)
+        inserted = db.log_rtds_reference_samples(slug, float(start_ts), samples)
+        if inserted:
+            print(
+                f"[bot] RTDS samples: stored {inserted} tick(s) around open for {slug}",
+                flush=True,
+            )
 
     async def _collect_final_prices(self) -> None:
         """Each tick: fetch finalPrice for recent closed BTC short-horizon markets.
@@ -1674,7 +1691,7 @@ class PaperBot:
                     if settled:
                         print(
                             f"[bot] shadow backfill: {slug} settled → {winner} "
-                            f"pnl=${settled['pnl']:+.2f}",
+                            f"rows={settled.get('count', 1)} pnl=${settled['pnl']:+.2f}",
                             flush=True,
                         )
                     return
@@ -2134,10 +2151,10 @@ class PaperBot:
                 poly_price_to_beat=poly_price_to_beat,
             )
             if settled:
-                settled_count += 1
+                settled_count += int(settled.get("count", 1))
                 print(
                     f"[bot] shadow reconcile: {slug} settled → {winner} "
-                    f"pnl=${settled['pnl']:+.2f}",
+                    f"rows={settled.get('count', 1)} pnl=${settled['pnl']:+.2f}",
                     flush=True,
                 )
         if settled_count:
@@ -2202,6 +2219,13 @@ class PaperBot:
 
         if final_price is not None and price_to_beat is not None:
             winner = "Up" if final_price >= price_to_beat else "Down"
+            sample_count = db.settle_rtds_reference_samples(slug, price_to_beat)
+            if sample_count:
+                print(
+                    f"[bot] RTDS samples: compared {sample_count} tick(s) for {slug} "
+                    f"against priceToBeat=${price_to_beat:,.2f}",
+                    flush=True,
+                )
             print(
                 f"[bot] resolved via eventMetadata: {slug} → {winner}  "
                 f"finalPrice={final_price:.2f}  priceToBeat={price_to_beat:.2f}",

@@ -25,7 +25,7 @@ class PolymarketRtdsPriceFeed:
         self.last_update: Optional[float] = None
         self.source: str = "polymarket-rtds"
         self.current_symbol: Optional[str] = None
-        self._price_history: deque = deque(maxlen=1200)  # ~10 min at up to a few ticks/sec
+        self._price_history: deque = deque(maxlen=1200)  # [(unix_ts, price, symbol)]
         self._running = False
         self._ws = None
 
@@ -38,13 +38,23 @@ class PolymarketRtdsPriceFeed:
         if not self._price_history:
             return None
 
-        closest_ts, closest_price = min(
+        closest_ts, closest_price, _symbol = min(
             self._price_history,
             key=lambda item: abs(item[0] - window_start_ts),
         )
         if abs(closest_ts - window_start_ts) > 5.0:
             return None
         return float(closest_price)
+
+    def get_ticks_around(self, center_ts: float, radius: float = 10.0) -> list[tuple[float, float, str]]:
+        """Return RTDS BTC ticks within +/- radius seconds of a timestamp."""
+        lo = center_ts - radius
+        hi = center_ts + radius
+        return [
+            (float(ts), float(price), str(symbol))
+            for ts, price, symbol in self._price_history
+            if lo <= float(ts) <= hi
+        ]
 
     async def connect(self):
         """Connect to Polymarket RTDS and stream BTC prices."""
@@ -140,7 +150,7 @@ class PolymarketRtdsPriceFeed:
         self.current_price = price
         self.current_symbol = symbol
         self.last_update = now
-        self._price_history.append((ts, price))
+        self._price_history.append((ts, price, symbol))
 
         cutoff = now - 600
         while self._price_history and self._price_history[0][0] < cutoff:

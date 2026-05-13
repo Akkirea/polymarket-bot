@@ -441,6 +441,15 @@ def get_live_attempt_summary():
     return {"ok": True, "summary": db.get_live_order_attempt_summary()}
 
 
+@app.get("/api/bot/rtds-reference-comparisons")
+def get_rtds_reference_comparisons(limit: int = 200, market_slug: str | None = None):
+    """RTDS ticks around market open compared with eventual official priceToBeat."""
+    return {
+        "ok": True,
+        "samples": db.get_rtds_reference_comparisons(limit=limit, market_slug=market_slug),
+    }
+
+
 @app.get("/api/markets")
 async def get_markets():
     """Configured markets plus current/next short-horizon Polymarket windows when available."""
