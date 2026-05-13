@@ -184,6 +184,43 @@ def token_for_side(market: dict, side: str) -> str:
     raise LiveClobError(f"Could not find CLOB token id for side={side}")
 
 
+def _book_side(book: Any, side: str) -> list:
+    if isinstance(book, dict):
+        return book.get(side, []) or []
+    return getattr(book, side, []) or []
+
+
+def _level_value(level: Any, key: str) -> Optional[float]:
+    raw = level.get(key) if isinstance(level, dict) else getattr(level, key, None)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _inspect_buy_liquidity(book: Any, max_price: float) -> dict:
+    asks = []
+    for level in _book_side(book, "asks"):
+        price = _level_value(level, "price")
+        size = _level_value(level, "size")
+        if price is None or size is None or size <= 0:
+            continue
+        asks.append({"price": price, "size": size, "usdc": price * size})
+
+    asks.sort(key=lambda item: item["price"])
+    fillable = [item for item in asks if item["price"] <= max_price]
+    return {
+        "ask_count": len(asks),
+        "best_ask": asks[0]["price"] if asks else None,
+        "fillable_ask_count": len(fillable),
+        "fillable_shares": sum(item["size"] for item in fillable),
+        "fillable_usdc": sum(item["usdc"] for item in fillable),
+        "max_price": max_price,
+    }
+
+
 async def diagnose() -> dict:
     """
     Try every known signature_type and funder so we can see
@@ -268,6 +305,24 @@ async def place_order(
     min_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
     max_price = float(os.getenv("MAX_LIVE_PRICE", "0.70"))
     effective_max_price = min(max_price, max_fill_price) if max_fill_price is not None else max_price
+    min_fill_usdc = float(os.getenv("LIVE_MIN_FILL_USDC", "1.00"))
+
+    book = client.get_order_book(token_id)
+    liquidity = _inspect_buy_liquidity(book, effective_max_price)
+    if liquidity["best_ask"] is None:
+        raise LiveClobError(f"No asks in order book for {side} token")
+    if liquidity["best_ask"] > effective_max_price:
+        raise LiveClobError(
+            f"Best ask {liquidity['best_ask']:.4f} above live cap={effective_max_price:.4f}; "
+            f"ask_count={liquidity['ask_count']}"
+        )
+    required_fill = min(stake, min_fill_usdc) if order_type_name == "FAK" else stake
+    if liquidity["fillable_usdc"] + 1e-9 < required_fill:
+        raise LiveClobError(
+            f"Only ${liquidity['fillable_usdc']:.2f} fillable at cap={effective_max_price:.4f}; "
+            f"need ${required_fill:.2f} minimum fill "
+            f"(best_ask={liquidity['best_ask']:.4f}, fillable_asks={liquidity['fillable_ask_count']})"
+        )
 
     estimated_price = float(
         client.calculate_market_price(token_id, "BUY", stake, order_type)
@@ -325,6 +380,7 @@ async def place_order(
         "order_price": order_price,
         "max_fill_price": effective_max_price,
         "fill_price": fill_price,
+        "orderbook": liquidity,
         "order_id": resp.get("orderID"),
         "tx_hash": (resp.get("transactionsHashes") or [None])[0],
         "response": resp,
