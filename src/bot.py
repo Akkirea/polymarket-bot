@@ -86,6 +86,33 @@ def _round_order_size(amount: float) -> float:
     increment = max(0.01, ORDER_SIZE_INCREMENT)
     return round(math.ceil(amount / increment) * increment, 2)
 
+
+def _extract_official_price_to_beat(market: dict) -> Optional[float]:
+    """Return Polymarket's authoritative beat price when Gamma exposes it."""
+    candidates = [
+        market.get("priceToBeat"),
+        market.get("price_to_beat"),
+    ]
+    events = market.get("events") or []
+    if events:
+        meta = events[0].get("eventMetadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if isinstance(meta, dict):
+            candidates.append(meta.get("priceToBeat"))
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
 MARKET_FAMILIES = [
     {
         "label": "BTC 5m",
@@ -460,8 +487,12 @@ class PaperBot:
                 if self._evaluating:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
                     continue
-                price_to_beat = self._market_start_prices.get(slug)
-                price_source = self._market_start_sources.get(slug)
+                official_price_to_beat = _extract_official_price_to_beat(market)
+                local_price_to_beat = self._market_start_prices.get(slug)
+                local_price_source = self._market_start_sources.get(slug)
+                price_to_beat = official_price_to_beat or local_price_to_beat
+                price_source = "polymarket-official" if official_price_to_beat is not None else local_price_source
+                live_reference_ok = official_price_to_beat is not None
                 target_label = (
                     f"{EARLY_LIVE_WINDOW_LO}-{EARLY_LIVE_WINDOW_HI}s early-live"
                     if in_early_live_window else f"{entry_lo}-{entry_hi}s"
@@ -524,6 +555,12 @@ class PaperBot:
                     f"price={entry_price:.3f}  diff=${diff_at_entry:+.2f}  secs={seconds_remaining:.1f}",
                     flush=True,
                 )
+                if not live_reference_ok:
+                    print(
+                        f"[bot] LIVE DISABLED: {slug} official priceToBeat unavailable; "
+                        "paper only to avoid local-reference mismatch",
+                        flush=True,
+                    )
                 await self._open_position(
                     slug, direction, entry_price, end_ts,
                     start_ts=start_ts,
@@ -533,7 +570,7 @@ class PaperBot:
                     strategy=strategy,
                     hour_et=hour_et,
                     market=market,
-                    live_enabled=bool(market.get("_sz_live_enabled", True)),
+                    live_enabled=bool(market.get("_sz_live_enabled", True)) and live_reference_ok,
                 )
                 break
 
@@ -877,8 +914,13 @@ class PaperBot:
         if volume < MIN_MARKET_VOLUME:
             return False
 
-        reference_price = self._market_start_prices.get(slug)
+        reference_price = _extract_official_price_to_beat(market)
         if reference_price is None:
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} official priceToBeat unavailable; "
+                "not risking live on local proxy",
+                flush=True,
+            )
             return False
 
         live_price, live_source = await self._get_signal_price()
@@ -1082,8 +1124,15 @@ class PaperBot:
         prefix = spec["slug_prefix"] if spec else slug.rsplit("-", 1)[0]
         prev_slug = f"{prefix}-{int(start_ts - interval)}"
         prev_final  = self._final_price_cache.get(prev_slug)
-        reference_price = prev_final if prev_final is not None else price_to_beat
-        ref_source  = "prev-finalPrice" if prev_final is not None else f"{price_source or 'unknown'}-first-sight"
+        has_official_reference = price_source == "polymarket-official" and price_to_beat is not None
+        reference_price = price_to_beat if has_official_reference else prev_final if prev_final is not None else price_to_beat
+        ref_source = (
+            "polymarket-official"
+            if has_official_reference
+            else "prev-finalPrice"
+            if prev_final is not None
+            else f"{price_source or 'unknown'}-first-sight"
+        )
 
         if reference_price is None:
             print(f"[bot] SKIP: {slug} no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
