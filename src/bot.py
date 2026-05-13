@@ -61,6 +61,7 @@ CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 EARLY_LIVE_MAX_PRICE = 0.60  # early entries need better risk/reward than regular entries
 LIVE_MIN_SECONDS_BEFORE_CLOSE = 60.0  # avoid last-minute live fills with collapsed upside
+PREV_FINAL_MAX_AGE_SEC = 600.0  # previous exact market finalPrice can seed the next 5m beat
 BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's 30s/60s checks
 MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research shadows
@@ -178,6 +179,7 @@ class PaperBot:
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows per (slug, strategy)
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
+        self._final_price_cache_at: dict = {}      # {market_slug: unix_ts when finalPrice was fetched}
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._market_start_sources: dict = {}     # slug → source name for cached first-sight price
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
@@ -495,18 +497,29 @@ class PaperBot:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
                     continue
                 official_price_to_beat = _extract_official_price_to_beat(market)
+                prev_final_price_to_beat, prev_final_source = self._previous_final_reference(market)
                 local_price_to_beat = self._market_start_prices.get(slug)
                 local_price_source = self._market_start_sources.get(slug)
-                if bool(market.get("_sz_live_enabled", True)) and official_price_to_beat is None:
+                if bool(market.get("_sz_live_enabled", True)) and official_price_to_beat is None and prev_final_price_to_beat is None:
                     print(
-                        f"[bot] SKIP: {slug} official priceToBeat unavailable; "
+                        f"[bot] SKIP: {slug} official priceToBeat and prev-finalPrice unavailable; "
                         "not opening live/paper reversal entry on local proxy",
                         flush=True,
                     )
                     continue
-                price_to_beat = official_price_to_beat or local_price_to_beat
-                price_source = "polymarket-official" if official_price_to_beat is not None else local_price_source
-                live_reference_ok = official_price_to_beat is not None
+                if bool(market.get("_sz_live_enabled", True)):
+                    price_to_beat = official_price_to_beat or prev_final_price_to_beat
+                    price_source = "polymarket-official" if official_price_to_beat is not None else prev_final_source
+                else:
+                    price_to_beat = official_price_to_beat or prev_final_price_to_beat or local_price_to_beat
+                    price_source = (
+                        "polymarket-official"
+                        if official_price_to_beat is not None
+                        else prev_final_source
+                        if prev_final_price_to_beat is not None
+                        else local_price_source
+                    )
+                live_reference_ok = official_price_to_beat is not None or prev_final_price_to_beat is not None
                 target_label = (
                     f"{EARLY_LIVE_WINDOW_LO}-{EARLY_LIVE_WINDOW_HI}s early-live"
                     if in_early_live_window else f"{entry_lo}-{entry_hi}s"
@@ -712,6 +725,31 @@ class PaperBot:
 
     # ── Signals ────────────────────────────────────────────────────────────────
 
+    def _previous_final_reference(self, market: dict) -> tuple[Optional[float], Optional[str]]:
+        """Use the exact previous interval's Polymarket finalPrice as a live-safe beat fallback."""
+        slug = market.get("slug", "")
+        start_ts = _extract_start_ts(slug)
+        spec = _market_spec_for_slug(slug)
+        if start_ts is None or spec is None:
+            return None, None
+
+        interval = int(spec["interval"])
+        prev_slug = f"{spec['slug_prefix']}-{int(start_ts - interval)}"
+        prev_final = self._final_price_cache.get(prev_slug)
+        cached_at = self._final_price_cache_at.get(prev_slug)
+        if prev_final is None or cached_at is None:
+            return None, None
+
+        age = time.time() - float(cached_at)
+        if age > PREV_FINAL_MAX_AGE_SEC:
+            print(
+                f"[bot] prev-finalPrice stale for {slug}: {prev_slug} age={age:.1f}s",
+                flush=True,
+            )
+            return None, None
+
+        return float(prev_final), "prev-finalPrice"
+
     async def _collect_final_prices(self) -> None:
         """Each tick: fetch finalPrice for recent closed BTC short-horizon markets.
         Cache is keyed by market slug because 5m and 15m markets can share a
@@ -747,6 +785,7 @@ class PaperBot:
                     if meta.get("finalPrice") is not None and slug not in self._final_price_cache:
                         fp = float(meta["finalPrice"])
                         self._final_price_cache[slug] = fp
+                        self._final_price_cache_at[slug] = time.time()
                         print(f"[bot] finalPrice cache: {slug} start_ts={start_ts} → ${fp:,.2f}", flush=True)
 
                 except Exception as exc:
@@ -926,9 +965,12 @@ class PaperBot:
         slug = market["slug"]
 
         reference_price = _extract_official_price_to_beat(market)
+        reference_source = "polymarket-official" if reference_price is not None else None
+        if reference_price is None:
+            reference_price, reference_source = self._previous_final_reference(market)
         if reference_price is None:
             print(
-                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} official priceToBeat unavailable; "
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} official priceToBeat and prev-finalPrice unavailable; "
                 "not risking live on local proxy",
                 flush=True,
             )
@@ -964,7 +1006,7 @@ class PaperBot:
         print(
             f"[bot] LAG-FOLLOW LIVE SIGNAL PASSED: {side} on {slug} "
             f"price={side_price:.3f} diff=${diff:+.2f} 10s=${momentum_10:+.2f} "
-            f"secs={seconds_remaining:.1f} source={live_source}",
+            f"secs={seconds_remaining:.1f} source={live_source} ref={reference_source}",
             flush=True,
         )
         await self._open_position(
