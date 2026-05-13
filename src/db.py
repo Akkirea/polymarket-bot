@@ -26,6 +26,7 @@ if _USE_PG:
 
 # Primary-key column definition differs between the two engines
 _PK = "SERIAL PRIMARY KEY" if _USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+_FLOAT = "DOUBLE PRECISION" if _USE_PG else "REAL"
 
 # INSERT-ignore syntax differs; resolved once at module load
 _INSERT_WHALE_TRADE = (
@@ -281,13 +282,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS rtds_reference_samples (
             id                   {_PK},
             market_slug          TEXT NOT NULL,
-            market_start_ts      REAL NOT NULL,
-            sample_ts            REAL NOT NULL,
-            offset_sec           REAL NOT NULL,
-            price                REAL NOT NULL,
+            market_start_ts      {_FLOAT} NOT NULL,
+            sample_ts            {_FLOAT} NOT NULL,
+            offset_sec           {_FLOAT} NOT NULL,
+            price                {_FLOAT} NOT NULL,
             symbol               TEXT,
-            official_price_to_beat REAL,
-            error                REAL,
+            official_price_to_beat {_FLOAT},
+            error                {_FLOAT},
             created_at           TEXT NOT NULL,
             resolved_at          TEXT,
             UNIQUE(market_slug, sample_ts, symbol)
@@ -330,6 +331,21 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass  # column already exists
+
+    if _USE_PG:
+        for col in [
+            "market_start_ts",
+            "sample_ts",
+            "offset_sec",
+            "price",
+            "official_price_to_beat",
+            "error",
+        ]:
+            conn.execute(
+                f"ALTER TABLE rtds_reference_samples "
+                f"ALTER COLUMN {col} TYPE DOUBLE PRECISION USING {col}::double precision"
+            )
+        conn.commit()
 
     conn.close()
 
