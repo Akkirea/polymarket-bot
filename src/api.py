@@ -66,6 +66,11 @@ SHADOW_FAMILIES = {
         "slug_like": "btc-updown-5m-%",
         "strategy": "btc5-local-prevclose-shadow",
     },
+    "btc5_rtds_prevclose": {
+        "label": "BTC 5m RTDS Prev Close",
+        "slug_like": "btc-updown-5m-%",
+        "strategy": "btc5-rtds-prevclose-shadow",
+    },
     "btc15": {
         "label": "BTC 15m Shadow",
         "slug_like": "btc-updown-15m-%",

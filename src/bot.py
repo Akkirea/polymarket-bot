@@ -26,6 +26,7 @@ import aiohttp
 from . import db
 from .binance_ws import BinancePriceFeed
 from .chainlink import get_btc_price
+from .rtds_ws import PolymarketRtdsPriceFeed
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -67,6 +68,7 @@ MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research shadows
 SHADOW_MAX_FOLLOW_PRICE = 0.67
 LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
+RTDS_PREVCLOSE_SHADOW_STRATEGY = "btc5-rtds-prevclose-shadow"
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
@@ -172,8 +174,10 @@ class PaperBot:
         self.running:     bool  = False
         self._task:       Optional[asyncio.Task] = None
         self._binance_task: Optional[asyncio.Task] = None
+        self._rtds_task: Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._binance_feed = BinancePriceFeed()
+        self._rtds_feed = PolymarketRtdsPriceFeed()
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
@@ -220,6 +224,7 @@ class PaperBot:
         self.running = True
         loop = asyncio.get_running_loop()
         self._binance_task = loop.create_task(self._binance_feed.connect())
+        self._rtds_task = loop.create_task(self._rtds_feed.connect())
         loop.create_task(self._reconcile_unresolved_trades())
         loop.create_task(self._reconcile_unresolved_shadow_trades())
         loop.create_task(self._reconcile_unresolved_live_attempts())
@@ -244,6 +249,14 @@ class PaperBot:
             except asyncio.CancelledError:
                 pass
             self._binance_task = None
+        self._rtds_feed.stop()
+        if self._rtds_task:
+            self._rtds_task.cancel()
+            try:
+                await self._rtds_task
+            except asyncio.CancelledError:
+                pass
+            self._rtds_task = None
         if self._session and not self._session.closed:
             await self._session.close()
         print("[bot] Stopped")
@@ -273,6 +286,12 @@ class PaperBot:
                 "connected":    self._binance_feed.connected,
                 "current_price": round(self._binance_feed.current_price, 2) if self._binance_feed.current_price else None,
                 "last_update":  self._binance_feed.last_update,
+            },
+            "rtds_price_feed": {
+                "source":       self._rtds_feed.source,
+                "connected":    self._rtds_feed.connected,
+                "current_price": round(self._rtds_feed.current_price, 2) if self._rtds_feed.current_price else None,
+                "last_update":  self._rtds_feed.last_update,
             },
             "funding_rate": self._funding_rate,
             "funding_rate_updated_at": self._funding_rate_updated_at or None,
@@ -774,6 +793,19 @@ class PaperBot:
 
         return None, None
 
+    def _rtds_previous_close_reference(self, market: dict) -> tuple[Optional[float], Optional[str]]:
+        """Estimate current market's beat from Polymarket RTDS BTC price."""
+        slug = market.get("slug", "")
+        start_ts = _extract_start_ts(slug)
+        if start_ts is None:
+            return None, None
+
+        price = self._rtds_feed.get_price_at_window_start(float(start_ts))
+        if price is not None:
+            symbol = self._rtds_feed.current_symbol or "btc"
+            return float(price), f"polymarket-rtds-{symbol}-prev-close"
+        return None, None
+
     async def _collect_final_prices(self) -> None:
         """Each tick: fetch finalPrice for recent closed BTC short-horizon markets.
         Cache is keyed by market slug because 5m and 15m markets can share a
@@ -1072,6 +1104,12 @@ class PaperBot:
             seconds_remaining=seconds_remaining,
             hour_et=hour_et,
         )
+        await self._record_rtds_prevclose_shadow(
+            market=market,
+            end_ts=end_ts,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+        )
 
         reference_price = self._market_start_prices.get(slug)
         if reference_price is None:
@@ -1225,6 +1263,74 @@ class PaperBot:
             seconds_remaining=seconds_remaining,
             hour_et=hour_et,
             strategy=LOCAL_PREVCLOSE_SHADOW_STRATEGY,
+            preserve_reference=True,
+            force_min_stake=True,
+        )
+
+    async def _record_rtds_prevclose_shadow(
+        self,
+        market: dict,
+        end_ts: float,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> None:
+        """Shadow-test Polymarket RTDS previous-close reference."""
+        slug = market.get("slug", "")
+        if not slug.startswith("btc-updown-5m-"):
+            return
+        if self._research_shadow_exists(slug, RTDS_PREVCLOSE_SHADOW_STRATEGY):
+            return
+
+        official_reference = _extract_official_price_to_beat(market)
+        prev_final_reference, _prev_final_source = self._previous_final_reference(market)
+        if official_reference is not None or prev_final_reference is not None:
+            return
+
+        if not (ENTRY_WINDOW_LO <= seconds_remaining <= EARLY_LIVE_WINDOW_HI):
+            return
+
+        reference_price, reference_source = self._rtds_previous_close_reference(market)
+        if reference_price is None:
+            return
+
+        live_price, live_source = await self._get_signal_price()
+        if live_price is None:
+            return
+
+        diff = live_price - reference_price
+        if abs(diff) < PRICE_DIFF_THRESHOLD:
+            return
+
+        side = "Up" if diff > 0 else "Down"
+        side_price = _side_price(market, side)
+        if not (CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE):
+            return
+
+        price_10s_ago = self._get_price_n_seconds_ago(10)
+        if price_10s_ago is None:
+            return
+        momentum_10 = live_price - price_10s_ago
+        if side == "Up" and momentum_10 < 0:
+            return
+        if side == "Down" and momentum_10 > 0:
+            return
+
+        print(
+            f"[bot] RTDS-PREVCLOSE SHADOW: {side} on {slug} "
+            f"diff=${diff:+.2f} 10s=${momentum_10:+.2f} "
+            f"ref=${reference_price:,.2f} ({reference_source}) live={live_source}",
+            flush=True,
+        )
+        self._record_shadow_entry(
+            slug=slug,
+            side=side,
+            entry_price=side_price,
+            end_ts=end_ts,
+            price_to_beat=reference_price,
+            diff_at_entry=diff,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+            strategy=RTDS_PREVCLOSE_SHADOW_STRATEGY,
             preserve_reference=True,
             force_min_stake=True,
         )
