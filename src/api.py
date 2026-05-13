@@ -418,6 +418,19 @@ def get_shadow_summary():
     return {"ok": True, "families": summaries}
 
 
+@app.get("/api/bot/live-attempts")
+def get_live_attempts(limit: int = 100):
+    """Recent failed live order attempts with eventual would-have-won annotation."""
+    limit = max(1, min(int(limit), 500))
+    return {"ok": True, "attempts": db.get_live_order_attempts(limit=limit)}
+
+
+@app.get("/api/bot/live-attempts/summary")
+def get_live_attempt_summary():
+    """Aggregate failed live attempts for dashboard cards."""
+    return {"ok": True, "summary": db.get_live_order_attempt_summary()}
+
+
 @app.get("/api/markets")
 async def get_markets():
     """Configured markets plus current/next short-horizon Polymarket windows when available."""

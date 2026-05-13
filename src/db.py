@@ -10,6 +10,7 @@ converts them to ? for SQLite so no query needs two versions.
 """
 
 import os
+import json
 import sqlite3
 from datetime import datetime
 from typing import Optional
@@ -248,7 +249,34 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_bot_signals_ts   ON bot_signals(ts);
-        CREATE INDEX IF NOT EXISTS idx_bot_signals_slug ON bot_signals(slug)
+        CREATE INDEX IF NOT EXISTS idx_bot_signals_slug ON bot_signals(slug);
+
+        CREATE TABLE IF NOT EXISTS live_order_attempts (
+            id                 {_PK},
+            market_slug        TEXT NOT NULL,
+            side               TEXT NOT NULL,
+            intended_stake     REAL,
+            paper_entry_price  REAL,
+            max_fill_price     REAL,
+            reason             TEXT,
+            status             TEXT NOT NULL DEFAULT 'failed',
+            attempted_at       TEXT NOT NULL,
+            seconds_remaining  REAL,
+            strategy           TEXT,
+            diff_at_entry      REAL,
+            price_to_beat      REAL,
+            orderbook          TEXT,
+            outcome            TEXT,
+            resolution_price   REAL,
+            poly_price_to_beat REAL,
+            would_have_won     INTEGER,
+            hypothetical_pnl   REAL,
+            settled_at         TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_live_attempts_slug ON live_order_attempts(market_slug);
+        CREATE INDEX IF NOT EXISTS idx_live_attempts_status ON live_order_attempts(status);
+        CREATE INDEX IF NOT EXISTS idx_live_attempts_attempted ON live_order_attempts(attempted_at)
     """)
     conn.commit()
 
@@ -286,6 +314,159 @@ def init_db():
                 pass  # column already exists
 
     conn.close()
+
+
+def log_live_order_attempt(attempt: dict):
+    """Record a failed live execution attempt for later resolution analysis."""
+    orderbook = attempt.get("orderbook")
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO live_order_attempts
+              (market_slug, side, intended_stake, paper_entry_price, max_fill_price,
+               reason, status, attempted_at, seconds_remaining, strategy,
+               diff_at_entry, price_to_beat, orderbook, outcome, would_have_won,
+               hypothetical_pnl)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'unresolved', NULL, NULL)""",
+        (
+            attempt["market_slug"],
+            attempt["side"],
+            round(float(attempt.get("intended_stake") or 0.0), 4),
+            round(float(attempt.get("paper_entry_price") or 0.0), 4),
+            round(float(attempt.get("max_fill_price") or 0.0), 4),
+            str(attempt.get("reason") or "")[:1000],
+            attempt.get("status", "failed"),
+            attempt.get("attempted_at") or datetime.utcnow().isoformat(),
+            round(float(attempt["seconds_remaining"]), 1) if attempt.get("seconds_remaining") is not None else None,
+            attempt.get("strategy"),
+            round(float(attempt["diff_at_entry"]), 2) if attempt.get("diff_at_entry") is not None else None,
+            round(float(attempt["price_to_beat"]), 2) if attempt.get("price_to_beat") is not None else None,
+            json.dumps(orderbook, sort_keys=True) if orderbook is not None else None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_unresolved_live_order_attempts(limit: int = 500) -> list:
+    """Return unresolved failed live attempts that still need winner annotation."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT market_slug, side, paper_entry_price
+             FROM live_order_attempts
+            WHERE outcome = 'unresolved'
+            ORDER BY attempted_at DESC
+            LIMIT %s""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def settle_live_order_attempts(
+    market_slug: str,
+    winner: str,
+    resolution_price: Optional[float] = None,
+    poly_price_to_beat: Optional[float] = None,
+) -> int:
+    """Annotate failed live attempts with whether the direction would have won."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, side, intended_stake, paper_entry_price
+             FROM live_order_attempts
+            WHERE market_slug = %s
+              AND outcome = 'unresolved'""",
+        (market_slug,),
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        side = row["side"]
+        stake = float(row["intended_stake"] or 0.0)
+        entry_price = float(row["paper_entry_price"] or 0.5)
+        if entry_price <= 0:
+            entry_price = 0.5
+        won = side == winner
+        hypothetical_pnl = stake * (1.0 / entry_price - 1.0) if won else -stake
+        conn.execute(
+            """UPDATE live_order_attempts
+                  SET outcome = %s,
+                      resolution_price = COALESCE(%s, resolution_price),
+                      poly_price_to_beat = COALESCE(%s, poly_price_to_beat),
+                      would_have_won = %s,
+                      hypothetical_pnl = %s,
+                      settled_at = %s
+                WHERE id = %s""",
+            (
+                winner,
+                round(resolution_price, 2) if resolution_price is not None else None,
+                round(poly_price_to_beat, 2) if poly_price_to_beat is not None else None,
+                1 if won else 0,
+                round(hypothetical_pnl, 4),
+                datetime.utcnow().isoformat(),
+                row["id"],
+            ),
+        )
+        updated += 1
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def get_live_order_attempts(limit: int = 100) -> list:
+    """Return recent failed live attempts for dashboard display."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT *
+             FROM live_order_attempts
+            ORDER BY attempted_at DESC
+            LIMIT %s""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    attempts = []
+    for row in rows:
+        item = dict(row)
+        if item.get("orderbook"):
+            try:
+                item["orderbook"] = json.loads(item["orderbook"])
+            except Exception:
+                pass
+        attempts.append(item)
+    return attempts
+
+
+def get_live_order_attempt_summary() -> dict:
+    """Aggregate failed live attempts by reason/would-have-won for dashboard cards."""
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) AS n FROM live_order_attempts").fetchone()
+    resolved = conn.execute(
+        """SELECT
+               COUNT(*) AS n,
+               COALESCE(SUM(CASE WHEN would_have_won = 1 THEN 1 ELSE 0 END), 0) AS wins,
+               COALESCE(SUM(CASE WHEN would_have_won = 0 THEN 1 ELSE 0 END), 0) AS losses,
+               COALESCE(SUM(hypothetical_pnl), 0) AS hypothetical_pnl
+             FROM live_order_attempts
+            WHERE outcome IS NOT NULL
+              AND outcome != 'unresolved'"""
+    ).fetchone()
+    by_reason = conn.execute(
+        """SELECT reason, COUNT(*) AS count
+             FROM live_order_attempts
+            GROUP BY reason
+            ORDER BY count DESC
+            LIMIT 10"""
+    ).fetchall()
+    conn.close()
+    resolved_n = int(resolved["n"] or 0)
+    wins = int(resolved["wins"] or 0)
+    return {
+        "total_attempts": int(total["n"] or 0),
+        "resolved_attempts": resolved_n,
+        "would_have_won": wins,
+        "would_have_lost": int(resolved["losses"] or 0),
+        "would_have_win_rate": round(wins / resolved_n, 4) if resolved_n else 0.0,
+        "hypothetical_pnl": round(float(resolved["hypothetical_pnl"] or 0.0), 4),
+        "by_reason": [dict(r) for r in by_reason],
+    }
 
 
 def log_bot_signal(

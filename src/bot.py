@@ -190,6 +190,7 @@ class PaperBot:
         self._binance_task = loop.create_task(self._binance_feed.connect())
         loop.create_task(self._reconcile_unresolved_trades())
         loop.create_task(self._reconcile_unresolved_shadow_trades())
+        loop.create_task(self._reconcile_unresolved_live_attempts())
         self._task = loop.create_task(self._loop())
         print("[bot] Started — task created")
 
@@ -535,6 +536,49 @@ class PaperBot:
             flush=True,
         )
         return shrunk
+
+    def _log_live_attempt_failed(
+        self,
+        pos_or_slug,
+        side: str,
+        stake: float,
+        paper_entry_price: float,
+        live_cap: float,
+        reason: str,
+        *,
+        seconds_remaining: Optional[float] = None,
+        strategy: Optional[str] = None,
+        diff_at_entry: Optional[float] = None,
+        price_to_beat: Optional[float] = None,
+    ) -> None:
+        """Persist a failed live attempt so we can later score direction quality."""
+        if isinstance(pos_or_slug, dict):
+            slug = pos_or_slug["market_slug"]
+            seconds_remaining = seconds_remaining if seconds_remaining is not None else (
+                max(0.0, float(pos_or_slug["end_ts"]) - time.time()) if pos_or_slug.get("end_ts") else None
+            )
+            strategy = strategy if strategy is not None else pos_or_slug.get("strategy")
+            diff_at_entry = diff_at_entry if diff_at_entry is not None else pos_or_slug.get("diff_at_entry")
+            price_to_beat = price_to_beat if price_to_beat is not None else pos_or_slug.get("price_to_beat")
+        else:
+            slug = str(pos_or_slug)
+
+        try:
+            db.log_live_order_attempt({
+                "market_slug": slug,
+                "side": side,
+                "intended_stake": stake,
+                "paper_entry_price": paper_entry_price,
+                "max_fill_price": live_cap,
+                "reason": reason,
+                "attempted_at": datetime.now(timezone.utc).isoformat(),
+                "seconds_remaining": seconds_remaining,
+                "strategy": strategy,
+                "diff_at_entry": diff_at_entry,
+                "price_to_beat": price_to_beat,
+            })
+        except Exception as exc:
+            print(f"[bot] LIVE ATTEMPT LOG failed for {slug}: {exc}", flush=True)
 
     # ── Active markets ─────────────────────────────────────────────────────────
 
@@ -1279,9 +1323,22 @@ class PaperBot:
                     f"< {LIVE_MIN_SECONDS_BEFORE_CLOSE:.0f}s minimum",
                     flush=True,
                 )
+                self._log_live_attempt_failed(
+                    slug,
+                    side,
+                    stake,
+                    entry_price,
+                    entry_price,
+                    f"Skipped live: {seconds_remaining:.1f}s before close < {LIVE_MIN_SECONDS_BEFORE_CLOSE:.0f}s minimum",
+                    seconds_remaining=seconds_remaining,
+                    strategy=strategy,
+                    diff_at_entry=diff_at_entry,
+                    price_to_beat=price_to_beat,
+                )
             elif market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
             else:
+                live_cap = entry_price
                 try:
                     from . import live_clob
                     live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
@@ -1327,6 +1384,18 @@ class PaperBot:
                     )
                 except Exception as exc:
                     print(f"[bot] LIVE: order failed for {slug} ({exc}) — paper only", flush=True)
+                    self._log_live_attempt_failed(
+                        slug,
+                        side,
+                        stake,
+                        entry_price,
+                        live_cap,
+                        str(exc),
+                        seconds_remaining=seconds_remaining,
+                        strategy=strategy,
+                        diff_at_entry=diff_at_entry,
+                        price_to_beat=price_to_beat,
+                    )
                     live_should_retry = True
         elif os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and not live_enabled:
             print(f"[bot] LIVE: disabled for {slug} strategy={strategy} — paper/shadow only", flush=True)
@@ -1419,6 +1488,14 @@ class PaperBot:
                         f"cap={live_cap:.4f}: {exc}",
                         flush=True,
                     )
+                    self._log_live_attempt_failed(
+                        pos,
+                        side,
+                        stake,
+                        paper_entry_price,
+                        live_cap,
+                        str(exc),
+                    )
                     await asyncio.sleep(retry_interval)
                     continue
 
@@ -1499,12 +1576,23 @@ class PaperBot:
                         resolution_price=final_price,
                         poly_price_to_beat=poly_price_to_beat,
                     )
+                    attempt_count = db.settle_live_order_attempts(
+                        slug,
+                        winner,
+                        resolution_price=final_price,
+                        poly_price_to_beat=poly_price_to_beat,
+                    )
                     if settled:
                         self._reload_accounting_state()
                         print(
                             f"[bot] backfill: {slug} settled → {winner} pnl=${settled['pnl']:+.2f}",
                             flush=True,
                         )
+                        if attempt_count:
+                            print(
+                                f"[bot] live attempts: settled {attempt_count} failed attempt(s) for {slug}",
+                                flush=True,
+                            )
                         return
                     if final_price is not None:
                         db.update_resolution_price(slug, float(final_price))
@@ -1558,14 +1646,53 @@ class PaperBot:
                 resolution_price=final_price,
                 poly_price_to_beat=poly_price_to_beat,
             )
+            attempt_count = db.settle_live_order_attempts(
+                slug,
+                winner,
+                resolution_price=final_price,
+                poly_price_to_beat=poly_price_to_beat,
+            )
             if settled:
                 settled_count += 1
                 print(
                     f"[bot] reconcile: {slug} settled → {winner} pnl=${settled['pnl']:+.2f}",
                     flush=True,
                 )
+            if attempt_count:
+                print(
+                    f"[bot] live attempts: settled {attempt_count} failed attempt(s) for {slug}",
+                    flush=True,
+                )
         if settled_count:
             self._reload_accounting_state()
+
+    async def _reconcile_unresolved_live_attempts(self) -> None:
+        unresolved = db.load_unresolved_live_order_attempts()
+        if not unresolved:
+            return
+        print(f"[bot] live attempts reconcile: checking {len(unresolved)} unresolved attempts", flush=True)
+        settled_count = 0
+        checked_slugs = set()
+        for row in unresolved:
+            slug = row["market_slug"]
+            if slug in checked_slugs:
+                continue
+            checked_slugs.add(slug)
+            start_ts = _extract_start_ts(slug)
+            if start_ts is None:
+                continue
+            end_ts = start_ts + float(_market_interval(slug))
+            winner, final_price, poly_price_to_beat = await self._resolve_market(slug, end_ts)
+            if winner is None:
+                continue
+            settled_count += db.settle_live_order_attempts(
+                slug,
+                winner,
+                resolution_price=final_price,
+                poly_price_to_beat=poly_price_to_beat,
+            )
+        if settled_count:
+            print(f"[bot] live attempts reconcile: settled {settled_count} failed attempt(s)", flush=True)
 
     async def _reconcile_unresolved_shadow_trades(self) -> None:
         unresolved = db.load_unresolved_shadow_trades()
@@ -1792,6 +1919,17 @@ class PaperBot:
                 ))
             conn.commit()
             conn.close()
+            attempt_count = db.settle_live_order_attempts(
+                pos["market_slug"],
+                winner,
+                resolution_price=resolution_price,
+                poly_price_to_beat=poly_price_to_beat,
+            )
+            if attempt_count:
+                print(
+                    f"[bot] live attempts: settled {attempt_count} failed attempt(s) for {pos['market_slug']}",
+                    flush=True,
+                )
             db.save_bot_state(self.balance)
             asyncio.create_task(
                 self._backfill_resolution_price(pos["market_slug"], pos["end_ts"])
