@@ -487,7 +487,7 @@ class PaperBot:
                 if in_early_live_window:
                     strategy = "btc5-early-lag-live"
                 shadow_mode = market.get("_sz_mode") == "shadow"
-                shadow_strategy = strategy if shadow_mode else "funding-neutral-shadow"
+                shadow_strategy = strategy
                 shadow_already_recorded = (
                     (slug, shadow_strategy) in self._shadow_entered_slugs
                     or db.shadow_trade_exists(slug, shadow_strategy)
@@ -1717,7 +1717,7 @@ class PaperBot:
         diff_at_entry: Optional[float] = None,
         seconds_remaining: Optional[float] = None,
         hour_et: int = 0,
-        strategy: str = "funding-neutral-shadow",
+        strategy: str = "shadow",
         preserve_reference: bool = False,
         force_min_stake: bool = False,
     ) -> None:
@@ -1730,7 +1730,7 @@ class PaperBot:
                 f"[bot] SHADOW SKIP: Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum",
                 flush=True,
             )
-            db.log_bot_signal(slug, filter_hit="funding_neutral_shadow_size", outcome="skipped",
+            db.log_bot_signal(slug, filter_hit="shadow_size", outcome="skipped",
                               direction=side, diff=diff_at_entry)
             return
 

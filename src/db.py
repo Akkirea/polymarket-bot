@@ -1082,7 +1082,7 @@ def settle_unresolved_bot_trade(
     return {"won": won, "pnl": round(pnl, 2)}
 
 
-def shadow_trade_exists(market_slug: str, strategy: str = "funding-neutral-shadow") -> bool:
+def shadow_trade_exists(market_slug: str, strategy: str = "shadow") -> bool:
     """Return True if a shadow entry was already recorded for this slug."""
     conn = get_connection()
     row = conn.execute(
@@ -1100,7 +1100,7 @@ def shadow_trade_exists(market_slug: str, strategy: str = "funding-neutral-shado
 
 def log_shadow_trade(trade: dict) -> bool:
     """Insert a hypothetical trade that never affects paper/live balance."""
-    strategy = trade.get("strategy", "funding-neutral-shadow")
+    strategy = trade.get("strategy", "shadow")
     if shadow_trade_exists(trade["market_slug"], strategy):
         return False
 
