@@ -524,6 +524,20 @@ class PaperBot:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
                     continue
                 official_price_to_beat = _extract_official_price_to_beat(market)
+                # current priceToBeat == previous window's finalPrice at the boundary —
+                # seed the cache now so prev-finalPrice is available immediately without
+                # waiting for _collect_final_prices() to poll Gamma
+                if official_price_to_beat is not None and start_ts is not None:
+                    _spec = _market_spec_for_slug(slug)
+                    if _spec:
+                        _prev_seed_slug = f"{_spec['slug_prefix']}-{int(start_ts - _spec['interval'])}"
+                        if _prev_seed_slug not in self._final_price_cache:
+                            self._final_price_cache[_prev_seed_slug] = official_price_to_beat
+                            self._final_price_cache_at[_prev_seed_slug] = time.time()
+                            print(
+                                f"[bot] prev-finalPrice seeded: {_prev_seed_slug} → ${official_price_to_beat:,.2f}",
+                                flush=True,
+                            )
                 prev_final_price_to_beat, prev_final_source = self._previous_final_reference(market)
                 rtds_price_to_beat, rtds_source = (None, None)
                 if official_price_to_beat is None and prev_final_price_to_beat is None:
@@ -1848,6 +1862,17 @@ class PaperBot:
                     diff_at_entry=diff_at_entry,
                     price_to_beat=price_to_beat,
                 )
+            elif not (CROWD_MIN <= entry_price <= CROWD_MAX):
+                reason = (
+                    f"entry_price {entry_price:.3f} outside crowd band "
+                    f"[{CROWD_MIN},{CROWD_MAX}] at signal time — crowd slipped"
+                )
+                print(f"[bot] LIVE CANCEL: {slug} {reason}", flush=True)
+                self._log_live_attempt_failed(
+                    slug, side, stake, entry_price, entry_price, reason,
+                    seconds_remaining=seconds_remaining, strategy=strategy,
+                    diff_at_entry=diff_at_entry, price_to_beat=price_to_beat,
+                )
             elif market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
             else:
@@ -1969,6 +1994,13 @@ class PaperBot:
         max_attempts = max(0, int(os.getenv("LIVE_RETRY_MAX_ATTEMPTS", "12")))
         live_cap = min(CROWD_MAX, max_profit_price, paper_entry_price + live_slippage)
 
+        if not (CROWD_MIN <= paper_entry_price <= CROWD_MAX):
+            print(
+                f"[bot] LIVE RETRY: disabled for {slug}; paper_entry_price={paper_entry_price:.3f} "
+                f"outside crowd band [{CROWD_MIN},{CROWD_MAX}]",
+                flush=True,
+            )
+            return
         if live_cap < CROWD_MIN:
             print(
                 f"[bot] LIVE RETRY: disabled for {slug}; cap={live_cap:.4f} below CROWD_MIN={CROWD_MIN:.2f}",

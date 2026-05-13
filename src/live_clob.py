@@ -311,6 +311,11 @@ async def place_order(
     liquidity = _inspect_buy_liquidity(book, effective_max_price)
     if liquidity["best_ask"] is None:
         raise LiveClobError(f"No asks in order book for {side} token")
+    if liquidity["best_ask"] < min_price:
+        raise LiveClobError(
+            f"Best ask {liquidity['best_ask']:.4f} below MIN_LIVE_PRICE={min_price:.2f}; "
+            f"crowd has moved against signal direction"
+        )
     if liquidity["best_ask"] > effective_max_price:
         raise LiveClobError(
             f"Best ask {liquidity['best_ask']:.4f} above live cap={effective_max_price:.4f}; "
