@@ -467,7 +467,8 @@ class PaperBot:
                 # Only enforce/log this inside the entry window; early-window
                 # volume is often low and can make normal markets look blocked.
                 volume = float(market.get("volume") or 0)
-                if volume < MIN_MARKET_VOLUME:
+                volume_blocks_paper = volume < MIN_MARKET_VOLUME
+                if volume_blocks_paper and not bool(market.get("_sz_live_enabled", True)):
                     if in_main_window and volume_retry_enabled:
                         self._volume_retry_slugs.add(slug)
                     print(
@@ -477,7 +478,13 @@ class PaperBot:
                         flush=True,
                     )
                     continue
-                if in_volume_retry_window:
+                if volume_blocks_paper:
+                    print(
+                        f"[bot] LOW VOLUME: {slug} volume=${volume:.0f} < "
+                        f"${MIN_MARKET_VOLUME:,.0f}; live may continue via orderbook preflight",
+                        flush=True,
+                    )
+                elif in_volume_retry_window:
                     print(
                         f"[bot] LATE RETRY: {slug} volume=${volume:.0f} now clears "
                         f"${MIN_MARKET_VOLUME:,.0f} minimum  secs={seconds_remaining:.1f}",
@@ -910,9 +917,6 @@ class PaperBot:
     ) -> bool:
         """Promote the validated btc5-lag-follow-shadow rule into conservative live execution."""
         slug = market["slug"]
-        volume = float(market.get("volume") or 0.0)
-        if volume < MIN_MARKET_VOLUME:
-            return False
 
         reference_price = _extract_official_price_to_beat(market)
         if reference_price is None:
