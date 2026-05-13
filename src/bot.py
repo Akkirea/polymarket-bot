@@ -51,7 +51,7 @@ ENTRY_WINDOW_LO      = 75    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 150   # enter when seconds_remaining <= this
 EARLY_LIVE_WINDOW_LO = 150   # stricter live-only detector starts here
 EARLY_LIVE_WINDOW_HI = 240
-VOLUME_RETRY_LO      = 30    # late retry only after a volume skip in the main window
+VOLUME_RETRY_LO      = 60    # late retry only while entries still have enough time before close
 VOLUME_RETRY_HI      = ENTRY_WINDOW_LO
 MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — outside this band, funding must agree with direction
@@ -418,6 +418,15 @@ class PaperBot:
             # ── configured reversal window per market family
             if ((in_early_live_window or in_main_window or in_volume_retry_window)
                     and slug not in self._entered_slugs):
+                if seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
+                    print(
+                        f"[bot] SKIP: {slug} {seconds_remaining:.1f}s before close "
+                        f"< {LIVE_MIN_SECONDS_BEFORE_CLOSE:.0f}s no-entry floor",
+                        flush=True,
+                    )
+                    self._volume_retry_slugs.discard(slug)
+                    continue
+
                 strategy = market.get("_sz_strategy", "chainlink-reversal-guard")
                 if in_early_live_window:
                     strategy = "btc5-early-lag-live"
