@@ -51,6 +51,16 @@ SHADOW_FAMILIES = {
         "slug_like": "btc-updown-5m-%",
         "strategy": "btc5-overpriced-fade-shadow",
     },
+    "btc5_hedged_dominant": {
+        "label": "BTC 5m Hedged Dominant",
+        "slug_like": "btc-updown-5m-%",
+        "strategy_like": "btc5-hedged-dominant-shadow-%",
+    },
+    "btc5_cheap_hedge": {
+        "label": "BTC 5m Cheap Hedge",
+        "slug_like": "btc-updown-5m-%",
+        "strategy_like": "btc5-cheap-hedge-shadow-%",
+    },
     "btc15": {
         "label": "BTC 15m Shadow",
         "slug_like": "btc-updown-15m-%",
@@ -75,6 +85,9 @@ def _family_filter_sql(family: str | None) -> tuple[str, tuple]:
     if spec.get("strategy"):
         clauses.append("strategy = %s")
         params.append(spec["strategy"])
+    if spec.get("strategy_like"):
+        clauses.append("strategy LIKE %s")
+        params.append(spec["strategy_like"])
     return " AND " + " AND ".join(clauses), tuple(params)
 
 
@@ -356,8 +369,15 @@ def get_shadow_summary():
     try:
         summaries = []
         for key, spec in SHADOW_FAMILIES.items():
-            strategy_clause = "AND strategy = %s" if spec.get("strategy") else ""
-            params = ("shadow", spec["slug_like"]) + ((spec["strategy"],) if spec.get("strategy") else ())
+            strategy_clause = ""
+            params = ["shadow", spec["slug_like"]]
+            if spec.get("strategy"):
+                strategy_clause = "AND strategy = %s"
+                params.append(spec["strategy"])
+            elif spec.get("strategy_like"):
+                strategy_clause = "AND strategy LIKE %s"
+                params.append(spec["strategy_like"])
+            params = tuple(params)
             row = conn.execute(
                 """SELECT
                        COUNT(*) AS total,

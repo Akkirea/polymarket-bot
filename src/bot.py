@@ -70,6 +70,10 @@ FADE_SHADOW_WINDOW   = (75, 240)
 FADE_CROWD_PRICE     = 0.75
 FADE_MAX_DIFF        = 35.0
 FADE_MAX_MOMENTUM    = 8.0
+HEDGED_SHADOW_WINDOW = (150, 300)
+HEDGED_DOMINANT_MIN  = 0.45
+HEDGED_DOMINANT_MAX  = 0.67
+HEDGED_HEDGE_MAX     = 0.10
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
@@ -389,7 +393,7 @@ class PaperBot:
                 and slug in self._volume_retry_slugs
             )
             if market.get("_sz_live_enabled", True):
-                await self._record_research_shadows(market, end_ts, seconds_remaining, hour_et)
+                await self._record_research_shadows(market, end_ts, seconds_remaining, hour_et, markets)
             # ── configured reversal window per market family
             if ((in_early_live_window or in_main_window or in_volume_retry_window)
                     and slug not in self._entered_slugs):
@@ -792,6 +796,7 @@ class PaperBot:
         end_ts: float,
         seconds_remaining: float,
         hour_et: int,
+        active_markets: Optional[list] = None,
     ) -> None:
         """Record shadow-only BTC 5m strategy variants for tradability research."""
         slug = market["slug"]
@@ -867,6 +872,49 @@ class PaperBot:
                 record("btc5-overpriced-fade-shadow", "Down")
             elif down_price >= FADE_CROWD_PRICE and momentum_10 >= -FADE_MAX_MOMENTUM:
                 record("btc5-overpriced-fade-shadow", "Up")
+
+        # 4) Bonereaper-style research: dominant directional leg with cheap
+        # opposite insurance. This is shadow-only because 0.90+ chasing has
+        # blow-up risk; we only test sane dominant prices.
+        hedge_lo, hedge_hi = HEDGED_SHADOW_WINDOW
+        if hedge_lo <= seconds_remaining <= hedge_hi and abs(diff) >= 8.0:
+            side = "Up" if diff > 0 else "Down"
+            opposite = "Down" if side == "Up" else "Up"
+            side_price = _side_price(market, side)
+            hedge_price = _side_price(market, opposite)
+            momentum_ok = (
+                momentum_10 is not None
+                and momentum_30 is not None
+                and ((side == "Up" and momentum_10 > 0 and momentum_30 > 0)
+                     or (side == "Down" and momentum_10 < 0 and momentum_30 < 0))
+            )
+            if momentum_ok and HEDGED_DOMINANT_MIN <= side_price <= HEDGED_DOMINANT_MAX:
+                agreement = self._cross_market_agreement(side, active_markets or [], slug)
+                suffix = f"{agreement}x"
+                record(f"btc5-hedged-dominant-shadow-{suffix}", side)
+                if hedge_price <= HEDGED_HEDGE_MAX:
+                    record(f"btc5-cheap-hedge-shadow-{suffix}", opposite)
+
+    def _cross_market_agreement(self, side: str, active_markets: list, current_slug: str) -> int:
+        """Count related open markets whose crowd-leading side agrees."""
+        agreement = 1
+        for related in active_markets:
+            related_slug = related.get("slug", "")
+            if related_slug == current_slug:
+                continue
+            if not (
+                related_slug.startswith("btc-updown-15m-")
+                or related_slug.startswith("btc-updown-5m-")
+            ):
+                continue
+            up_price = _side_price(related, "Up")
+            down_price = _side_price(related, "Down")
+            if max(up_price, down_price) < 0.55:
+                continue
+            leading_side = "Up" if up_price > down_price else "Down"
+            if leading_side == side:
+                agreement += 1
+        return min(agreement, 3)
 
     async def _evaluate_signals(
         self, market: dict, price_to_beat: Optional[float], price_source: Optional[str]
