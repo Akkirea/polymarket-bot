@@ -66,6 +66,7 @@ BINANCE_STALE_AFTER  = 65.0  # seconds — keep Binance history usable for 15m's
 MIN_MARKET_VOLUME    = 2000.0  # USDC — only enforced during the entry window
 MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research shadows
 SHADOW_MAX_FOLLOW_PRICE = 0.67
+LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
@@ -750,6 +751,29 @@ class PaperBot:
 
         return float(prev_final), "prev-finalPrice"
 
+    def _local_previous_close_reference(self, market: dict) -> tuple[Optional[float], Optional[str]]:
+        """Estimate current market's beat from local BTC price at previous close.
+
+        This is intentionally shadow-only. It can arrive earlier than Polymarket
+        metadata, but it is not authoritative enough for live execution.
+        """
+        slug = market.get("slug", "")
+        start_ts = _extract_start_ts(slug)
+        if start_ts is None:
+            return None, None
+
+        if self._binance_feed.connected:
+            price = self._binance_feed.get_price_at_window_start(float(start_ts))
+            if price is not None:
+                return float(price), "binance-prev-close"
+
+        first_sight = self._market_start_prices.get(slug)
+        first_sight_source = self._market_start_sources.get(slug)
+        if first_sight is not None:
+            return float(first_sight), f"{first_sight_source or 'local'}-first-sight"
+
+        return None, None
+
     async def _collect_final_prices(self) -> None:
         """Each tick: fetch finalPrice for recent closed BTC short-horizon markets.
         Cache is keyed by market slug because 5m and 15m markets can share a
@@ -1042,6 +1066,13 @@ class PaperBot:
         if volume < MIN_SHADOW_VOLUME:
             return
 
+        await self._record_local_prevclose_shadow(
+            market=market,
+            end_ts=end_ts,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+        )
+
         reference_price = self._market_start_prices.get(slug)
         if reference_price is None:
             return
@@ -1130,6 +1161,74 @@ class PaperBot:
                 if hedge_price <= HEDGED_HEDGE_MAX:
                     record(f"btc5-cheap-hedge-shadow-{suffix}", opposite)
 
+    async def _record_local_prevclose_shadow(
+        self,
+        market: dict,
+        end_ts: float,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> None:
+        """Shadow-test local previous-close reference when trusted Polymarket refs are missing."""
+        slug = market.get("slug", "")
+        if not slug.startswith("btc-updown-5m-"):
+            return
+        if self._research_shadow_exists(slug, LOCAL_PREVCLOSE_SHADOW_STRATEGY):
+            return
+
+        official_reference = _extract_official_price_to_beat(market)
+        prev_final_reference, _prev_final_source = self._previous_final_reference(market)
+        if official_reference is not None or prev_final_reference is not None:
+            return
+
+        if not (ENTRY_WINDOW_LO <= seconds_remaining <= EARLY_LIVE_WINDOW_HI):
+            return
+
+        reference_price, reference_source = self._local_previous_close_reference(market)
+        if reference_price is None:
+            return
+
+        live_price, live_source = await self._get_signal_price()
+        if live_price is None:
+            return
+
+        diff = live_price - reference_price
+        if abs(diff) < PRICE_DIFF_THRESHOLD:
+            return
+
+        side = "Up" if diff > 0 else "Down"
+        side_price = _side_price(market, side)
+        if not (CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE):
+            return
+
+        price_10s_ago = self._get_price_n_seconds_ago(10)
+        if price_10s_ago is None:
+            return
+        momentum_10 = live_price - price_10s_ago
+        if side == "Up" and momentum_10 < 0:
+            return
+        if side == "Down" and momentum_10 > 0:
+            return
+
+        print(
+            f"[bot] LOCAL-PREVCLOSE SHADOW: {side} on {slug} "
+            f"diff=${diff:+.2f} 10s=${momentum_10:+.2f} "
+            f"ref=${reference_price:,.2f} ({reference_source}) live={live_source}",
+            flush=True,
+        )
+        self._record_shadow_entry(
+            slug=slug,
+            side=side,
+            entry_price=side_price,
+            end_ts=end_ts,
+            price_to_beat=reference_price,
+            diff_at_entry=diff,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+            strategy=LOCAL_PREVCLOSE_SHADOW_STRATEGY,
+            preserve_reference=True,
+            force_min_stake=True,
+        )
+
     def _cross_market_agreement(self, side: str, active_markets: list, current_slug: str) -> int:
         """Count related open markets whose crowd-leading side agrees."""
         agreement = 1
@@ -1158,15 +1257,15 @@ class PaperBot:
         Two-condition entry:
         1. abs(live_price - reference_price) >= PRICE_DIFF_THRESHOLD
         2. After 3s re-check: move hasn't reversed and diff >= REVERSAL_THRESHOLD
-        Reference price is previous window's finalPrice if cached, else Chainlink first-sight.
+        Live-enabled markets require Polymarket official priceToBeat or a fresh
+        previous-window finalPrice. Shadow-only markets may still use local first-sight.
         """
-        # Use previous same-interval market's finalPrice as reference if cached,
-        # else fall back to first-sight price. The slug number is the market start_ts.
         slug = market["slug"]
         start_ts = _extract_start_ts(slug)
         if start_ts is None:
             db.log_bot_signal(slug, filter_hit="bad_slug_ts", outcome="skipped")
             return None, {"source": "none", "momentum": None}
+        live_enabled = bool(market.get("_sz_live_enabled", True))
         spec = _market_spec_for_slug(slug)
         interval = spec["interval"] if spec else int(market.get("_sz_interval") or 300)
         diff_threshold = float(spec.get("diff_threshold", PRICE_DIFF_THRESHOLD)) if spec else PRICE_DIFF_THRESHOLD
@@ -1178,17 +1277,31 @@ class PaperBot:
         prev_slug = f"{prefix}-{int(start_ts - interval)}"
         prev_final  = self._final_price_cache.get(prev_slug)
         has_official_reference = price_source == "polymarket-official" and price_to_beat is not None
-        reference_price = price_to_beat if has_official_reference else prev_final if prev_final is not None else price_to_beat
-        ref_source = (
-            "polymarket-official"
-            if has_official_reference
-            else "prev-finalPrice"
-            if prev_final is not None
-            else f"{price_source or 'unknown'}-first-sight"
-        )
+        has_prev_final_reference = price_source == "prev-finalPrice" and price_to_beat is not None
+        if live_enabled and not (has_official_reference or has_prev_final_reference):
+            print(
+                f"[bot] SKIP: {slug} live-enabled market has no official/prev-final reference; "
+                "local proxy disabled",
+                flush=True,
+            )
+            db.log_bot_signal(slug, filter_hit="no_trusted_reference", outcome="skipped")
+            return None, {"source": "none", "momentum": None}
+
+        if has_official_reference:
+            reference_price = price_to_beat
+            ref_source = "polymarket-official"
+        elif has_prev_final_reference:
+            reference_price = price_to_beat
+            ref_source = "prev-finalPrice"
+        elif prev_final is not None:
+            reference_price = prev_final
+            ref_source = "prev-finalPrice"
+        else:
+            reference_price = price_to_beat
+            ref_source = f"{price_source or 'unknown'}-first-sight"
 
         if reference_price is None:
-            print(f"[bot] SKIP: {slug} no reference price (no finalPrice cache, no Chainlink cache)", flush=True)
+            print(f"[bot] SKIP: {slug} no reference price", flush=True)
             db.log_bot_signal(slug, filter_hit="no_reference", outcome="skipped")
             return None, {"source": "none", "momentum": None}
 
