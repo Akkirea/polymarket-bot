@@ -1899,9 +1899,8 @@ class PaperBot:
                 live_cap = entry_price
                 try:
                     from . import live_clob
-                    live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
                     max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
-                    live_cap = min(CROWD_MAX, max_profit_price, entry_price + live_slippage)
+                    live_cap = min(CROWD_MAX, max_profit_price)
                     live_retries = max(0, int(os.getenv("LIVE_FAK_RETRIES", "1")))
                     live_retry_delay = max(0.0, float(os.getenv("LIVE_FAK_RETRY_DELAY_SEC", "1.0")))
 
@@ -2005,14 +2004,13 @@ class PaperBot:
             return
 
         max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
-        live_slippage = float(os.getenv("LIVE_MAX_SLIPPAGE", "0.05"))
         retry_interval = max(0.5, float(os.getenv("LIVE_RETRY_INTERVAL_SEC", "3.0")))
         stop_before_close = max(
             LIVE_MIN_SECONDS_BEFORE_CLOSE,
             float(os.getenv("LIVE_RETRY_STOP_BEFORE_CLOSE_SEC", str(LIVE_MIN_SECONDS_BEFORE_CLOSE))),
         )
         max_attempts = max(0, int(os.getenv("LIVE_RETRY_MAX_ATTEMPTS", "12")))
-        live_cap = min(CROWD_MAX, max_profit_price, paper_entry_price + live_slippage)
+        live_cap = min(CROWD_MAX, max_profit_price)
 
         if not (CROWD_MIN <= paper_entry_price <= CROWD_MAX):
             print(
