@@ -71,8 +71,10 @@ LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
 RTDS_PREVCLOSE_SHADOW_STRATEGY = "btc5-rtds-prevclose-shadow"
 RTDS_LIVE_FALLBACK_SOURCE = "rtds-live-fallback"
 RTDS_LIVE_FALLBACK_ENABLED = os.getenv("RTDS_LIVE_FALLBACK_ENABLED", "true").lower() == "true"
-RTDS_LIVE_UP_DIFF = float(os.getenv("RTDS_LIVE_UP_DIFF", "60"))
-RTDS_LIVE_DOWN_DIFF = float(os.getenv("RTDS_LIVE_DOWN_DIFF", "80"))
+RTDS_LIVE_UP_DIFF        = float(os.getenv("RTDS_LIVE_UP_DIFF",          "30"))
+RTDS_LIVE_DOWN_DIFF      = float(os.getenv("RTDS_LIVE_DOWN_DIFF",        "40"))
+RTDS_LIVE_UP_CROWD_CAP   = float(os.getenv("RTDS_LIVE_UP_CROWD_CAP",    "0.55"))
+RTDS_LIVE_DOWN_CROWD_FLOOR = float(os.getenv("RTDS_LIVE_DOWN_CROWD_FLOOR", "0.45"))
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
@@ -861,15 +863,32 @@ class PaperBot:
             return None, None
         return float(price), RTDS_LIVE_FALLBACK_SOURCE
 
-    def _rtds_live_edge_ok(self, diff: float) -> tuple[bool, str]:
-        """Asymmetric fallback gate. RTDS samples have been high vs official beat."""
-        if diff >= RTDS_LIVE_UP_DIFF:
-            return True, f"Up RTDS edge ${diff:+.2f} >= ${RTDS_LIVE_UP_DIFF:.0f}"
-        if diff <= -RTDS_LIVE_DOWN_DIFF:
-            return True, f"Down RTDS edge ${diff:+.2f} <= -${RTDS_LIVE_DOWN_DIFF:.0f}"
+    def _rtds_live_edge_ok(self, diff: float, crowd_price: float) -> tuple[bool, str]:
+        """BTC-vs-crowd divergence gate.
+
+        Fires when BTC has moved meaningfully AND the crowd hasn't fully
+        priced it in yet — i.e. the crowd is still lagging the actual move.
+        Lower diff thresholds than the old pure-diff gate because we now
+        confirm the crowd hasn't caught up before entering.
+        """
+        if diff >= RTDS_LIVE_UP_DIFF and crowd_price <= RTDS_LIVE_UP_CROWD_CAP:
+            return True, (
+                f"Up divergence ${diff:+.2f} >= ${RTDS_LIVE_UP_DIFF:.0f} "
+                f"crowd={crowd_price:.3f} <= {RTDS_LIVE_UP_CROWD_CAP:.2f}"
+            )
+        if diff <= -RTDS_LIVE_DOWN_DIFF and crowd_price >= RTDS_LIVE_DOWN_CROWD_FLOOR:
+            return True, (
+                f"Down divergence ${diff:+.2f} <= -${RTDS_LIVE_DOWN_DIFF:.0f} "
+                f"crowd={crowd_price:.3f} >= {RTDS_LIVE_DOWN_CROWD_FLOOR:.2f}"
+            )
         if diff >= 0:
-            return False, f"Up RTDS edge ${diff:+.2f} < ${RTDS_LIVE_UP_DIFF:.0f}"
-        return False, f"Down RTDS edge ${diff:+.2f} > -${RTDS_LIVE_DOWN_DIFF:.0f}"
+            if diff < RTDS_LIVE_UP_DIFF:
+                return False, f"Up diff ${diff:+.2f} < ${RTDS_LIVE_UP_DIFF:.0f}"
+            return False, f"Up crowd={crowd_price:.3f} > cap {RTDS_LIVE_UP_CROWD_CAP:.2f} (already priced in)"
+        else:
+            if diff > -RTDS_LIVE_DOWN_DIFF:
+                return False, f"Down diff ${diff:+.2f} > -${RTDS_LIVE_DOWN_DIFF:.0f}"
+            return False, f"Down crowd={crowd_price:.3f} < floor {RTDS_LIVE_DOWN_CROWD_FLOOR:.2f} (already priced in)"
 
     def _record_rtds_reference_samples(self, market: dict) -> None:
         """Store RTDS ticks around 5m open so settlement can reveal best timing offset."""
@@ -1119,18 +1138,17 @@ class PaperBot:
 
         diff = live_price - reference_price
         side = "Up" if diff > 0 else "Down"
+        side_price = _side_price(market, side)
+        live_max_price = min(LAG_FOLLOW_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
+        if not (CROWD_MIN <= side_price <= live_max_price):
+            return False
         if reference_source == RTDS_LIVE_FALLBACK_SOURCE:
-            edge_ok, edge_reason = self._rtds_live_edge_ok(diff)
+            edge_ok, edge_reason = self._rtds_live_edge_ok(diff, side_price)
             if not edge_ok:
                 print(f"[bot] LAG-FOLLOW RTDS LIVE SKIP: {slug} {edge_reason}", flush=True)
                 return False
             print(f"[bot] LAG-FOLLOW RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
         elif abs(diff) < PRICE_DIFF_THRESHOLD:
-            return False
-
-        side_price = _side_price(market, side)
-        live_max_price = min(LAG_FOLLOW_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
-        if not (CROWD_MIN <= side_price <= live_max_price):
             return False
 
         price_10s_ago = self._get_price_n_seconds_ago(10)
@@ -1537,7 +1555,8 @@ class PaperBot:
             )
             direction = "Up" if diff_initial > 0 else "Down"
             if has_rtds_live_fallback:
-                edge_ok, edge_reason = self._rtds_live_edge_ok(diff_initial)
+                crowd_price_now = _side_price(market, direction)
+                edge_ok, edge_reason = self._rtds_live_edge_ok(diff_initial, crowd_price_now)
                 if not edge_ok:
                     print(f"[bot] SKIP RTDS LIVE: {slug} {edge_reason}", flush=True)
                     db.log_bot_signal(slug, filter_hit="rtds_live_edge", outcome="skipped",
@@ -1652,7 +1671,8 @@ class PaperBot:
                                   momentum=momentum, chop_range=chop_range)
                 return None, {"source": "none", "momentum": None}
             if has_rtds_live_fallback:
-                edge_ok, edge_reason = self._rtds_live_edge_ok(diff_final)
+                crowd_price_post = _side_price(market, direction)
+                edge_ok, edge_reason = self._rtds_live_edge_ok(diff_final, crowd_price_post)
                 if not edge_ok:
                     print(f"[bot] SKIP RTDS LIVE: {slug} post-guard {edge_reason}", flush=True)
                     db.log_bot_signal(slug, filter_hit="rtds_live_reversal_edge", outcome="skipped",
