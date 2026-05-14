@@ -1374,12 +1374,15 @@ class PaperBot:
         reference_source = "polymarket-official" if reference_price is not None else None
         if reference_price is None:
             reference_price, reference_source = self._previous_final_reference(market)
+        if reference_price is None and start_ts is not None:
+            kline = await self._binance_feed.get_kline_open(start_ts)
+            if kline is not None:
+                reference_price, reference_source = kline, "binance-kline-open"
         if reference_price is None:
             reference_price, reference_source = self._rtds_live_fallback_reference(market)
         if reference_price is None:
             print(
-                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} official priceToBeat and prev-finalPrice unavailable; "
-                "RTDS fallback unavailable; not risking live on local proxy",
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} all reference sources unavailable",
                 flush=True,
             )
             return False
@@ -1423,7 +1426,9 @@ class PaperBot:
             flush=True,
         )
         strategy = "btc5-lag-follow-live"
-        if reference_source == RTDS_LIVE_FALLBACK_SOURCE:
+        if reference_source == "binance-kline-open":
+            strategy = "btc5-lag-follow-live-kline"
+        elif reference_source == RTDS_LIVE_FALLBACK_SOURCE:
             strategy = "btc5-lag-follow-live-rtds-fallback"
         await self._open_position(
             slug,
