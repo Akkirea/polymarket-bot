@@ -74,6 +74,11 @@ LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
 RTDS_PREVCLOSE_SHADOW_STRATEGY = "btc5-rtds-prevclose-shadow"
 RTDS_LIVE_FALLBACK_SOURCE = "rtds-live-fallback"
 RTDS_LIVE_FALLBACK_ENABLED = os.getenv("RTDS_LIVE_FALLBACK_ENABLED", "true").lower() == "true"
+# Kline (Binance 5m open) and RTDS prices are consistently ~$33/$30 ABOVE the actual
+# Chainlink Data Streams price Polymarket uses for settlement. Subtract this correction
+# so the reference used for diff and strategy tag reflects the real expected beat.
+KLINE_BIAS_CORRECTION = float(os.getenv("KLINE_BIAS_CORRECTION", "33.0"))
+RTDS_BIAS_CORRECTION  = float(os.getenv("RTDS_BIAS_CORRECTION",  "30.0"))
 RTDS_LIVE_UP_DIFF        = float(os.getenv("RTDS_LIVE_UP_DIFF",          "30"))
 RTDS_LIVE_DOWN_DIFF      = float(os.getenv("RTDS_LIVE_DOWN_DIFF",        "40"))
 RTDS_LIVE_UP_CROWD_CAP   = float(os.getenv("RTDS_LIVE_UP_CROWD_CAP",    "0.55"))
@@ -504,10 +509,15 @@ class PaperBot:
                 if _pre_ref_price is None:
                     _pre_ref_price, _pre_ref_source = self._previous_final_reference(market)
                 if _pre_ref_price is None and start_ts is not None:
-                    _pre_ref_price = await self._binance_feed.get_kline_open(start_ts)
-                    _pre_ref_source = "binance-kline-open" if _pre_ref_price is not None else None
+                    _kline_raw = await self._binance_feed.get_kline_open(start_ts)
+                    if _kline_raw is not None:
+                        _pre_ref_price = _kline_raw - KLINE_BIAS_CORRECTION
+                        _pre_ref_source = "binance-kline-open"
                 if _pre_ref_price is None:
-                    _pre_ref_price, _pre_ref_source = self._rtds_live_fallback_reference(market)
+                    _rtds_raw, _rtds_src = self._rtds_live_fallback_reference(market)
+                    if _rtds_raw is not None:
+                        _pre_ref_price = _rtds_raw - RTDS_BIAS_CORRECTION
+                        _pre_ref_source = _rtds_src
                 if _pre_ref_price is None:
                     _pre_ref_price = self._market_start_prices.get(slug)
                     _pre_ref_source = self._market_start_sources.get(slug)
@@ -634,15 +644,18 @@ class PaperBot:
                 kline_price_to_beat: Optional[float] = None
                 if official_price_to_beat is None and prev_final_price_to_beat is None:
                     if start_ts is not None:
-                        kline_price_to_beat = await self._binance_feed.get_kline_open(start_ts)
-                        if kline_price_to_beat is not None:
+                        _kline_raw = await self._binance_feed.get_kline_open(start_ts)
+                        if _kline_raw is not None:
+                            kline_price_to_beat = _kline_raw - KLINE_BIAS_CORRECTION
                             print(
-                                f"[bot] kline open reference: {slug} ${kline_price_to_beat:,.2f}",
+                                f"[bot] kline open reference: {slug} ${_kline_raw:,.2f} → corrected ${kline_price_to_beat:,.2f}",
                                 flush=True,
                             )
                 rtds_price_to_beat, rtds_source = (None, None)
                 if official_price_to_beat is None and prev_final_price_to_beat is None and kline_price_to_beat is None:
-                    rtds_price_to_beat, rtds_source = self._rtds_live_fallback_reference(market)
+                    _rtds_raw, rtds_source = self._rtds_live_fallback_reference(market)
+                    if _rtds_raw is not None:
+                        rtds_price_to_beat = _rtds_raw - RTDS_BIAS_CORRECTION
                 local_price_to_beat = self._market_start_prices.get(slug)
                 local_price_source = self._market_start_sources.get(slug)
                 if (
@@ -1439,9 +1452,13 @@ class PaperBot:
         if reference_price is None and start_ts is not None:
             kline = await self._binance_feed.get_kline_open(start_ts)
             if kline is not None:
-                reference_price, reference_source = kline, "binance-kline-open"
+                reference_price = kline - KLINE_BIAS_CORRECTION
+                reference_source = "binance-kline-open"
         if reference_price is None:
-            reference_price, reference_source = self._rtds_live_fallback_reference(market)
+            rtds_raw, rtds_src = self._rtds_live_fallback_reference(market)
+            if rtds_raw is not None:
+                reference_price = rtds_raw - RTDS_BIAS_CORRECTION
+                reference_source = rtds_src
         if reference_price is None:
             print(
                 f"[bot] LAG-FOLLOW LIVE SKIP: {slug} all reference sources unavailable",
