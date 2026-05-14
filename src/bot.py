@@ -2353,14 +2353,6 @@ class PaperBot:
         kelly_stake    = min(max_stake, raw_stake)
         stake          = _round_order_size(max(min_stake, kelly_stake))
 
-        if max_stake < min_stake:
-            print(
-                f"[bot] OPEN SKIP: {slug} {side} entry={entry_price:.3f} "
-                f"max stake ${max_stake:.2f} below ${min_stake:.2f} minimum "
-                f"(shares floor=${min_shares_stake:.2f}, bal={_live_bal:.2f})",
-                flush=True,
-            )
-            return
         if kelly_stake < min_stake:
             print(
                 f"[bot] OPEN: {slug} {side} entry={entry_price:.3f} "
