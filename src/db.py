@@ -295,7 +295,23 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_rtds_samples_slug ON rtds_reference_samples(market_slug);
-        CREATE INDEX IF NOT EXISTS idx_rtds_samples_error ON rtds_reference_samples(error)
+        CREATE INDEX IF NOT EXISTS idx_rtds_samples_error ON rtds_reference_samples(error);
+
+        CREATE TABLE IF NOT EXISTS pre_signal_orders (
+            market_slug       TEXT PRIMARY KEY,
+            order_id          TEXT NOT NULL,
+            side              TEXT NOT NULL,
+            stake             REAL NOT NULL,
+            limit_price       REAL NOT NULL,
+            placed_at         REAL NOT NULL,
+            price_to_beat     REAL,
+            reference_source  TEXT,
+            diff_at_placement REAL,
+            crowd_at_placement REAL,
+            end_ts            REAL,
+            hour_et           INTEGER,
+            created_at        TEXT NOT NULL
+        )
     """)
     conn.commit()
 
@@ -1211,6 +1227,74 @@ def get_top_whale_wallets(limit: int = 5) -> list:
             ORDER BY win_rate DESC, resolved_trades DESC
             LIMIT %s""",
         (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Pre-signal order persistence ───────────────────────────────────────────────
+
+def save_pre_signal_order(order_info: dict) -> None:
+    """Persist a resting GTC pre-signal order so it survives bot restarts."""
+    from datetime import timezone
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO pre_signal_orders
+               (market_slug, order_id, side, stake, limit_price, placed_at,
+                price_to_beat, reference_source, diff_at_placement,
+                crowd_at_placement, end_ts, hour_et, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (market_slug) DO UPDATE SET
+               order_id          = EXCLUDED.order_id,
+               side              = EXCLUDED.side,
+               stake             = EXCLUDED.stake,
+               limit_price       = EXCLUDED.limit_price,
+               placed_at         = EXCLUDED.placed_at,
+               price_to_beat     = EXCLUDED.price_to_beat,
+               reference_source  = EXCLUDED.reference_source,
+               diff_at_placement = EXCLUDED.diff_at_placement,
+               crowd_at_placement = EXCLUDED.crowd_at_placement,
+               end_ts            = EXCLUDED.end_ts,
+               hour_et           = EXCLUDED.hour_et,
+               created_at        = EXCLUDED.created_at"""
+        if _USE_PG else
+        """INSERT OR REPLACE INTO pre_signal_orders
+               (market_slug, order_id, side, stake, limit_price, placed_at,
+                price_to_beat, reference_source, diff_at_placement,
+                crowd_at_placement, end_ts, hour_et, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (
+            order_info["market_slug"],
+            order_info["order_id"],
+            order_info["side"],
+            order_info["stake"],
+            order_info["limit_price"],
+            order_info["placed_at"],
+            order_info.get("price_to_beat"),
+            order_info.get("reference_source"),
+            order_info.get("diff_at_placement"),
+            order_info.get("crowd_at_placement"),
+            order_info.get("end_ts"),
+            order_info.get("hour_et"),
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_pre_signal_order(market_slug: str) -> None:
+    conn = get_connection()
+    conn.execute("DELETE FROM pre_signal_orders WHERE market_slug = %s", (market_slug,))
+    conn.commit()
+    conn.close()
+
+
+def load_pre_signal_orders() -> list[dict]:
+    """Load all resting pre-signal orders from DB (called on bot startup)."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM pre_signal_orders ORDER BY placed_at ASC"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

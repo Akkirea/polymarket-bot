@@ -192,7 +192,10 @@ class PaperBot:
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
-        self._pre_signal_orders: dict = {}         # slug → pre-signal order dict
+        self._pre_signal_orders: dict = {          # slug → pre-signal order dict
+            row["market_slug"]: row
+            for row in db.load_pre_signal_orders()
+        }
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows per (slug, strategy)
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
@@ -203,6 +206,12 @@ class PaperBot:
         self._funding_rate: Optional[float] = None
         self._funding_rate_updated_at: float = 0.0
         self._funding_rate_source: Optional[str] = None
+        if self._pre_signal_orders:
+            print(
+                f"[bot] Restored {len(self._pre_signal_orders)} resting pre-signal order(s) from DB: "
+                + ", ".join(self._pre_signal_orders.keys()),
+                flush=True,
+            )
         print(f"[bot] Loaded balance from DB: ${self.balance:.2f}", flush=True)
         print(
             f"[bot] Loaded stats from DB: wins={self.wins} losses={self.losses} "
@@ -1213,7 +1222,8 @@ class PaperBot:
             from . import live_clob
             limit_price = min(PRE_SIGNAL_LIMIT_PRICE, max_profit_price, CROWD_MAX)
             result = await live_clob.place_limit_order(market, side, stake, limit_price)
-            self._pre_signal_orders[slug] = {
+            order_rec = {
+                "market_slug": slug,
                 "order_id": result["order_id"],
                 "side": side,
                 "stake": stake,
@@ -1227,6 +1237,8 @@ class PaperBot:
                 "end_ts": market.get("endDateIso") or market.get("end_ts"),
                 "hour_et": hour_et,
             }
+            self._pre_signal_orders[slug] = order_rec
+            db.save_pre_signal_order(order_rec)
             print(
                 f"[bot] PRE-SIGNAL LIMIT: {side} {slug} "
                 f"stake=${stake:.2f} limit={limit_price:.3f} diff=${diff:+.2f} "
@@ -1273,6 +1285,7 @@ class PaperBot:
             except Exception as exc:
                 print(f"[bot] PRE-SIGNAL cancel error {slug}: {exc}", flush=True)
             self._pre_signal_orders.pop(slug, None)
+            db.delete_pre_signal_order(slug)
             return False
 
         # Check fill status
@@ -1293,6 +1306,7 @@ class PaperBot:
 
         # Filled — promote to open position
         self._pre_signal_orders.pop(slug, None)
+        db.delete_pre_signal_order(slug)
         self._entered_slugs.add(slug)
         self.live_balance -= filled_usdc
 
