@@ -24,7 +24,7 @@ from typing import Optional
 import aiohttp
 
 from . import db
-from .binance_ws import BinancePriceFeed
+from .binance_ws import BinancePriceFeed, OrderBookFeed
 from .chainlink import get_btc_price
 from .rtds_ws import PolymarketRtdsPriceFeed
 
@@ -95,6 +95,9 @@ HEDGED_SHADOW_WINDOW = (150, 300)
 HEDGED_DOMINANT_MIN  = 0.45
 HEDGED_DOMINANT_MAX  = 0.67
 HEDGED_HEDGE_MAX     = 0.10
+OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.6"))
+OB_SUSTAINED_SECONDS   = float(os.getenv("OB_SUSTAINED_SECONDS",   "5.0"))
+OB_SHADOW_WINDOW       = (60, 210)  # wider than lag-follow; leading signal fires early
 
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
@@ -202,9 +205,11 @@ class PaperBot:
         self._task:       Optional[asyncio.Task] = None
         self._binance_task: Optional[asyncio.Task] = None
         self._rtds_task: Optional[asyncio.Task] = None
+        self._ob_task: Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._binance_feed = BinancePriceFeed()
         self._rtds_feed = PolymarketRtdsPriceFeed()
+        self._ob_feed = OrderBookFeed()
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
@@ -264,6 +269,7 @@ class PaperBot:
         loop = asyncio.get_running_loop()
         self._binance_task = loop.create_task(self._binance_feed.connect())
         self._rtds_task = loop.create_task(self._rtds_feed.connect())
+        self._ob_task = loop.create_task(self._ob_feed.connect())
         loop.create_task(self._reconcile_unresolved_trades())
         loop.create_task(self._reconcile_unresolved_shadow_trades())
         loop.create_task(self._reconcile_unresolved_live_attempts())
@@ -296,6 +302,14 @@ class PaperBot:
             except asyncio.CancelledError:
                 pass
             self._rtds_task = None
+        self._ob_feed.stop()
+        if self._ob_task:
+            self._ob_task.cancel()
+            try:
+                await self._ob_task
+            except asyncio.CancelledError:
+                pass
+            self._ob_task = None
         if self._session and not self._session.closed:
             await self._session.close()
         print("[bot] Stopped")
@@ -1738,7 +1752,30 @@ class PaperBot:
             if momentum_ok and CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE:
                 record("btc5-early-momentum-shadow", side)
 
-        # 3) Bonereaper-style research: dominant directional leg with cheap
+        # 3) Order book imbalance: leading signal — fires before price confirms.
+        ob_lo, ob_hi = OB_SHADOW_WINDOW
+        if ob_lo <= seconds_remaining <= ob_hi:
+            imbalance = self._ob_feed.get_sustained_imbalance(OB_SUSTAINED_SECONDS)
+            if imbalance is not None and abs(imbalance) >= OB_IMBALANCE_THRESHOLD:
+                ob_side = "Up" if imbalance > 0 else "Down"
+                ob_price = _side_price(market, ob_side)
+                if CROWD_MIN <= ob_price <= SHADOW_MAX_FOLLOW_PRICE:
+                    if not self._research_shadow_exists(slug, "btc5-ob-imbalance-shadow"):
+                        self._record_shadow_entry(
+                            slug=slug,
+                            side=ob_side,
+                            entry_price=ob_price,
+                            end_ts=end_ts,
+                            price_to_beat=reference_price,
+                            diff_at_entry=round(imbalance, 4),
+                            seconds_remaining=seconds_remaining,
+                            hour_et=hour_et,
+                            strategy="btc5-ob-imbalance-shadow",
+                            preserve_reference=True,
+                            force_min_stake=True,
+                        )
+
+        # 4) Bonereaper-style research: dominant directional leg with cheap
         # opposite insurance. This is shadow-only because 0.90+ chasing has
         # blow-up risk; we only test sane dominant prices.
         hedge_lo, hedge_hi = HEDGED_SHADOW_WINDOW
