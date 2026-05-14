@@ -200,6 +200,8 @@ class PaperBot:
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
         self._final_price_cache_at: dict = {}      # {market_slug: unix_ts when finalPrice was fetched}
+        self._ptb_cache:            dict = {}      # {market_slug: priceToBeat} refreshed independently
+        self._ptb_cache_at:         dict = {}      # {market_slug: unix_ts when priceToBeat was last fetched}
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._market_start_sources: dict = {}     # slug → source name for cached first-sight price
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
@@ -482,6 +484,10 @@ class PaperBot:
                 _pre_ref_price: Optional[float] = _extract_official_price_to_beat(market)
                 _pre_ref_source: Optional[str] = "polymarket-official" if _pre_ref_price is not None else None
                 if _pre_ref_price is None:
+                    _ptb = await self._fetch_official_price_to_beat(slug)
+                    if _ptb is not None:
+                        _pre_ref_price, _pre_ref_source = _ptb, "polymarket-official"
+                if _pre_ref_price is None:
                     _pre_ref_price, _pre_ref_source = self._previous_final_reference(market)
                 if _pre_ref_price is None and start_ts is not None:
                     _pre_ref_price = await self._binance_feed.get_kline_open(start_ts)
@@ -593,6 +599,8 @@ class PaperBot:
                     print("[bot] _tick: reversal check in progress — skipping reversal-guard", flush=True)
                     continue
                 official_price_to_beat = _extract_official_price_to_beat(market)
+                if official_price_to_beat is None:
+                    official_price_to_beat = await self._fetch_official_price_to_beat(slug)
                 # current priceToBeat == previous window's finalPrice at the boundary —
                 # seed the cache now so prev-finalPrice is available immediately without
                 # waiting for _collect_final_prices() to poll Gamma
@@ -900,6 +908,32 @@ class PaperBot:
             return None, None
 
         return float(prev_final), "prev-finalPrice"
+
+    async def _fetch_official_price_to_beat(self, slug: str) -> Optional[float]:
+        """Re-fetch priceToBeat directly from Gamma for a specific slug. Cached for 10s."""
+        now = time.time()
+        cached_at = self._ptb_cache_at.get(slug)
+        if cached_at is not None and now - cached_at < 10.0:
+            return self._ptb_cache.get(slug)
+
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{GAMMA_API}/markets", params={"slug": slug}
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if not data:
+                    return None
+                ptb = _extract_official_price_to_beat(data[0])
+                self._ptb_cache_at[slug] = now
+                if ptb is not None:
+                    self._ptb_cache[slug] = ptb
+                    print(f"[bot] priceToBeat refreshed: {slug} ${ptb:,.2f}", flush=True)
+                return ptb
+        except Exception:
+            return None
 
     def _local_previous_close_reference(self, market: dict) -> tuple[Optional[float], Optional[str]]:
         """Estimate current market's beat from local BTC price at previous close.
@@ -1372,6 +1406,10 @@ class PaperBot:
 
         reference_price = _extract_official_price_to_beat(market)
         reference_source = "polymarket-official" if reference_price is not None else None
+        if reference_price is None:
+            ptb = await self._fetch_official_price_to_beat(slug)
+            if ptb is not None:
+                reference_price, reference_source = ptb, "polymarket-official"
         if reference_price is None:
             reference_price, reference_source = self._previous_final_reference(market)
         if reference_price is None and start_ts is not None:
