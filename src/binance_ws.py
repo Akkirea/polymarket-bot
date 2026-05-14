@@ -20,12 +20,15 @@ from . import config
 class BinancePriceFeed:
     """Real-time BTC price via Binance WebSocket."""
 
+    _KLINE_URL = "https://api.binance.com/api/v3/klines"
+
     def __init__(self):
         self.current_price: Optional[float] = None
         self.last_update: Optional[float] = None
         self.source: str = "binance"
         self.change_24h: Optional[float] = None  # not provided by trade stream
         self._price_history: deque = deque(maxlen=600)  # ~10 min at 1/sec
+        self._kline_cache: dict = {}  # start_ts → open price
         self._running = False
         self._ws = None
 
@@ -111,6 +114,46 @@ class BinancePriceFeed:
         if closest_diff > 5.0:
             return None
         return closest
+
+    async def get_kline_open(self, start_ts: float) -> Optional[float]:
+        """
+        Return the Binance 5m kline open price at start_ts (Unix seconds).
+
+        Binance klines align with clock boundaries (:00, :05, :10 ...) so the
+        candle whose openTime == start_ts gives the BTC price at the exact
+        moment the Polymarket window opened — same reference Chainlink uses.
+        Result is cached per start_ts so only one HTTP call is made per market.
+        """
+        if start_ts in self._kline_cache:
+            return self._kline_cache[start_ts]
+
+        import aiohttp as _aio
+        start_ms = int(start_ts * 1000)
+        try:
+            async with _aio.ClientSession(timeout=_aio.ClientTimeout(total=5)) as session:
+                async with session.get(
+                    self._KLINE_URL,
+                    params={
+                        "symbol": "BTCUSDT",
+                        "interval": "5m",
+                        "startTime": start_ms,
+                        "limit": 1,
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not data or len(data[0]) < 2:
+                        return None
+                    # Verify the returned candle actually starts at our timestamp
+                    candle_open_ms = int(data[0][0])
+                    if abs(candle_open_ms - start_ms) > 1000:
+                        return None
+                    price = float(data[0][1])  # index 1 = open price
+                    self._kline_cache[start_ts] = price
+                    return price
+        except Exception:
+            return None
 
     # Port 9443 is blocked on some cloud providers; 443 is the fallback.
     _WS_URLS = [
