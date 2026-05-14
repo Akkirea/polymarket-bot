@@ -75,6 +75,10 @@ RTDS_LIVE_UP_DIFF        = float(os.getenv("RTDS_LIVE_UP_DIFF",          "30"))
 RTDS_LIVE_DOWN_DIFF      = float(os.getenv("RTDS_LIVE_DOWN_DIFF",        "40"))
 RTDS_LIVE_UP_CROWD_CAP   = float(os.getenv("RTDS_LIVE_UP_CROWD_CAP",    "0.55"))
 RTDS_LIVE_DOWN_CROWD_FLOOR = float(os.getenv("RTDS_LIVE_DOWN_CROWD_FLOOR", "0.45"))
+PRE_SIGNAL_ENABLED     = os.getenv("PRE_SIGNAL_ENABLED", "true").lower() == "true"
+PRE_SIGNAL_DIFF        = float(os.getenv("PRE_SIGNAL_DIFF",        "15"))
+PRE_SIGNAL_LIMIT_PRICE = float(os.getenv("PRE_SIGNAL_LIMIT_PRICE", "0.52"))
+PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF",  "8"))
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
@@ -187,6 +191,7 @@ class PaperBot:
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
+        self._pre_signal_orders: dict = {}         # slug → pre-signal order dict
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows per (slug, strategy)
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
@@ -455,6 +460,51 @@ class PaperBot:
             )
             if market.get("_sz_live_enabled", True):
                 await self._record_research_shadows(market, end_ts, seconds_remaining, hour_et, markets)
+            if slug.startswith("btc-updown-15m-"):
+                await self._record_15m_shadow(market, end_ts, seconds_remaining, hour_et)
+
+            # ── Pre-signal limit order management (5m live markets only) ──────
+            if (
+                bool(market.get("_sz_live_enabled", True))
+                and slug.startswith("btc-updown-5m-")
+            ):
+                # Compute reference price once — reused by pre-signal and lag-follow paths
+                _pre_ref_price: Optional[float] = _extract_official_price_to_beat(market)
+                _pre_ref_source: Optional[str] = "polymarket-official" if _pre_ref_price is not None else None
+                if _pre_ref_price is None:
+                    _pre_ref_price, _pre_ref_source = self._previous_final_reference(market)
+                if _pre_ref_price is None:
+                    _pre_ref_price, _pre_ref_source = self._rtds_live_fallback_reference(market)
+
+                if _pre_ref_price is not None:
+                    _pre_live_price, _pre_live_source = await self._get_signal_price()
+                    if _pre_live_price is not None:
+                        _pre_diff = _pre_live_price - _pre_ref_price
+
+                        # 1. Manage existing resting orders (check fill / cancel on reversal)
+                        pre_filled = await self._manage_pre_signal_orders(
+                            market=market,
+                            current_diff=_pre_diff,
+                            seconds_remaining=seconds_remaining,
+                            end_ts=end_ts,
+                            start_ts=start_ts,
+                            hour_et=hour_et,
+                        )
+                        if pre_filled:
+                            break
+
+                        # 2. Place a new pre-signal limit at $15 threshold
+                        if (
+                            in_main_window or in_early_live_window
+                        ) and slug not in self._entered_slugs:
+                            await self._maybe_place_pre_signal_limit(
+                                market=market,
+                                diff=_pre_diff,
+                                reference_price=_pre_ref_price,
+                                reference_source=_pre_ref_source,
+                                seconds_remaining=seconds_remaining,
+                                hour_et=hour_et,
+                            )
 
             if (
                 LAG_FOLLOW_LIVE_ENABLED
@@ -776,7 +826,12 @@ class PaperBot:
                         market["_sz_entry_window"] = spec["entry_window"]
                         market["_sz_mode"] = spec.get("mode", "paper")
                         markets.append(market)
-                        print(f"[bot] found open market: {slug}  closed={data[0].get('closed')}")
+                        volume = float(market.get("volume") or 0)
+                        print(
+                            f"[bot] found open market: {slug}  closed={data[0].get('closed')}  "
+                            f"label={spec['label']}  volume=${volume:.0f}  "
+                            f"live_enabled={spec['live_enabled']}  mode={spec.get('mode','paper')}"
+                        )
                     elif data:
                         print(f"[bot] market {slug} is closed — skipping")
                     else:
@@ -1107,6 +1162,165 @@ class PaperBot:
             f"10s=${momentum_10:+.2f}, 30s=${momentum_30:+.2f}"
         )
 
+    async def _maybe_place_pre_signal_limit(
+        self,
+        market: dict,
+        diff: float,
+        reference_price: float,
+        reference_source: str,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> None:
+        """At PRE_SIGNAL_DIFF threshold, place a GTC limit order before the book reprices."""
+        if not PRE_SIGNAL_ENABLED:
+            return
+        if os.getenv("POLYMARKET_LIVE", "false").lower() != "true":
+            return
+
+        slug = market.get("slug", "")
+        if slug in self._entered_slugs or slug in self._pre_signal_orders:
+            return
+        if seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
+            return
+
+        side = "Up" if diff > 0 else "Down"
+        if abs(diff) < PRE_SIGNAL_DIFF:
+            return
+
+        crowd_price = _side_price(market, side)
+        if not (CROWD_MIN <= crowd_price <= CROWD_MAX):
+            return
+
+        win_prob = self._get_measured_win_prob()
+        loss_prob = 1.0 - win_prob
+        b = (1.0 / PRE_SIGNAL_LIMIT_PRICE) - 1.0
+        kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
+        multiplier = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
+        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
+        stake = _round_order_size(max(MIN_STAKE, min(MAX_STAKE * multiplier, self.balance * kelly_fraction * 0.5 * multiplier)))
+
+        if self.balance < stake:
+            return
+
+        try:
+            from . import live_clob
+            limit_price = min(PRE_SIGNAL_LIMIT_PRICE, max_profit_price, CROWD_MAX)
+            result = await live_clob.place_limit_order(market, side, stake, limit_price)
+            self._pre_signal_orders[slug] = {
+                "order_id": result["order_id"],
+                "side": side,
+                "stake": stake,
+                "limit_price": limit_price,
+                "placed_at": time.time(),
+                "market": market,
+                "price_to_beat": reference_price,
+                "reference_source": reference_source,
+                "diff_at_placement": diff,
+                "crowd_at_placement": crowd_price,
+                "end_ts": market.get("endDateIso") or market.get("end_ts"),
+                "hour_et": hour_et,
+            }
+            print(
+                f"[bot] PRE-SIGNAL LIMIT: {side} {slug} "
+                f"stake=${stake:.2f} limit={limit_price:.3f} diff=${diff:+.2f} "
+                f"order_id={result['order_id']}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[bot] PRE-SIGNAL LIMIT failed for {slug}: {exc}", flush=True)
+
+    async def _manage_pre_signal_orders(
+        self,
+        market: dict,
+        current_diff: float,
+        seconds_remaining: float,
+        end_ts: float,
+        start_ts: Optional[float],
+        hour_et: int,
+    ) -> bool:
+        """
+        Check resting pre-signal orders for this market.
+        - If filled: promote to open position, return True (skip further entry logic)
+        - If diff reversed below cancel threshold: cancel the order
+        - Returns True if a pre-signal fill was processed (caller should skip normal entry).
+        """
+        slug = market.get("slug", "")
+        order_info = self._pre_signal_orders.get(slug)
+        if order_info is None:
+            return False
+
+        side = order_info["side"]
+        order_id = order_info["order_id"]
+
+        # Cancel if direction reversed
+        if (side == "Up" and current_diff < PRE_SIGNAL_CANCEL_DIFF) or \
+           (side == "Down" and current_diff > -PRE_SIGNAL_CANCEL_DIFF):
+            print(
+                f"[bot] PRE-SIGNAL CANCEL: {slug} diff reversed to ${current_diff:+.2f} "
+                f"— cancelling order {order_id}",
+                flush=True,
+            )
+            try:
+                from . import live_clob
+                await live_clob.cancel_limit_order(order_id)
+            except Exception as exc:
+                print(f"[bot] PRE-SIGNAL cancel error {slug}: {exc}", flush=True)
+            self._pre_signal_orders.pop(slug, None)
+            return False
+
+        # Check fill status
+        try:
+            from . import live_clob
+            status = await live_clob.get_order_status(order_id)
+        except Exception as exc:
+            print(f"[bot] PRE-SIGNAL status check failed {slug}: {exc}", flush=True)
+            return False
+
+        size_matched = float(status.get("size_matched") or status.get("sizeMatched") or 0)
+        size_total   = float(status.get("original_size") or status.get("size") or (order_info["stake"] / order_info["limit_price"]))
+        filled_usdc  = size_matched * order_info["limit_price"]
+
+        if filled_usdc < 0.50:
+            # Not meaningfully filled yet
+            return False
+
+        # Filled — promote to open position
+        self._pre_signal_orders.pop(slug, None)
+        self._entered_slugs.add(slug)
+        self.live_balance -= filled_usdc
+
+        strategy = "btc5-pre-signal-limit"
+        if order_info.get("reference_source") == RTDS_LIVE_FALLBACK_SOURCE:
+            strategy = "btc5-pre-signal-limit-rtds"
+
+        print(
+            f"[bot] PRE-SIGNAL FILLED: {side} {slug} "
+            f"filled_usdc=${filled_usdc:.2f} price={order_info['limit_price']:.3f} "
+            f"order_id={order_id}",
+            flush=True,
+        )
+
+        pos = {
+            "market_slug":       slug,
+            "side":              side,
+            "size":              order_info["stake"],
+            "entry_price":       order_info["limit_price"],
+            "price_to_beat":     order_info["price_to_beat"],
+            "end_ts":            end_ts,
+            "opened_at":         datetime.now(timezone.utc).isoformat(),
+            "diff_at_entry":     order_info["diff_at_placement"],
+            "seconds_remaining": seconds_remaining,
+            "strategy":          strategy,
+            "live_order_id":     order_id,
+            "live_stake":        round(filled_usdc, 2),
+            "live_fill_price":   order_info["limit_price"],
+        }
+        self.balance -= order_info["stake"]
+        self.positions.append(pos)
+        db.save_open_position(pos)
+        db.save_bot_state(self.balance)
+        return True
+
     async def _maybe_open_lag_follow_live(
         self,
         market: dict,
@@ -1306,6 +1520,60 @@ class PaperBot:
                 record(f"btc5-hedged-dominant-shadow-{suffix}", side)
                 if hedge_price <= HEDGED_HEDGE_MAX:
                     record(f"btc5-cheap-hedge-shadow-{suffix}", opposite)
+
+    async def _record_15m_shadow(
+        self,
+        market: dict,
+        end_ts: float,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> None:
+        """Record shadow research entries for BTC 15m markets."""
+        slug = market.get("slug", "")
+        if not slug.startswith("btc-updown-15m-"):
+            return
+        if self._research_shadow_exists(slug, "btc-15m-paper-shadow"):
+            return
+
+        volume = float(market.get("volume") or 0.0)
+        if volume < MIN_SHADOW_VOLUME:
+            return
+
+        official_ptb = _extract_official_price_to_beat(market)
+        prev_final, _ = self._previous_final_reference(market)
+        reference_price = official_ptb or prev_final
+        if reference_price is None:
+            return
+
+        live_price, _ = await self._get_signal_price()
+        if live_price is None:
+            return
+
+        diff = live_price - reference_price
+        spec = _market_spec_for_slug(slug)
+        diff_threshold = float(spec["diff_threshold"]) if spec else 25.0
+
+        if abs(diff) < diff_threshold:
+            return
+
+        side = "Up" if diff > 0 else "Down"
+        side_price = _side_price(market, side)
+        if not (CROWD_MIN <= side_price <= CROWD_MAX):
+            return
+
+        self._record_shadow_entry(
+            slug=slug,
+            side=side,
+            entry_price=side_price,
+            end_ts=end_ts,
+            price_to_beat=reference_price,
+            diff_at_entry=diff,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+            strategy="btc-15m-paper-shadow",
+            preserve_reference=True,
+            force_min_stake=True,
+        )
 
     async def _record_local_prevclose_shadow(
         self,

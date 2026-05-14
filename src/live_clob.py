@@ -64,6 +64,7 @@ def _load_sdk():
             BalanceAllowanceParams,
             MarketOrderArgs,
             OrderArgs,
+            OrderPayload,
             OrderType,
             PartialCreateOrderOptions,
         )
@@ -78,6 +79,7 @@ def _load_sdk():
         "ClobClient": ClobClient,
         "MarketOrderArgs": MarketOrderArgs,
         "OrderArgs": OrderArgs,
+        "OrderPayload": OrderPayload,
         "OrderType": OrderType,
         "PartialCreateOrderOptions": PartialCreateOrderOptions,
         "BUY": "BUY",
@@ -390,6 +392,80 @@ async def place_order(
         "tx_hash": (resp.get("transactionsHashes") or [None])[0],
         "response": resp,
     }
+
+
+async def place_limit_order(
+    market: dict,
+    side: str,
+    stake: float,
+    limit_price: float,
+) -> dict:
+    """Place a GTC resting limit BUY. stake is USDC, size in shares = stake/limit_price."""
+    if os.getenv("POLYMARKET_LIVE", "false").lower() != "true":
+        raise LiveClobError("POLYMARKET_LIVE must be true to place live orders")
+
+    min_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
+    max_price = float(os.getenv("MAX_LIVE_PRICE", "0.70"))
+    if not (min_price <= limit_price <= max_price):
+        raise LiveClobError(
+            f"limit_price {limit_price:.3f} outside [{min_price:.2f},{max_price:.2f}]"
+        )
+
+    sdk = _load_sdk()
+    client = _client(sdk)
+    token_id = token_for_side(market, side)
+    tick_size = client.get_tick_size(token_id)
+    neg_risk = client.get_neg_risk(token_id)
+
+    stake = round(stake, 2)
+    if stake < 0.01:
+        raise LiveClobError(f"Stake ${stake:.4f} below $0.01 minimum")
+
+    shares = round(stake / limit_price, 4)
+
+    order = client.create_order(
+        order_args=sdk["OrderArgs"](
+            token_id=token_id,
+            price=limit_price,
+            size=shares,
+            side="BUY",
+        ),
+        options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
+    )
+    response = client.post_order(order, sdk["OrderType"].GTC)
+    resp = _to_plain(response)
+
+    if not isinstance(resp, dict):
+        raise LiveClobError(f"GTC order returned unexpected response: {resp}")
+
+    order_id = resp.get("orderID") or resp.get("order_id")
+    if not order_id:
+        raise LiveClobError(f"GTC order response missing orderID: {resp}")
+
+    return {
+        "order_id": order_id,
+        "token_id": token_id,
+        "side": side,
+        "limit_price": limit_price,
+        "stake_usdc": stake,
+        "shares": shares,
+        "response": resp,
+    }
+
+
+async def get_order_status(order_id: str) -> dict:
+    """Return current status of a resting order."""
+    sdk = _load_sdk()
+    client = _client(sdk)
+    return _to_plain(client.get_order(order_id))
+
+
+async def cancel_limit_order(order_id: str) -> bool:
+    """Cancel a resting GTC order. Returns True on success."""
+    sdk = _load_sdk()
+    client = _client(sdk)
+    resp = _to_plain(client.cancel_order(sdk["OrderPayload"](orderID=order_id)))
+    return isinstance(resp, dict) and not resp.get("error")
 
 
 async def update_balance() -> dict:
