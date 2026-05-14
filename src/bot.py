@@ -76,9 +76,9 @@ RTDS_LIVE_DOWN_DIFF      = float(os.getenv("RTDS_LIVE_DOWN_DIFF",        "40"))
 RTDS_LIVE_UP_CROWD_CAP   = float(os.getenv("RTDS_LIVE_UP_CROWD_CAP",    "0.55"))
 RTDS_LIVE_DOWN_CROWD_FLOOR = float(os.getenv("RTDS_LIVE_DOWN_CROWD_FLOOR", "0.45"))
 PRE_SIGNAL_ENABLED     = os.getenv("PRE_SIGNAL_ENABLED", "true").lower() == "true"
-PRE_SIGNAL_DIFF        = float(os.getenv("PRE_SIGNAL_DIFF",        "15"))
-PRE_SIGNAL_LIMIT_PRICE = float(os.getenv("PRE_SIGNAL_LIMIT_PRICE", "0.52"))
-PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF",  "8"))
+PRE_SIGNAL_DIFF        = float(os.getenv("PRE_SIGNAL_DIFF",        "22"))
+PRE_SIGNAL_LIMIT_PRICE = float(os.getenv("PRE_SIGNAL_LIMIT_PRICE", "0.50"))
+PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF", "13"))
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
@@ -509,9 +509,10 @@ class PaperBot:
                         if pre_filled:
                             break
 
-                        # 2. Place a new pre-signal limit at $15 threshold
+                        # 2. Place a new pre-signal limit — main window only, quality reference only
                         if (
-                            in_main_window or in_early_live_window
+                            in_main_window
+                            and _pre_ref_source in ("polymarket-official", "prev-finalPrice", "binance-kline-open")
                         ) and slug not in self._entered_slugs:
                             await self._maybe_place_pre_signal_limit(
                                 market=market,
@@ -1228,7 +1229,7 @@ class PaperBot:
         b = (1.0 / PRE_SIGNAL_LIMIT_PRICE) - 1.0
         kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
         multiplier = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
-        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
+        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
         stake = _round_order_size(max(MIN_STAKE, min(MAX_STAKE * multiplier, self.balance * kelly_fraction * 0.5 * multiplier)))
 
         if self.balance < stake:
@@ -2204,7 +2205,7 @@ class PaperBot:
                 live_cap = entry_price
                 try:
                     from . import live_clob
-                    max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
+                    max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
                     live_cap = min(CROWD_MAX, max_profit_price)
                     live_retries = max(0, int(os.getenv("LIVE_FAK_RETRIES", "1")))
                     live_retry_delay = max(0.0, float(os.getenv("LIVE_FAK_RETRY_DELAY_SEC", "1.0")))
@@ -2308,7 +2309,7 @@ class PaperBot:
         if market is None or slug in self._live_retry_slugs:
             return
 
-        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.67"))
+        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
         retry_interval = max(0.5, float(os.getenv("LIVE_RETRY_INTERVAL_SEC", "3.0")))
         stop_before_close = max(
             LIVE_MIN_SECONDS_BEFORE_CLOSE,
