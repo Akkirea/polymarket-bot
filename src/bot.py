@@ -1134,7 +1134,7 @@ class PaperBot:
         """Return the nearest recent BTC reading, preferring Binance history."""
         target = time.time() - n
 
-        if self._binance_feed.connected:
+        if self._binance_feed._price_history:
             price = self._find_closest_price(self._binance_feed._price_history, target, max_gap=2.0)
             if price is not None:
                 return price
