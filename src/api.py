@@ -428,6 +428,55 @@ def get_shadow_summary():
     return {"ok": True, "families": summaries}
 
 
+@app.get("/api/bot/shadow/diff-buckets")
+def get_shadow_diff_buckets(strategy: str = "btc5-lag-follow-shadow"):
+    """Win rate broken down by |diff_at_entry| bucket for a shadow strategy."""
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT
+                   CASE
+                     WHEN ABS(diff_at_entry) < 20  THEN '10-20'
+                     WHEN ABS(diff_at_entry) < 35  THEN '20-35'
+                     WHEN ABS(diff_at_entry) < 50  THEN '35-50'
+                     WHEN ABS(diff_at_entry) < 75  THEN '50-75'
+                     WHEN ABS(diff_at_entry) < 100 THEN '75-100'
+                     ELSE '100+'
+                   END AS bucket,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses,
+                   ROUND(AVG(ABS(diff_at_entry)), 2) AS avg_abs_diff,
+                   ROUND(AVG(entry_price), 3) AS avg_entry_price,
+                   ROUND(COALESCE(SUM(pnl), 0), 2) AS total_pnl
+               FROM bot_trades
+              WHERE mode = 'shadow'
+                AND strategy = %s
+                AND pnl IS NOT NULL
+                AND diff_at_entry IS NOT NULL
+                AND COALESCE(outcome, '') != 'unresolved'
+              GROUP BY bucket
+              ORDER BY MIN(ABS(diff_at_entry))""",
+            (strategy,),
+        ).fetchall()
+    finally:
+        conn.close()
+    result = []
+    for r in rows:
+        resolved = int(r["wins"] or 0) + int(r["losses"] or 0)
+        result.append({
+            "bucket": r["bucket"],
+            "total": int(r["total"]),
+            "wins": int(r["wins"] or 0),
+            "losses": int(r["losses"] or 0),
+            "win_rate": round(int(r["wins"] or 0) / resolved, 4) if resolved else 0.0,
+            "avg_abs_diff": float(r["avg_abs_diff"] or 0),
+            "avg_entry_price": float(r["avg_entry_price"] or 0),
+            "total_pnl": float(r["total_pnl"] or 0),
+        })
+    return {"strategy": strategy, "buckets": result}
+
+
 @app.get("/api/bot/live-attempts")
 def get_live_attempts(limit: int = 100):
     """Recent failed live order attempts with eventual would-have-won annotation."""
