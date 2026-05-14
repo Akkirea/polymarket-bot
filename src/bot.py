@@ -1737,6 +1737,9 @@ class PaperBot:
             )
             if momentum_ok and CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE:
                 record("btc5-lag-follow-shadow", side)
+            # High-diff variant: simulate $50 live threshold, cap at live max price
+            if momentum_ok and abs(diff) >= 50.0 and CROWD_MIN <= side_price <= LAG_FOLLOW_LIVE_MAX_PRICE:
+                record("btc5-lag-follow-50-shadow", side)
 
         # 2) Early momentum: enter before the obvious late signal if price is still tradable.
         early_lo, early_hi = EARLY_SHADOW_WINDOW
