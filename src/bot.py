@@ -1474,12 +1474,27 @@ class PaperBot:
                 return False
 
         price_10s_ago = self._get_price_n_seconds_ago(10)
-        if price_10s_ago is None:
+        price_30s_ago = self._get_price_n_seconds_ago(30)
+        if price_10s_ago is None or price_30s_ago is None:
             return False
         momentum_10 = live_price - price_10s_ago
-        if side == "Up" and momentum_10 < 0:
+        momentum_30 = live_price - price_30s_ago
+
+        # Both windows must agree — guards against adverse selection where
+        # informed sellers dump the losing side right as it begins to reverse.
+        if side == "Up" and not (momentum_10 > 0 and momentum_30 > 0):
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} Up momentum not aligned "
+                f"10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f}",
+                flush=True,
+            )
             return False
-        if side == "Down" and momentum_10 > 0:
+        if side == "Down" and not (momentum_10 < 0 and momentum_30 < 0):
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} Down momentum not aligned "
+                f"10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f}",
+                flush=True,
+            )
             return False
 
         self._market_start_prices.pop(slug, None)
@@ -1488,7 +1503,7 @@ class PaperBot:
         self._volume_retry_slugs.discard(slug)
         print(
             f"[bot] LAG-FOLLOW LIVE SIGNAL PASSED: {side} on {slug} "
-            f"price={side_price:.3f} diff=${diff:+.2f} 10s=${momentum_10:+.2f} "
+            f"price={side_price:.3f} diff=${diff:+.2f} 10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f} "
             f"secs={seconds_remaining:.1f} source={live_source} ref={reference_source}",
             flush=True,
         )
