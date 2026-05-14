@@ -483,11 +483,11 @@ class PaperBot:
                 _pre_ref_source: Optional[str] = "polymarket-official" if _pre_ref_price is not None else None
                 if _pre_ref_price is None:
                     _pre_ref_price, _pre_ref_source = self._previous_final_reference(market)
-                if _pre_ref_price is None:
-                    _pre_ref_price, _pre_ref_source = self._rtds_live_fallback_reference(market)
                 if _pre_ref_price is None and start_ts is not None:
                     _pre_ref_price = await self._binance_feed.get_kline_open(start_ts)
                     _pre_ref_source = "binance-kline-open" if _pre_ref_price is not None else None
+                if _pre_ref_price is None:
+                    _pre_ref_price, _pre_ref_source = self._rtds_live_fallback_reference(market)
                 if _pre_ref_price is None:
                     _pre_ref_price = self._market_start_prices.get(slug)
                     _pre_ref_source = self._market_start_sources.get(slug)
@@ -607,11 +607,9 @@ class PaperBot:
                                 flush=True,
                             )
                 prev_final_price_to_beat, prev_final_source = self._previous_final_reference(market)
-                rtds_price_to_beat, rtds_source = (None, None)
+                # Priority: official Gamma → prev-final → kline open → RTDS → local start price
                 kline_price_to_beat: Optional[float] = None
                 if official_price_to_beat is None and prev_final_price_to_beat is None:
-                    rtds_price_to_beat, rtds_source = self._rtds_live_fallback_reference(market)
-                if official_price_to_beat is None and prev_final_price_to_beat is None and rtds_price_to_beat is None:
                     if start_ts is not None:
                         kline_price_to_beat = await self._binance_feed.get_kline_open(start_ts)
                         if kline_price_to_beat is not None:
@@ -619,33 +617,36 @@ class PaperBot:
                                 f"[bot] kline open reference: {slug} ${kline_price_to_beat:,.2f}",
                                 flush=True,
                             )
+                rtds_price_to_beat, rtds_source = (None, None)
+                if official_price_to_beat is None and prev_final_price_to_beat is None and kline_price_to_beat is None:
+                    rtds_price_to_beat, rtds_source = self._rtds_live_fallback_reference(market)
                 local_price_to_beat = self._market_start_prices.get(slug)
                 local_price_source = self._market_start_sources.get(slug)
                 if (
                     bool(market.get("_sz_live_enabled", True))
                     and official_price_to_beat is None
                     and prev_final_price_to_beat is None
-                    and rtds_price_to_beat is None
                     and kline_price_to_beat is None
+                    and rtds_price_to_beat is None
                     and local_price_to_beat is None
                 ):
                     print(
                         f"[bot] SKIP: {slug} all price-to-beat sources unavailable "
-                        "(official/prev-final/RTDS/kline/local); not opening entry",
+                        "(official/prev-final/kline/RTDS/local); not opening entry",
                         flush=True,
                     )
                     continue
                 if bool(market.get("_sz_live_enabled", True)):
-                    price_to_beat = official_price_to_beat or prev_final_price_to_beat or rtds_price_to_beat or kline_price_to_beat or local_price_to_beat
+                    price_to_beat = official_price_to_beat or prev_final_price_to_beat or kline_price_to_beat or rtds_price_to_beat or local_price_to_beat
                     price_source = (
                         "polymarket-official"
                         if official_price_to_beat is not None
                         else prev_final_source
                         if prev_final_price_to_beat is not None
-                        else rtds_source
-                        if rtds_price_to_beat is not None
                         else "binance-kline-open"
                         if kline_price_to_beat is not None
+                        else rtds_source
+                        if rtds_price_to_beat is not None
                         else local_price_source
                     )
                 else:
