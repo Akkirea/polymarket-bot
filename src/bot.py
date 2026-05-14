@@ -134,6 +134,7 @@ MARKET_FAMILIES = [
         "interval": 300,
         "strategy": "chainlink-reversal-guard",
         "live_enabled": True,
+        "mode": "live",
         "entry_window": (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI),
         "diff_threshold": PRICE_DIFF_THRESHOLD,
         "reversal_threshold": REVERSAL_THRESHOLD,
@@ -475,6 +476,9 @@ class PaperBot:
                     _pre_ref_price, _pre_ref_source = self._previous_final_reference(market)
                 if _pre_ref_price is None:
                     _pre_ref_price, _pre_ref_source = self._rtds_live_fallback_reference(market)
+                if _pre_ref_price is None:
+                    _pre_ref_price = self._market_start_prices.get(slug)
+                    _pre_ref_source = self._market_start_sources.get(slug)
 
                 if _pre_ref_price is not None:
                     _pre_live_price, _pre_live_source = await self._get_signal_price()
@@ -601,21 +605,24 @@ class PaperBot:
                     and official_price_to_beat is None
                     and prev_final_price_to_beat is None
                     and rtds_price_to_beat is None
+                    and local_price_to_beat is None
                 ):
                     print(
-                        f"[bot] SKIP: {slug} official priceToBeat and prev-finalPrice unavailable; "
-                        "RTDS fallback unavailable; not opening live/paper reversal entry on local proxy",
+                        f"[bot] SKIP: {slug} all price-to-beat sources unavailable "
+                        "(official/prev-final/RTDS/local); not opening entry",
                         flush=True,
                     )
                     continue
                 if bool(market.get("_sz_live_enabled", True)):
-                    price_to_beat = official_price_to_beat or prev_final_price_to_beat or rtds_price_to_beat
+                    price_to_beat = official_price_to_beat or prev_final_price_to_beat or rtds_price_to_beat or local_price_to_beat
                     price_source = (
                         "polymarket-official"
                         if official_price_to_beat is not None
                         else prev_final_source
                         if prev_final_price_to_beat is not None
                         else rtds_source
+                        if rtds_price_to_beat is not None
+                        else local_price_source
                     )
                 else:
                     price_to_beat = official_price_to_beat or prev_final_price_to_beat or local_price_to_beat
