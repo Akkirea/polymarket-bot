@@ -37,6 +37,7 @@ INITIAL_WALLET_SIZE  = 97.0
 MAX_STAKE_PCT        = 0.02   # half-Kelly at 52% win prob and 0.50 entry
 MIN_STAKE_PCT        = 0.01   # skip smaller signals instead of forcing oversize bets
 LIVE_MIN_ORDER_SIZE  = 1.00   # Polymarket marketable BUY minimum
+CLOB_MIN_SHARES      = 5      # Polymarket CLOB rejects orders with fewer than 5 shares
 ORDER_SIZE_INCREMENT = 0.01   # Keep cent precision; MIN_STAKE protects Polymarket's $1 floor
 MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT  # legacy fallback; runtime uses self.balance
 MIN_STAKE            = max(LIVE_MIN_ORDER_SIZE, INITIAL_WALLET_SIZE * MIN_STAKE_PCT)  # legacy fallback
@@ -1285,7 +1286,8 @@ class PaperBot:
         max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
         _live_bal = self.live_balance
         _dyn_max = _live_bal * MAX_STAKE_PCT * multiplier
-        _dyn_min = max(LIVE_MIN_ORDER_SIZE, _live_bal * MIN_STAKE_PCT)
+        _min_shares_stake = _round_order_size(CLOB_MIN_SHARES * PRE_SIGNAL_LIMIT_PRICE)
+        _dyn_min = max(LIVE_MIN_ORDER_SIZE, _live_bal * MIN_STAKE_PCT, _min_shares_stake)
         stake = _round_order_size(max(_dyn_min, min(_dyn_max, _live_bal * kelly_fraction * 0.5 * multiplier)))
 
         if _live_bal < stake:
@@ -2233,7 +2235,8 @@ class PaperBot:
         multiplier     = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
         _live_bal      = self.live_balance
         max_stake      = _live_bal * MAX_STAKE_PCT * multiplier
-        min_stake      = max(LIVE_MIN_ORDER_SIZE, _live_bal * MIN_STAKE_PCT)
+        min_shares_stake = _round_order_size(CLOB_MIN_SHARES * entry_price)
+        min_stake      = max(LIVE_MIN_ORDER_SIZE, _live_bal * MIN_STAKE_PCT, min_shares_stake)
         raw_stake      = _live_bal * kelly_fraction * 0.5 * multiplier
         kelly_stake    = min(max_stake, raw_stake)
         stake          = _round_order_size(max(min_stake, kelly_stake))
@@ -2242,7 +2245,7 @@ class PaperBot:
             print(
                 f"[bot] OPEN SKIP: {slug} {side} entry={entry_price:.3f} "
                 f"max stake ${max_stake:.2f} below ${min_stake:.2f} minimum "
-                f"({MIN_STAKE_PCT:.0%} of live balance ${_live_bal:.2f})",
+                f"(shares floor=${min_shares_stake:.2f}, bal={_live_bal:.2f})",
                 flush=True,
             )
             return
