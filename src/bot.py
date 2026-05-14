@@ -83,7 +83,7 @@ RTDS_LIVE_UP_DIFF        = float(os.getenv("RTDS_LIVE_UP_DIFF",          "30"))
 RTDS_LIVE_DOWN_DIFF      = float(os.getenv("RTDS_LIVE_DOWN_DIFF",        "40"))
 RTDS_LIVE_UP_CROWD_CAP   = float(os.getenv("RTDS_LIVE_UP_CROWD_CAP",    "0.55"))
 RTDS_LIVE_DOWN_CROWD_FLOOR = float(os.getenv("RTDS_LIVE_DOWN_CROWD_FLOOR", "0.45"))
-PRE_SIGNAL_ENABLED     = os.getenv("PRE_SIGNAL_ENABLED", "true").lower() == "true"
+PRE_SIGNAL_ENABLED     = os.getenv("PRE_SIGNAL_ENABLED", "false").lower() == "true"
 PRE_SIGNAL_DIFF        = float(os.getenv("PRE_SIGNAL_DIFF",        "22"))
 PRE_SIGNAL_LIMIT_PRICE = float(os.getenv("PRE_SIGNAL_LIMIT_PRICE", "0.50"))
 PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF", "13"))
