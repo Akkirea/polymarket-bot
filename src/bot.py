@@ -38,8 +38,8 @@ MAX_STAKE_PCT        = 0.02   # half-Kelly at 52% win prob and 0.50 entry
 MIN_STAKE_PCT        = 0.01   # skip smaller signals instead of forcing oversize bets
 LIVE_MIN_ORDER_SIZE  = 1.00   # Polymarket marketable BUY minimum
 ORDER_SIZE_INCREMENT = 0.01   # Keep cent precision; MIN_STAKE protects Polymarket's $1 floor
-MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT
-MIN_STAKE            = max(LIVE_MIN_ORDER_SIZE, INITIAL_WALLET_SIZE * MIN_STAKE_PCT)
+MAX_STAKE            = INITIAL_WALLET_SIZE * MAX_STAKE_PCT  # legacy fallback; runtime uses self.balance
+MIN_STAKE            = max(LIVE_MIN_ORDER_SIZE, INITIAL_WALLET_SIZE * MIN_STAKE_PCT)  # legacy fallback
 WIN_PROB             = 0.60   # conservative win rate estimate — update after 200 trades
 MIN_PREV_MOVE        = 25.0   # USD — skip if the reference window moved less than this
 # Data-validated allowed hours (ET = UTC-4). All others blocked.
@@ -56,8 +56,10 @@ VOLUME_RETRY_LO      = 60    # late retry only while entries still have enough t
 VOLUME_RETRY_HI      = ENTRY_WINDOW_LO
 MIN_MOMENTUM_MOVE    = 10.0  # USD — chop filter: abs(live - price_10s_ago) must exceed this
 FUNDING_THRESHOLD    = 0.02  # % — outside this band, funding must agree with direction
-PRICE_DIFF_THRESHOLD = 10.0  # USD — minimum diff from reference price to enter
-REVERSAL_THRESHOLD   = 8.0   # USD — diff must still be >= this after 3s re-check
+PRICE_DIFF_THRESHOLD      = 10.0  # USD — shadow/paper entry gate (kept low for data)
+LIVE_DIFF_THRESHOLD_BASE  = 35.0  # USD — live entry base: $35 at 60s, +$0.25/s after
+LIVE_DIFF_THRESHOLD_MAX   = 75.0  # USD — cap so very early entries aren't blocked forever
+REVERSAL_THRESHOLD        = 8.0   # USD — diff must still be >= this after 3s re-check
 CROWD_MIN            = 0.30  # outcomePrices lower bound — below this crowd is 70%+ against us
 CROWD_MAX            = 0.70  # outcomePrices upper bound — above this move is fully priced in
 EARLY_LIVE_MAX_PRICE = 0.60  # early entries need better risk/reward than regular entries
@@ -99,6 +101,17 @@ def _round_order_size(amount: float) -> float:
     """Round up to the configured order-size increment."""
     increment = max(0.01, ORDER_SIZE_INCREMENT)
     return round(math.ceil(amount / increment) * increment, 2)
+
+
+def _live_diff_threshold(seconds_remaining: float) -> float:
+    """
+    Seconds-aware live entry threshold.
+
+    Starts at $35 at 60 s remaining and grows by $0.25 per additional second,
+    capped at $75. More time left = more room for reversal = larger diff needed.
+    """
+    extra = max(0.0, seconds_remaining - 60.0)
+    return min(LIVE_DIFF_THRESHOLD_MAX, LIVE_DIFF_THRESHOLD_BASE + extra * 0.25)
 
 
 def _extract_official_price_to_beat(market: dict) -> Optional[float]:
@@ -755,7 +768,7 @@ class PaperBot:
                 )
                 break
 
-    def _get_measured_win_prob(self) -> float:
+    def _get_measured_win_prob(self, live: bool = False) -> float:
         """
         Return the win probability to use for Kelly sizing.
 
@@ -765,20 +778,26 @@ class PaperBot:
 
         Falls back to a conservative 0.52 (barely above breakeven) until we
         have enough data — avoids over-sizing on unvalidated edge.
+
+        Pass live=True to use live trade history instead of paper history.
         """
-        total = self.wins + self.losses
+        if live:
+            wins, losses, label = self.live_wins, self.live_losses, "live"
+        else:
+            wins, losses, label = self.wins, self.losses, "paper"
+        total = wins + losses
         if total < 20:  # config.MIN_KELLY_TRADES
             print(
-                f"[bot] Kelly: only {total} resolved trades — "
+                f"[bot] Kelly ({label}): only {total} resolved trades — "
                 f"using conservative WIN_PROB=0.52",
                 flush=True,
             )
             return 0.52
         # Bayesian shrinkage toward 0.5 with prior weight 10
         prior_weight = 10
-        shrunk = (self.wins + prior_weight * 0.5) / (total + prior_weight)
+        shrunk = (wins + prior_weight * 0.5) / (total + prior_weight)
         print(
-            f"[bot] Kelly: measured win_prob={self.wins}/{total}={self.wins/total:.3f} "
+            f"[bot] Kelly ({label}): measured win_prob={wins}/{total}={wins/total:.3f} "
             f"→ shrunk={shrunk:.3f}",
             flush=True,
         )
@@ -1258,15 +1277,18 @@ class PaperBot:
         if not (CROWD_MIN <= crowd_price <= CROWD_MAX):
             return
 
-        win_prob = self._get_measured_win_prob()
+        win_prob = self._get_measured_win_prob(live=True)
         loss_prob = 1.0 - win_prob
         b = (1.0 / PRE_SIGNAL_LIMIT_PRICE) - 1.0
         kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
         multiplier = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
         max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
-        stake = _round_order_size(max(MIN_STAKE, min(MAX_STAKE * multiplier, self.balance * kelly_fraction * 0.5 * multiplier)))
+        _live_bal = self.live_balance
+        _dyn_max = _live_bal * MAX_STAKE_PCT * multiplier
+        _dyn_min = max(LIVE_MIN_ORDER_SIZE, _live_bal * MIN_STAKE_PCT)
+        stake = _round_order_size(max(_dyn_min, min(_dyn_max, _live_bal * kelly_fraction * 0.5 * multiplier)))
 
-        if self.balance < stake:
+        if _live_bal < stake:
             return
 
         try:
@@ -1441,8 +1463,15 @@ class PaperBot:
                 print(f"[bot] LAG-FOLLOW RTDS LIVE SKIP: {slug} {edge_reason}", flush=True)
                 return False
             print(f"[bot] LAG-FOLLOW RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
-        elif abs(diff) < PRICE_DIFF_THRESHOLD:
-            return False
+        else:
+            live_threshold = _live_diff_threshold(seconds_remaining)
+            if abs(diff) < live_threshold:
+                print(
+                    f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff ${abs(diff):.2f} "
+                    f"< threshold ${live_threshold:.2f} ({seconds_remaining:.0f}s remaining)",
+                    flush=True,
+                )
+                return False
 
         price_10s_ago = self._get_price_n_seconds_ago(10)
         if price_10s_ago is None:
@@ -2073,7 +2102,8 @@ class PaperBot:
         b              = (1.0 / entry_price) - 1.0
         kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
         multiplier     = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
-        stake          = min(MAX_STAKE * multiplier, self.balance * kelly_fraction * 0.5 * multiplier)
+        _dyn_max = self.balance * MAX_STAKE_PCT * multiplier
+        stake    = min(_dyn_max, self.balance * kelly_fraction * 0.5 * multiplier)
         return stake, kelly_fraction, multiplier
 
     def _record_shadow_entry(
@@ -2092,11 +2122,12 @@ class PaperBot:
     ) -> None:
         """Record a hypothetical shadow trade without touching paper/live accounting."""
         stake, kelly_fraction, multiplier = self._shadow_stake(entry_price, hour_et)
+        _dyn_min = max(LIVE_MIN_ORDER_SIZE, self.balance * MIN_STAKE_PCT)
         if force_min_stake:
-            stake = _round_order_size(max(MIN_STAKE, stake))
-        if stake < MIN_STAKE:
+            stake = _round_order_size(max(_dyn_min, stake))
+        if stake < _dyn_min:
             print(
-                f"[bot] SHADOW SKIP: Kelly stake ${stake:.2f} below ${MIN_STAKE:.2f} minimum",
+                f"[bot] SHADOW SKIP: Kelly stake ${stake:.2f} below ${_dyn_min:.2f} minimum",
                 flush=True,
             )
             db.log_bot_signal(slug, filter_hit="shadow_size", outcome="skipped",
@@ -2180,33 +2211,35 @@ class PaperBot:
         # Half-Kelly sizing with data-driven hour multiplier.
         # WIN_PROB is derived from measured trade history (or conservative
         # default of 0.52 when sample size is too small).
-        win_prob       = self._get_measured_win_prob()
+        win_prob       = self._get_measured_win_prob(live=True)
         loss_prob      = 1.0 - win_prob
         b              = (1.0 / entry_price) - 1.0   # net payout per dollar risked
         kelly_fraction = max(0.0, (win_prob * b - loss_prob) / b) if b > 0 else 0.0
         multiplier     = min(1.0, HOUR_MULTIPLIER.get(hour_et, 1.0))
-        max_stake      = MAX_STAKE * multiplier
-        raw_stake      = self.balance * kelly_fraction * 0.5 * multiplier
+        _live_bal      = self.live_balance
+        max_stake      = _live_bal * MAX_STAKE_PCT * multiplier
+        min_stake      = max(LIVE_MIN_ORDER_SIZE, _live_bal * MIN_STAKE_PCT)
+        raw_stake      = _live_bal * kelly_fraction * 0.5 * multiplier
         kelly_stake    = min(max_stake, raw_stake)
-        stake          = _round_order_size(max(MIN_STAKE, kelly_stake))
+        stake          = _round_order_size(max(min_stake, kelly_stake))
 
-        if max_stake < MIN_STAKE:
+        if max_stake < min_stake:
             print(
                 f"[bot] OPEN SKIP: {slug} {side} entry={entry_price:.3f} "
-                f"max stake ${max_stake:.2f} below ${MIN_STAKE:.2f} minimum "
-                f"({MIN_STAKE_PCT:.0%} of ${INITIAL_WALLET_SIZE:.0f})",
+                f"max stake ${max_stake:.2f} below ${min_stake:.2f} minimum "
+                f"({MIN_STAKE_PCT:.0%} of live balance ${_live_bal:.2f})",
                 flush=True,
             )
             return
-        if kelly_stake < MIN_STAKE:
+        if kelly_stake < min_stake:
             print(
                 f"[bot] OPEN: {slug} {side} entry={entry_price:.3f} "
                 f"using minimum stake ${stake:.2f}; Kelly suggested ${kelly_stake:.2f}",
                 flush=True,
             )
 
-        if self.balance < stake:
-            print(f"[bot] OPEN SKIP: {slug} insufficient balance (${self.balance:.2f})", flush=True)
+        if _live_bal < stake:
+            print(f"[bot] OPEN SKIP: {slug} insufficient live balance (${_live_bal:.2f})", flush=True)
             return
 
         # ── Live order (best-effort alongside paper) ───────────────────────────
