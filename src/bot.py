@@ -90,10 +90,7 @@ PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF", "13"))
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
-FADE_SHADOW_WINDOW   = (75, 240)
-FADE_CROWD_PRICE     = 0.75
-FADE_MAX_DIFF        = 35.0
-FADE_MAX_MOMENTUM    = 8.0
+RTDS_PREVCLOSE_LIVE_ENABLED = os.getenv("RTDS_PREVCLOSE_LIVE_ENABLED", "true").lower() == "true"
 HEDGED_SHADOW_WINDOW = (150, 300)
 HEDGED_DOMINANT_MIN  = 0.45
 HEDGED_DOMINANT_MAX  = 0.67
@@ -569,6 +566,20 @@ class PaperBot:
                 )
                 if opened_lag_follow:
                     break
+
+                if (
+                    RTDS_PREVCLOSE_LIVE_ENABLED
+                    and market.get("_sz_live_enabled", True)
+                    and slug not in self._entered_slugs
+                ):
+                    opened_rtds = await self._maybe_open_rtds_prevclose_live(
+                        market=market,
+                        end_ts=end_ts,
+                        seconds_remaining=seconds_remaining,
+                        hour_et=hour_et,
+                    )
+                    if opened_rtds:
+                        break
 
             # ── configured reversal window per market family
             if ((in_early_live_window or in_main_window or in_volume_retry_window)
@@ -1547,6 +1558,98 @@ class PaperBot:
         )
         return True
 
+    async def _maybe_open_rtds_prevclose_live(
+        self,
+        market: dict,
+        end_ts: float,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> bool:
+        """Live execution of the RTDS prev-close strategy (75.8% WR shadow, n=150).
+
+        Uses the RTDS tick at window open as the reference (same as prevclose shadow).
+        Only fires when diff clears the RTDS live edge gate AND both 10s+30s momentum agree.
+        """
+        if not RTDS_PREVCLOSE_LIVE_ENABLED:
+            return False
+
+        slug = market.get("slug", "")
+        if not slug.startswith("btc-updown-5m-"):
+            return False
+
+        official_reference = _extract_official_price_to_beat(market)
+        prev_final_reference, _ = self._previous_final_reference(market)
+        if official_reference is not None or prev_final_reference is not None:
+            return False
+
+        if seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
+            return False
+
+        reference_price, reference_source = self._rtds_previous_close_reference(market)
+        if reference_price is None:
+            return False
+
+        live_price, live_source = await self._get_signal_price()
+        if live_price is None:
+            return False
+
+        diff = live_price - reference_price
+        side = "Up" if diff > 0 else "Down"
+        side_price = _side_price(market, side)
+
+        live_max_price = min(LAG_FOLLOW_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
+        if not (CROWD_MIN <= side_price <= live_max_price):
+            return False
+
+        edge_ok, edge_reason = self._rtds_live_edge_ok(diff, side_price)
+        if not edge_ok:
+            print(f"[bot] RTDS-PREVCLOSE LIVE SKIP: {slug} {edge_reason}", flush=True)
+            return False
+
+        price_10s_ago = self._get_price_n_seconds_ago(10)
+        price_30s_ago = self._get_price_n_seconds_ago(30)
+        if price_10s_ago is None or price_30s_ago is None:
+            return False
+        momentum_10 = live_price - price_10s_ago
+        momentum_30 = live_price - price_30s_ago
+
+        if side == "Up" and not (momentum_10 > 0 and momentum_30 > 0):
+            print(
+                f"[bot] RTDS-PREVCLOSE LIVE SKIP: {slug} Up momentum not aligned "
+                f"10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f}", flush=True,
+            )
+            return False
+        if side == "Down" and not (momentum_10 < 0 and momentum_30 < 0):
+            print(
+                f"[bot] RTDS-PREVCLOSE LIVE SKIP: {slug} Down momentum not aligned "
+                f"10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f}", flush=True,
+            )
+            return False
+
+        self._entered_slugs.add(slug)
+        self._volume_retry_slugs.discard(slug)
+        print(
+            f"[bot] RTDS-PREVCLOSE LIVE SIGNAL: {side} on {slug} "
+            f"diff=${diff:+.2f} 10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f} "
+            f"secs={seconds_remaining:.1f} source={live_source} ref={reference_source}",
+            flush=True,
+        )
+        await self._open_position(
+            slug,
+            side,
+            side_price,
+            end_ts,
+            start_ts=_extract_start_ts(slug),
+            price_to_beat=reference_price,
+            diff_at_entry=diff,
+            seconds_remaining=seconds_remaining,
+            strategy="btc5-rtds-prevclose-live",
+            hour_et=hour_et,
+            market=market,
+            live_enabled=True,
+        )
+        return True
+
     async def _record_research_shadows(
         self,
         market: dict,
@@ -1635,15 +1738,7 @@ class PaperBot:
             if momentum_ok and CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE:
                 record("btc5-early-momentum-shadow", side)
 
-        # 3) Overpriced fade: crowd is extreme, but BTC edge/momentum does not justify it.
-        fade_lo, fade_hi = FADE_SHADOW_WINDOW
-        if fade_lo <= seconds_remaining <= fade_hi and abs(diff) <= FADE_MAX_DIFF and momentum_10 is not None:
-            if up_price >= FADE_CROWD_PRICE and momentum_10 <= FADE_MAX_MOMENTUM:
-                record("btc5-overpriced-fade-shadow", "Down")
-            elif down_price >= FADE_CROWD_PRICE and momentum_10 >= -FADE_MAX_MOMENTUM:
-                record("btc5-overpriced-fade-shadow", "Up")
-
-        # 4) Bonereaper-style research: dominant directional leg with cheap
+        # 3) Bonereaper-style research: dominant directional leg with cheap
         # opposite insurance. This is shadow-only because 0.90+ chasing has
         # blow-up risk; we only test sane dominant prices.
         hedge_lo, hedge_hi = HEDGED_SHADOW_WINDOW
