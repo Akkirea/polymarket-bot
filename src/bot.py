@@ -50,7 +50,7 @@ ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
 HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 75    # enter when seconds_remaining >= this
-ENTRY_WINDOW_HI      = 150   # enter when seconds_remaining <= this
+ENTRY_WINDOW_HI      = 100   # enter when seconds_remaining <= this
 EARLY_LIVE_WINDOW_LO = 150   # stricter live-only detector starts here
 EARLY_LIVE_WINDOW_HI = 240
 VOLUME_RETRY_LO      = 60    # late retry only while entries still have enough time before close
