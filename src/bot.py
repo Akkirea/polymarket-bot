@@ -25,7 +25,7 @@ import aiohttp
 
 from . import db
 from .binance_ws import BinancePriceFeed, OrderBookFeed
-from .chainlink import get_btc_price
+from .chainlink import get_btc_price, get_price_at_ts as chainlink_price_at_ts
 from .rtds_ws import PolymarketRtdsPriceFeed
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ RTDS_LIVE_FALLBACK_ENABLED = os.getenv("RTDS_LIVE_FALLBACK_ENABLED", "true").low
 # Chainlink Data Streams price Polymarket uses for settlement. Subtract this correction
 # so the reference used for diff and strategy tag reflects the real expected beat.
 KLINE_BIAS_CORRECTION = float(os.getenv("KLINE_BIAS_CORRECTION", "33.0"))
-RTDS_BIAS_CORRECTION  = float(os.getenv("RTDS_BIAS_CORRECTION",  "30.0"))
+RTDS_BIAS_CORRECTION  = float(os.getenv("RTDS_BIAS_CORRECTION",  "42.0"))
 RTDS_LIVE_UP_DIFF        = float(os.getenv("RTDS_LIVE_UP_DIFF",          "30"))
 RTDS_LIVE_DOWN_DIFF      = float(os.getenv("RTDS_LIVE_DOWN_DIFF",        "40"))
 RTDS_LIVE_UP_CROWD_CAP   = float(os.getenv("RTDS_LIVE_UP_CROWD_CAP",    "0.55"))
@@ -1545,10 +1545,21 @@ class PaperBot:
         if reference_price is None:
             reference_price, reference_source = self._previous_final_reference(market)
         if reference_price is None and start_ts is not None:
-            kline = await self._binance_feed.get_kline_open(start_ts)
-            if kline is not None:
-                reference_price = kline - KLINE_BIAS_CORRECTION
-                reference_source = "binance-kline-open"
+            try:
+                session = await self._get_session()
+                cl_result = await chainlink_price_at_ts(float(start_ts), session)
+                if cl_result is not None:
+                    cl_price, cl_round_id, cl_started_at = cl_result
+                    reference_price = cl_price
+                    reference_source = "chainlink-round"
+                    print(
+                        f"[bot] chainlink-round ref: {slug} round={cl_round_id} "
+                        f"startedAt={cl_started_at:.0f} price=${cl_price:,.2f} "
+                        f"(target_ts={start_ts:.0f} offset={cl_started_at - start_ts:+.1f}s)",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[bot] chainlink-round lookup failed for {slug}: {exc}", flush=True)
         if reference_price is None:
             rtds_raw, rtds_src = self._rtds_live_fallback_reference(market)
             if rtds_raw is not None:
@@ -1676,7 +1687,9 @@ class PaperBot:
             flush=True,
         )
         strategy = "btc5-lag-follow-live"
-        if reference_source == "binance-kline-open":
+        if reference_source == "chainlink-round":
+            strategy = "btc5-lag-follow-live-chainlink"
+        elif reference_source == "binance-kline-open":
             strategy = "btc5-lag-follow-live-kline"
         elif reference_source == RTDS_LIVE_FALLBACK_SOURCE:
             strategy = "btc5-lag-follow-live-rtds-fallback"
