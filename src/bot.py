@@ -109,6 +109,21 @@ def _round_order_size(amount: float) -> float:
     return round(math.ceil(amount / increment) * increment, 2)
 
 
+def _crowd_floor(abs_diff: float) -> float:
+    """Minimum acceptable Polymarket side price given BTC diff strength.
+
+    Larger diff earns the right to fight more crowd skepticism.
+    Below $50 diff the $50 gate already blocks entry; floor is unreachable.
+    """
+    if abs_diff >= 100:
+        return 0.52
+    if abs_diff >= 70:
+        return 0.55
+    if abs_diff >= 50:
+        return 0.58
+    return 1.0
+
+
 def _live_diff_threshold(seconds_remaining: float) -> float:
     """
     Seconds-aware live entry threshold.
@@ -1512,6 +1527,39 @@ class PaperBot:
                 print(
                     f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff ${abs(diff):.2f} "
                     f"< threshold $50.00 ({seconds_remaining:.0f}s remaining)",
+                    flush=True,
+                )
+                return False
+
+        # ── Crowd floor: reject if crowd disagrees too strongly with signal ──
+        floor = _crowd_floor(abs(diff))
+        if side_price < floor:
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} crowd {side_price:.3f} "
+                f"< floor {floor:.2f} for diff ${abs(diff):.2f}",
+                flush=True,
+            )
+            return False
+
+        # ── Borderline zone: re-confirm signal still holds in 5s ─────────
+        if side_price < live_max_price:
+            await asyncio.sleep(5)
+            live_price2, _ = await self._get_signal_price()
+            if live_price2 is None:
+                return False
+            diff2 = live_price2 - reference_price
+            if abs(diff2) < 50.0:
+                print(
+                    f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff fell to ${abs(diff2):.2f} "
+                    f"on re-check — signal reversed",
+                    flush=True,
+                )
+                return False
+            side_price2 = _side_price(market, side)
+            if side_price2 < floor:
+                print(
+                    f"[bot] LAG-FOLLOW LIVE SKIP: {slug} crowd moved to {side_price2:.3f} "
+                    f"< floor {floor:.2f} on re-check",
                     flush=True,
                 )
                 return False
