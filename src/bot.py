@@ -48,6 +48,11 @@ MIN_PREV_MOVE        = 25.0   # USD — skip if the reference window moved less 
 ALLOWED_HOURS        = {0, 1, 4, 5, 18, 19}
 # Hour 19: 2x (70.6% WR, n=17, p<0.01). Hour 18: 1x until n≥20 (77.8% WR but n=9).
 HOUR_MULTIPLIER      = {19: 2.0, 0: 1.0, 4: 1.0, 5: 1.0, 1: 0.75, 18: 1.0}
+# Hours blocked from live execution (shadow continues at all hours for data collection).
+# Derived from shadow WR with n≥5: hour 0 (55% WR n=20), 3 (62.5% n=8), 11 (57.1% n=7).
+LIVE_BLOCKED_HOURS   = {0, 3, 11}
+# Minimum HTF trend (10-min BTC move) that blocks a trade if it opposes the signal direction.
+HTF_TREND_THRESHOLD  = 25.0
 POLL_INTERVAL        = 3     # seconds between ticks
 ENTRY_WINDOW_LO      = 75    # enter when seconds_remaining >= this
 ENTRY_WINDOW_HI      = 100   # enter when seconds_remaining <= this
@@ -1517,6 +1522,15 @@ class PaperBot:
         """Promote the validated btc5-lag-follow-shadow rule into conservative live execution."""
         slug = market["slug"]
 
+        # ── Hour gate: skip live entry in statistically bad hours ────────────
+        if hour_et in LIVE_BLOCKED_HOURS:
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} hour {hour_et} ET blocked "
+                f"(LIVE_BLOCKED_HOURS={LIVE_BLOCKED_HOURS})",
+                flush=True,
+            )
+            return False
+
         reference_price = _extract_official_price_to_beat(market)
         reference_source = "polymarket-official" if reference_price is not None else None
         if reference_price is None:
@@ -1652,6 +1666,36 @@ class PaperBot:
                 flush=True,
             )
             return False
+
+        # ── HTF trend filter: 10-minute BTC trend must not strongly oppose signal ──
+        # Primary cause of UP losses during sustained downtrends: bounces look
+        # bullish intrawindow but the 10m context is bearish. Blocks signals where
+        # the HTF trend exceeds $25 in the opposite direction.
+        btc_history = list(self._binance_feed._price_history)
+        if len(btc_history) >= 60:
+            price_10m_ago_target = time.time() - 600
+            _htf_closest = min(btc_history, key=lambda x: abs(x[0] - price_10m_ago_target))
+            _htf_price = _htf_closest[1] if abs(_htf_closest[0] - price_10m_ago_target) < 60.0 else None
+            if _htf_price is not None:
+                htf_trend = live_price - _htf_price
+                if side == "Up" and htf_trend < -HTF_TREND_THRESHOLD:
+                    print(
+                        f"[bot] LAG-FOLLOW LIVE SKIP: {slug} HTF bearish ({htf_trend:+.2f} over 10m) "
+                        f"but signal=Up — sustained downtrend blocks entry",
+                        flush=True,
+                    )
+                    return False
+                if side == "Down" and htf_trend > HTF_TREND_THRESHOLD:
+                    print(
+                        f"[bot] LAG-FOLLOW LIVE SKIP: {slug} HTF bullish ({htf_trend:+.2f} over 10m) "
+                        f"but signal=Down — sustained uptrend blocks entry",
+                        flush=True,
+                    )
+                    return False
+                print(
+                    f"[bot] LAG-FOLLOW LIVE HTF OK: {slug} 10m trend={htf_trend:+.2f} side={side}",
+                    flush=True,
+                )
 
         self._market_start_prices.pop(slug, None)
         self._market_start_sources.pop(slug, None)
