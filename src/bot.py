@@ -1508,11 +1508,10 @@ class PaperBot:
                 return False
             print(f"[bot] LAG-FOLLOW RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
         else:
-            live_threshold = _live_diff_threshold(seconds_remaining)
-            if abs(diff) < live_threshold:
+            if abs(diff) < 50.0:
                 print(
                     f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff ${abs(diff):.2f} "
-                    f"< threshold ${live_threshold:.2f} ({seconds_remaining:.0f}s remaining)",
+                    f"< threshold $50.00 ({seconds_remaining:.0f}s remaining)",
                     flush=True,
                 )
                 return False
