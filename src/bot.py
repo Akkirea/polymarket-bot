@@ -87,10 +87,10 @@ PRE_SIGNAL_ENABLED     = os.getenv("PRE_SIGNAL_ENABLED", "false").lower() == "tr
 PRE_SIGNAL_DIFF        = float(os.getenv("PRE_SIGNAL_DIFF",        "22"))
 PRE_SIGNAL_LIMIT_PRICE = float(os.getenv("PRE_SIGNAL_LIMIT_PRICE", "0.50"))
 PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF", "13"))
-LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "true").lower() == "true"
+LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "false").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
-RTDS_PREVCLOSE_LIVE_ENABLED = os.getenv("RTDS_PREVCLOSE_LIVE_ENABLED", "true").lower() == "true"
+RTDS_PREVCLOSE_LIVE_ENABLED = os.getenv("RTDS_PREVCLOSE_LIVE_ENABLED", "false").lower() == "true"
 HEDGED_SHADOW_WINDOW = (150, 300)
 HEDGED_DOMINANT_MIN  = 0.45
 HEDGED_DOMINANT_MAX  = 0.67
