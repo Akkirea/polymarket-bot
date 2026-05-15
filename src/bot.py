@@ -95,7 +95,7 @@ HEDGED_SHADOW_WINDOW = (150, 300)
 HEDGED_DOMINANT_MIN  = 0.45
 HEDGED_DOMINANT_MAX  = 0.67
 HEDGED_HEDGE_MAX     = 0.10
-OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.6"))
+OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.5"))
 OB_SUSTAINED_SECONDS   = float(os.getenv("OB_SUSTAINED_SECONDS",   "5.0"))
 OB_SHADOW_WINDOW       = (60, 210)  # wider than lag-follow; leading signal fires early
 
