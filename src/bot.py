@@ -112,13 +112,14 @@ def _round_order_size(amount: float) -> float:
 def _crowd_floor(abs_diff: float) -> float:
     """Minimum acceptable Polymarket side price given BTC diff strength.
 
-    Larger diff earns the right to fight more crowd skepticism.
-    Below $50 diff the $50 gate already blocks entry; floor is unreachable.
+    At $75+ diff (81% WR in shadow) the signal overrides crowd skepticism —
+    allows the symmetric payout zone (0.40–0.55) where wins ≈ losses.
+    Below $75, only enter when crowd moderately agrees (0.58+).
     """
     if abs_diff >= 100:
-        return 0.52
-    if abs_diff >= 70:
-        return 0.55
+        return 0.38
+    if abs_diff >= 75:
+        return 0.40
     if abs_diff >= 50:
         return 0.58
     return 1.0
@@ -1543,24 +1544,6 @@ class PaperBot:
             if ptb is not None:
                 reference_price, reference_source = ptb, "polymarket-official"
         if reference_price is None:
-            reference_price, reference_source = self._previous_final_reference(market)
-        if reference_price is None and start_ts is not None:
-            try:
-                session = await self._get_session()
-                cl_result = await chainlink_price_at_ts(float(start_ts), session)
-                if cl_result is not None:
-                    cl_price, cl_round_id, cl_started_at = cl_result
-                    reference_price = cl_price
-                    reference_source = "chainlink-round"
-                    print(
-                        f"[bot] chainlink-round ref: {slug} round={cl_round_id} "
-                        f"startedAt={cl_started_at:.0f} price=${cl_price:,.2f} "
-                        f"(target_ts={start_ts:.0f} offset={cl_started_at - start_ts:+.1f}s)",
-                        flush=True,
-                    )
-            except Exception as exc:
-                print(f"[bot] chainlink-round lookup failed for {slug}: {exc}", flush=True)
-        if reference_price is None:
             rtds_raw, rtds_src = self._rtds_live_fallback_reference(market)
             if rtds_raw is not None:
                 reference_price = rtds_raw - RTDS_BIAS_CORRECTION
@@ -1597,6 +1580,17 @@ class PaperBot:
                 )
                 return False
 
+        # ── Symmetric-zone gate: crowd skeptical (< 0.55) needs $75+ diff ──
+        # At 0.40–0.55 the payout is symmetric; below 0.55 the crowd disagrees,
+        # so only enter when the BTC signal is very strong ($75+, 81% WR in shadow).
+        if side_price < 0.55 and abs(diff) < 75.0:
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} symmetric-zone requires diff >= $75 "
+                f"(side_price={side_price:.3f} diff=${abs(diff):.2f})",
+                flush=True,
+            )
+            return False
+
         # ── Crowd floor: reject if crowd disagrees too strongly with signal ──
         floor = _crowd_floor(abs(diff))
         if side_price < floor:
@@ -1629,17 +1623,20 @@ class PaperBot:
             )
             return False
 
-        # ── Borderline zone: re-confirm signal still holds in 5s ─────────
+        # ── Re-confirm signal still holds after 5s ───────────────────────
+        # Symmetric zone (< 0.55) uses a tighter re-check ($75) since the crowd
+        # is skeptical; confidence zone (0.55+) uses the standard $50 re-check.
+        recheck_threshold = 75.0 if side_price < 0.55 else 50.0
         if side_price < live_max_price:
             await asyncio.sleep(5)
             live_price2, _ = await self._get_signal_price()
             if live_price2 is None:
                 return False
             diff2 = live_price2 - reference_price
-            if abs(diff2) < 50.0:
+            if abs(diff2) < recheck_threshold:
                 print(
                     f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff fell to ${abs(diff2):.2f} "
-                    f"on re-check — signal reversed",
+                    f"on re-check (threshold ${recheck_threshold:.0f}) — signal weakened",
                     flush=True,
                 )
                 return False
@@ -1686,13 +1683,12 @@ class PaperBot:
             f"secs={seconds_remaining:.1f} source={live_source} ref={reference_source}",
             flush=True,
         )
-        strategy = "btc5-lag-follow-live"
-        if reference_source == "chainlink-round":
-            strategy = "btc5-lag-follow-live-chainlink"
-        elif reference_source == "binance-kline-open":
-            strategy = "btc5-lag-follow-live-kline"
+        if side_price < 0.55:
+            strategy = "btc5-lag-follow-live-symmetric"
         elif reference_source == RTDS_LIVE_FALLBACK_SOURCE:
             strategy = "btc5-lag-follow-live-rtds-fallback"
+        else:
+            strategy = "btc5-lag-follow-live"
         await self._open_position(
             slug,
             side,
@@ -1874,9 +1870,22 @@ class PaperBot:
             )
             if momentum_ok and CROWD_MIN <= side_price <= SHADOW_MAX_FOLLOW_PRICE:
                 record("btc5-lag-follow-shadow", side)
-            # High-diff variant: simulate $50 live threshold, cap at live max price
+            # $50 threshold variant: simulate live $50 gate, cap at live max price
             if momentum_ok and abs(diff) >= 50.0 and CROWD_MIN <= side_price <= LAG_FOLLOW_LIVE_MAX_PRICE:
                 record("btc5-lag-follow-50-shadow", side)
+            # Symmetric-zone variant: mirrors btc5-lag-follow-live-symmetric exactly.
+            # diff $75+, crowd skeptical (0.40–0.55) — symmetric payout, strong signal.
+            if momentum_ok and abs(diff) >= 75.0 and CROWD_MIN <= side_price <= 0.55:
+                record("btc5-lag-follow-75-symmetric-shadow", side)
+
+        # 1b) Early GTC shadow: first crossing of $50 diff at 150-200s with tradable price.
+        # Tests whether placing a GTC limit early (before the main window) would win.
+        # Paper-only — live GTC not implemented; this builds the evidence base.
+        if 150 <= seconds_remaining <= 200 and abs(diff) >= 50.0:
+            side = "Up" if diff > 0 else "Down"
+            side_price = _side_price(market, side)
+            if CROWD_MIN <= side_price <= LAG_FOLLOW_LIVE_MAX_PRICE:
+                record("btc5-early-gtc-shadow", side)
 
         # 2) Early momentum: enter before the obvious late signal if price is still tradable.
         early_lo, early_hi = EARLY_SHADOW_WINDOW
