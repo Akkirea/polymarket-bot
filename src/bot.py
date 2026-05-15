@@ -240,6 +240,7 @@ class PaperBot:
         self._ptb_cache_at:         dict = {}      # {market_slug: unix_ts when priceToBeat was last fetched}
         self._market_start_prices: dict = {}      # slug → BTC price at first sight (price_to_beat)
         self._market_start_sources: dict = {}     # slug → source name for cached first-sight price
+        self._market_diff_history: dict = {}      # slug → [(ts, seconds_remaining, diff), ...]
         self._btc_price_timestamps: list = []  # [(unix_ts, price)] — last 60s for momentum
         self._funding_rate: Optional[float] = None
         self._funding_rate_updated_at: float = 0.0
@@ -552,6 +553,7 @@ class PaperBot:
                     _pre_live_price, _pre_live_source = await self._get_signal_price()
                     if _pre_live_price is not None:
                         _pre_diff = _pre_live_price - _pre_ref_price
+                        self._record_diff_snapshot(slug, seconds_remaining, _pre_diff)
 
                         # 1. Manage existing resting orders (check fill / cancel on reversal)
                         pre_filled = await self._manage_pre_signal_orders(
@@ -1180,6 +1182,59 @@ class PaperBot:
             return None
         return closest_price
 
+    def _record_diff_snapshot(self, slug: str, seconds_remaining: float, diff: float) -> None:
+        """Record a (ts, seconds_remaining, diff) snapshot for signal maturity tracking."""
+        history = self._market_diff_history.setdefault(slug, [])
+        history.append((time.time(), seconds_remaining, diff))
+        # Keep last 6 minutes; prune closed-market entries lazily
+        cutoff = time.time() - 360
+        self._market_diff_history[slug] = [e for e in history if e[0] >= cutoff]
+
+    def _signal_maturity(self, slug: str, threshold: float = 50.0) -> dict:
+        """Analyse diff history for a market.
+
+        Returns:
+          sustained_secs  — continuous seconds diff has been above threshold in same direction
+          trend           — 'rising', 'falling', or 'stable' based on last 15s vs prior 15s
+          peak_diff       — max abs(diff) seen across the whole window
+          is_fresh        — True if signal only just crossed threshold (< 20s sustained)
+        """
+        history = self._market_diff_history.get(slug, [])
+        if not history:
+            return {"sustained_secs": 0, "trend": "unknown", "peak_diff": 0, "is_fresh": True}
+
+        now = time.time()
+        _, _, latest_diff = history[-1]
+        sign = 1 if latest_diff >= 0 else -1
+
+        # Walk history forward; find the start of the most recent unbroken run above threshold
+        above_since: Optional[float] = None
+        for ts, _, diff in history:
+            if sign * diff >= threshold:
+                if above_since is None:
+                    above_since = ts
+            else:
+                above_since = None  # dipped below — reset streak
+        sustained_secs = (now - above_since) if above_since else 0.0
+
+        # Trend: compare avg abs(diff) last 15s vs the 15s before that
+        recent = [abs(d) for t, _, d in history if now - t <= 15]
+        older  = [abs(d) for t, _, d in history if 30 >= now - t > 15]
+        if recent and older:
+            delta = sum(recent) / len(recent) - sum(older) / len(older)
+            trend = "rising" if delta > 5 else "falling" if delta < -5 else "stable"
+        else:
+            trend = "unknown"
+
+        peak_diff = max((abs(d) for _, _, d in history), default=0)
+
+        return {
+            "sustained_secs": sustained_secs,
+            "trend": trend,
+            "peak_diff": peak_diff,
+            "is_fresh": sustained_secs < 20,
+        }
+
     def _binance_is_fresh(self) -> bool:
         if self._binance_feed.current_price is None or self._binance_feed.last_update is None:
             return False
@@ -1537,6 +1592,28 @@ class PaperBot:
             print(
                 f"[bot] LAG-FOLLOW LIVE SKIP: {slug} crowd {side_price:.3f} "
                 f"< floor {floor:.2f} for diff ${abs(diff):.2f}",
+                flush=True,
+            )
+            return False
+
+        # ── Signal maturity: reject fresh spikes, penalise falling diffs ────
+        maturity = self._signal_maturity(slug, threshold=50.0)
+        print(
+            f"[bot] LAG-FOLLOW LIVE maturity: {slug} sustained={maturity['sustained_secs']:.0f}s "
+            f"trend={maturity['trend']} peak=${maturity['peak_diff']:.0f} fresh={maturity['is_fresh']}",
+            flush=True,
+        )
+        if maturity["is_fresh"]:
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} signal fresh spike — "
+                f"only {maturity['sustained_secs']:.0f}s above threshold",
+                flush=True,
+            )
+            return False
+        if maturity["trend"] == "falling":
+            print(
+                f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff trending down — "
+                f"peak=${maturity['peak_diff']:.0f} now=${abs(diff):.0f}",
                 flush=True,
             )
             return False
