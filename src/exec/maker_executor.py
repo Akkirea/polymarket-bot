@@ -80,13 +80,18 @@ class MakerExecutor:
         self._price_to_beat = price_to_beat
         self._strategy = strategy or "maker_v1"
         self._exec_mode = (exec_mode or "maker_live").lower()
-        if place_fn is None or cancel_fn is None:
+        if place_fn is None and cancel_fn is None:
             from .. import live_clob
-            self._place_fn = place_fn or live_clob.place_gtc_buy
-            self._cancel_fn = cancel_fn or live_clob.cancel_order
-        else:
+            self._place_fn = live_clob.place_gtc_buy
+            self._cancel_fn = live_clob.cancel_order
+        elif place_fn is not None and cancel_fn is not None:
             self._place_fn = place_fn
             self._cancel_fn = cancel_fn
+        else:
+            raise ValueError(
+                "MakerExecutor: place_fn and cancel_fn must be provided together "
+                "or not at all — partial injection would silently mix live/shadow calls"
+            )
         self._closed = False
         self._fill_emitted = False
         self._diff_seed = abs(plan.diff_at_entry) if plan.diff_at_entry is not None else None
