@@ -121,6 +121,21 @@ STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
 
 
+def _SHADOW_HARD_STOP(reason: str) -> None:
+    """Emit a loud alert and abort the process immediately.
+
+    Called when a maker_shadow invariant is violated. os.abort() generates a
+    core-dump signal (SIGABRT) so Railway restarts the container and the incident
+    is visible in logs and exit-code monitoring.
+    """
+    msg = f"\n{'='*70}\n[SHADOW HARD STOP] {reason}\n{'='*70}\n"
+    print(msg, flush=True)
+    import sys
+    sys.stderr.write(msg)
+    sys.stderr.flush()
+    os.abort()
+
+
 def _round_order_size(amount: float) -> float:
     """Round up to the configured order-size increment."""
     increment = max(0.01, ORDER_SIZE_INCREMENT)
@@ -252,6 +267,9 @@ class PaperBot:
         self._exec_router: Optional[ExecutionRouter] = None
         self._shadow_sim: Optional[ShadowFillSimulator] = None
         self._shadow_ready: bool = False
+        self._shadow_watchdog_task: Optional[asyncio.Task] = None
+        self._shadow_dispatch_count: int = 0       # incremented by router dispatch
+        self._live_balance_at_shadow_boot: Optional[float] = None
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
@@ -351,6 +369,10 @@ class PaperBot:
                 exec_mode=EXEC_MODE,
             )
             self._shadow_selfcheck_task = loop.create_task(self._shadow_selfcheck())
+            if EXEC_MODE == "maker_shadow":
+                self._install_shadow_canaries()
+                self._live_balance_at_shadow_boot = self.live_balance
+                self._shadow_watchdog_task = loop.create_task(self._shadow_watchdog())
             print(f"[bot] EXEC_MODE={EXEC_MODE} — router initialised", flush=True)
         else:
             print(f"[bot] EXEC_MODE={EXEC_MODE} — no live/shadow execution layer", flush=True)
@@ -400,6 +422,13 @@ class PaperBot:
             except Exception as exc:
                 print(f"[bot] router shutdown error: {exc}", flush=True)
             self._exec_router = None
+        if self._shadow_watchdog_task is not None:
+            self._shadow_watchdog_task.cancel()
+            try:
+                await self._shadow_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._shadow_watchdog_task = None
         if self._shadow_selfcheck_task is not None:
             self._shadow_selfcheck_task.cancel()
             try:
@@ -1555,6 +1584,10 @@ class PaperBot:
         # mutates self.live_balance + writes live fields to open_positions.
         # Only maker_live is permitted to traverse this code.
         if EXEC_MODE != "maker_live":
+            _SHADOW_HARD_STOP(
+                f"_manage_pre_signal_orders reached in EXEC_MODE={EXEC_MODE} — "
+                f"pre-signal path must never run outside maker_live"
+            )
             return False
         if self._pre_signal_disabled:
             return False
@@ -2735,6 +2768,7 @@ class PaperBot:
                         strategy=strategy,
                         diff_now_getter=self._current_diff_for_slug,
                     )
+                    self._shadow_dispatch_count += 1
                 except Exception as exc:
                     print(f"[bot] LIVE: maker dispatch failed for {slug} ({exc}) — paper only", flush=True)
                     self._log_live_attempt_failed(
@@ -2824,6 +2858,72 @@ class PaperBot:
             f"order_id={pos['live_order_id']}",
             flush=True,
         )
+
+    # ── Shadow safety harness ──────────────────────────────────────────────────
+
+    def _install_shadow_canaries(self) -> None:
+        """Overwrite live execution entry-points with hard-stop traps.
+
+        Called once at startup in maker_shadow. Any call to these functions
+        means a code path reached the live CLOB when it must not have.
+        """
+        from . import live_clob as _lc
+
+        def _trap(name: str):
+            async def _canary(*args, **kwargs):
+                _SHADOW_HARD_STOP(
+                    f"live_clob.{name} called in EXEC_MODE=maker_shadow — "
+                    f"real order would have been placed"
+                )
+            return _canary
+
+        _lc.place_order    = _trap("place_order")
+        _lc.place_gtc_buy  = _trap("place_gtc_buy")
+        print("[bot] shadow canaries installed on live_clob.place_order + place_gtc_buy", flush=True)
+
+    async def _shadow_watchdog(self) -> None:
+        """Periodic integrity checks while running in maker_shadow.
+
+        Hard-stops the process if any invariant is violated:
+          1. live_balance must not change from its boot value
+          2. After first dispatch, db_shadow must contain at least one row
+        """
+        await asyncio.sleep(10)  # let feeds settle first
+        dispatch_db_checked = False
+
+        while self.running:
+            # ── Check 1: live_balance must be frozen ──────────────────────────
+            if (
+                self._live_balance_at_shadow_boot is not None
+                and self.live_balance != self._live_balance_at_shadow_boot
+            ):
+                _SHADOW_HARD_STOP(
+                    f"live_balance mutated in maker_shadow: "
+                    f"boot={self._live_balance_at_shadow_boot:.4f} "
+                    f"now={self.live_balance:.4f}"
+                )
+
+            # ── Check 2: after first dispatch, DB must have a row ─────────────
+            if self._shadow_dispatch_count > 0 and not dispatch_db_checked:
+                try:
+                    counts = db_shadow.counts_24h()
+                    total = sum(counts.values())
+                    if total == 0:
+                        _SHADOW_HARD_STOP(
+                            f"dispatch count={self._shadow_dispatch_count} but "
+                            f"db_shadow shows 0 rows — shadow_clob may not be writing"
+                        )
+                    else:
+                        print(
+                            f"[shadow-watchdog] DB integrity OK after first dispatch: "
+                            f"{counts}",
+                            flush=True,
+                        )
+                        dispatch_db_checked = True
+                except Exception as exc:
+                    print(f"[shadow-watchdog] db_shadow.counts_24h failed: {exc}", flush=True)
+
+            await asyncio.sleep(5)
 
     async def _shadow_selfcheck(self) -> None:
         """After 60 s, verify book WS produces a valid top-of-book for at least one
