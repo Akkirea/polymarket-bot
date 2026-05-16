@@ -24,9 +24,15 @@ from typing import Optional
 import aiohttp
 
 from . import db
+from . import db_shadow
 from .binance_ws import BinancePriceFeed, OrderBookFeed
 from .chainlink import get_btc_price, get_price_at_ts as chainlink_price_at_ts
 from .rtds_ws import PolymarketRtdsPriceFeed
+from .feeds.clob_book_ws import ClobBookFeed
+from .feeds.clob_user_ws import ClobUserFeed
+from .exec.router import ExecutionRouter
+from .exec.shadow_sim import ShadowFillSimulator
+from .exec import shadow_clob
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -104,8 +110,30 @@ OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.5"))
 OB_SUSTAINED_SECONDS   = float(os.getenv("OB_SUSTAINED_SECONDS",   "5.0"))
 OB_SHADOW_WINDOW       = (60, 210)  # wider than lag-follow; leading signal fires early
 
+# ── Execution mode ────────────────────────────────────────────────────────────
+# Values: shadow_only | maker_shadow | maker_live
+EXEC_MODE = os.getenv("EXEC_MODE", "shadow_only").lower()
+if EXEC_MODE.startswith("maker_"):
+    # Pre-signal limit path is not migrated; force-disable when in maker modes.
+    os.environ["PRE_SIGNAL_ENABLED"] = "false"
+
 STRATEGY_TAG = "SIGNAL_STRATEGY"  # stored in whale_address column (NOT NULL)
 LIVE_INITIAL_BALANCE = float(os.getenv("LIVE_INITIAL_BALANCE", "8.45"))  # starting pUSD on-chain
+
+
+def _SHADOW_HARD_STOP(reason: str) -> None:
+    """Emit a loud alert and abort the process immediately.
+
+    Called when a maker_shadow invariant is violated. os.abort() generates a
+    core-dump signal (SIGABRT) so Railway restarts the container and the incident
+    is visible in logs and exit-code monitoring.
+    """
+    msg = f"\n{'='*70}\n[SHADOW HARD STOP] {reason}\n{'='*70}\n"
+    print(msg, flush=True)
+    import sys
+    sys.stderr.write(msg)
+    sys.stderr.flush()
+    os.abort()
 
 
 def _round_order_size(amount: float) -> float:
@@ -227,10 +255,21 @@ class PaperBot:
         self._binance_task: Optional[asyncio.Task] = None
         self._rtds_task: Optional[asyncio.Task] = None
         self._ob_task: Optional[asyncio.Task] = None
+        self._clob_book_task: Optional[asyncio.Task] = None
+        self._clob_user_task: Optional[asyncio.Task] = None
+        self._shadow_selfcheck_task: Optional[asyncio.Task] = None
         self._session:    Optional[aiohttp.ClientSession] = None
         self._binance_feed = BinancePriceFeed()
         self._rtds_feed = PolymarketRtdsPriceFeed()
         self._ob_feed = OrderBookFeed()
+        self._clob_book_feed = ClobBookFeed()
+        self._clob_user_feed = ClobUserFeed()
+        self._exec_router: Optional[ExecutionRouter] = None
+        self._shadow_sim: Optional[ShadowFillSimulator] = None
+        self._shadow_ready: bool = False
+        self._shadow_watchdog_task: Optional[asyncio.Task] = None
+        self._shadow_dispatch_count: int = 0       # incremented by router dispatch
+        self._live_balance_at_shadow_boot: Optional[float] = None
         self._entered_slugs: set = set()           # avoid re-entering the same market
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
@@ -238,6 +277,19 @@ class PaperBot:
             row["market_slug"]: row
             for row in db.load_pre_signal_orders()
         }
+        # Startup safety net: pre-signal management ONLY allowed in maker_live.
+        # If shadow_only/maker_shadow boots with leftover rows, log + disable
+        # so even a regression in the runtime guard cannot reach the live SDK.
+        self._pre_signal_disabled: bool = False
+        if EXEC_MODE != "maker_live" and len(self._pre_signal_orders) > 0:
+            print(
+                f"[bot] STARTUP SAFETY: EXEC_MODE={EXEC_MODE} but found "
+                f"{len(self._pre_signal_orders)} leftover pre_signal_orders row(s); "
+                f"_manage_pre_signal_orders is permanently disabled this run "
+                f"(slugs: {', '.join(self._pre_signal_orders.keys())})",
+                flush=True,
+            )
+            self._pre_signal_disabled = True
         self._shadow_entered_slugs: set = set()    # avoid duplicate shadow rows per (slug, strategy)
         self._evaluating:    bool = False          # True while reversal guard is mid-sleep
         self._final_price_cache:    dict = {}      # {market_slug: finalPrice} for recent closed markets
@@ -292,6 +344,38 @@ class PaperBot:
         self._binance_task = loop.create_task(self._binance_feed.connect())
         self._rtds_task = loop.create_task(self._rtds_feed.connect())
         self._ob_task = loop.create_task(self._ob_feed.connect())
+        if EXEC_MODE in {"maker_shadow", "maker_live"}:
+            self._clob_book_task = loop.create_task(self._clob_book_feed.connect())
+            if EXEC_MODE == "maker_shadow":
+                self._shadow_sim = ShadowFillSimulator()
+                shadow_clob.set_simulator(self._shadow_sim)
+                self._clob_book_feed.set_trade_callback(self._shadow_sim.on_trade)
+                self._clob_book_feed.set_book_callback(self._shadow_sim.on_book_update)
+                fill_source = self._shadow_sim
+                place_fn = shadow_clob.place_gtc_buy_shadow
+                cancel_fn = shadow_clob.cancel_order_shadow
+            else:
+                self._clob_user_task = loop.create_task(self._clob_user_feed.connect())
+                fill_source = self._clob_user_feed
+                place_fn = None  # router defaults to live_clob.place_gtc_buy
+                cancel_fn = None
+            self._exec_router = ExecutionRouter(
+                book_feed=self._clob_book_feed,
+                fill_source=fill_source,
+                on_fill=self._on_maker_fill,
+                log_attempt=self._log_live_attempt_failed,
+                place_fn=place_fn,
+                cancel_fn=cancel_fn,
+                exec_mode=EXEC_MODE,
+            )
+            self._shadow_selfcheck_task = loop.create_task(self._shadow_selfcheck())
+            if EXEC_MODE == "maker_shadow":
+                self._install_shadow_canaries()
+                self._live_balance_at_shadow_boot = self.live_balance
+                self._shadow_watchdog_task = loop.create_task(self._shadow_watchdog())
+            print(f"[bot] EXEC_MODE={EXEC_MODE} — router initialised", flush=True)
+        else:
+            print(f"[bot] EXEC_MODE={EXEC_MODE} — no live/shadow execution layer", flush=True)
         loop.create_task(self._reconcile_unresolved_trades())
         loop.create_task(self._reconcile_unresolved_shadow_trades())
         loop.create_task(self._reconcile_unresolved_live_attempts())
@@ -332,6 +416,42 @@ class PaperBot:
             except asyncio.CancelledError:
                 pass
             self._ob_task = None
+        if self._exec_router is not None:
+            try:
+                await self._exec_router.shutdown()
+            except Exception as exc:
+                print(f"[bot] router shutdown error: {exc}", flush=True)
+            self._exec_router = None
+        if self._shadow_watchdog_task is not None:
+            self._shadow_watchdog_task.cancel()
+            try:
+                await self._shadow_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._shadow_watchdog_task = None
+        if self._shadow_selfcheck_task is not None:
+            self._shadow_selfcheck_task.cancel()
+            try:
+                await self._shadow_selfcheck_task
+            except asyncio.CancelledError:
+                pass
+            self._shadow_selfcheck_task = None
+        self._clob_book_feed.stop()
+        if self._clob_book_task:
+            self._clob_book_task.cancel()
+            try:
+                await self._clob_book_task
+            except asyncio.CancelledError:
+                pass
+            self._clob_book_task = None
+        self._clob_user_feed.stop()
+        if self._clob_user_task:
+            self._clob_user_task.cancel()
+            try:
+                await self._clob_user_task
+            except asyncio.CancelledError:
+                pass
+            self._clob_user_task = None
         if self._session and not self._session.closed:
             await self._session.close()
         print("[bot] Stopped")
@@ -371,6 +491,30 @@ class PaperBot:
             "funding_rate": self._funding_rate,
             "funding_rate_updated_at": self._funding_rate_updated_at or None,
             "funding_rate_source": self._funding_rate_source,
+            "shadow": self._shadow_status_block(),
+        }
+
+    def _shadow_status_block(self) -> dict:
+        counts = {"open": 0, "filled_aggressive_24h": 0, "filled_conservative_24h": 0, "cancelled_24h": 0}
+        if EXEC_MODE == "maker_shadow":
+            try:
+                counts = db_shadow.counts_24h()
+            except Exception:
+                pass
+        return {
+            "exec_mode": EXEC_MODE,
+            "ready": self._shadow_ready,
+            "orders_open_in_memory": (
+                self._shadow_sim.status_snapshot()["open_orders"] if self._shadow_sim else 0
+            ),
+            "orders_open_db": counts.get("open", 0),
+            "orders_filled_aggressive_24h": counts.get("filled_aggressive_24h", 0),
+            "orders_filled_conservative_24h": counts.get("filled_conservative_24h", 0),
+            "orders_cancelled_24h": counts.get("cancelled_24h", 0),
+            "last_book_update_ts": getattr(self._clob_book_feed, "last_book_update_ts", 0.0),
+            "last_trade_event_ts": getattr(self._clob_book_feed, "last_trade_event_ts", 0.0),
+            "ws_book_connected": getattr(self._clob_book_feed, "connected", False),
+            "book_subscriptions": len(getattr(self._clob_book_feed, "_subscriptions", set()) or set()),
         }
 
     def get_recent_trades(self, n: int = 20, mode: str = "paper") -> list:
@@ -1353,6 +1497,8 @@ class PaperBot:
         hour_et: int,
     ) -> None:
         """At PRE_SIGNAL_DIFF threshold, place a GTC limit order before the book reprices."""
+        if EXEC_MODE.startswith("maker_"):
+            return
         if not PRE_SIGNAL_ENABLED:
             return
         if os.getenv("POLYMARKET_LIVE", "false").lower() != "true":
@@ -1432,6 +1578,19 @@ class PaperBot:
         - If diff reversed below cancel threshold: cancel the order
         - Returns True if a pre-signal fill was processed (caller should skip normal entry).
         """
+        # ── Permanent runtime guard ────────────────────────────────────────────
+        # The pre-signal path uses live_clob.cancel_limit_order / get_order_status
+        # which have NO POLYMARKET_LIVE gate inside live_clob, and the fill branch
+        # mutates self.live_balance + writes live fields to open_positions.
+        # Only maker_live is permitted to traverse this code.
+        if EXEC_MODE != "maker_live":
+            _SHADOW_HARD_STOP(
+                f"_manage_pre_signal_orders reached in EXEC_MODE={EXEC_MODE} — "
+                f"pre-signal path must never run outside maker_live"
+            )
+            return False
+        if self._pre_signal_disabled:
+            return False
         slug = market.get("slug", "")
         order_info = self._pre_signal_orders.get(slug)
         if order_info is None:
@@ -1617,31 +1776,7 @@ class PaperBot:
             )
             return False
 
-        # ── Re-confirm signal still holds after 5s ───────────────────────
-        # Symmetric zone (< 0.55) uses a tighter re-check ($75) since the crowd
-        # is skeptical; confidence zone (0.55+) uses the standard $50 re-check.
-        recheck_threshold = 75.0 if side_price < 0.55 else 50.0
-        if side_price < live_max_price:
-            await asyncio.sleep(5)
-            live_price2, _ = await self._get_signal_price()
-            if live_price2 is None:
-                return False
-            diff2 = live_price2 - reference_price
-            if abs(diff2) < recheck_threshold:
-                print(
-                    f"[bot] LAG-FOLLOW LIVE SKIP: {slug} diff fell to ${abs(diff2):.2f} "
-                    f"on re-check (threshold ${recheck_threshold:.0f}) — signal weakened",
-                    flush=True,
-                )
-                return False
-            side_price2 = _side_price(market, side)
-            if side_price2 < floor:
-                print(
-                    f"[bot] LAG-FOLLOW LIVE SKIP: {slug} crowd moved to {side_price2:.3f} "
-                    f"< floor {floor:.2f} on re-check",
-                    flush=True,
-                )
-                return False
+        # Recheck disabled: continuous diff-decay cancel is enforced inside MakerExecutor.
 
         price_10s_ago = self._get_price_n_seconds_ago(10)
         price_30s_ago = self._get_price_n_seconds_ago(30)
@@ -2576,8 +2711,15 @@ class PaperBot:
 
         # ── Live order (best-effort alongside paper) ───────────────────────────
         live_order = None
-        live_should_retry = False
-        if os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and live_enabled:
+        execution_enabled = (
+            live_enabled
+            and EXEC_MODE in {"maker_shadow", "maker_live"}
+            and (EXEC_MODE == "maker_shadow" or os.getenv("POLYMARKET_LIVE", "false").lower() == "true")
+        )
+        if EXEC_MODE == "maker_shadow" and not self._shadow_ready:
+            print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
+            execution_enabled = False
+        if execution_enabled:
             if seconds_remaining is not None and seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
                 print(
                     f"[bot] LIVE: skipped for {slug}; {seconds_remaining:.1f}s before close "
@@ -2609,67 +2751,36 @@ class PaperBot:
                 )
             elif market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
+            elif self._exec_router is None:
+                print(f"[bot] LIVE: exec router not initialised — paper only", flush=True)
             else:
-                live_cap = entry_price
                 try:
-                    from . import live_clob
-                    max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
-                    live_cap = min(CROWD_MAX, max_profit_price)
-                    live_retries = max(0, int(os.getenv("LIVE_FAK_RETRIES", "1")))
-                    live_retry_delay = max(0.0, float(os.getenv("LIVE_FAK_RETRY_DELAY_SEC", "1.0")))
-
-                    for attempt in range(live_retries + 1):
-                        try:
-                            live_order = await live_clob.place_order(
-                                market,
-                                side,
-                                stake,
-                                max_fill_price=live_cap,
-                            )
-                            break
-                        except Exception as exc:
-                            order_type = os.getenv("LIVE_ORDER_TYPE", "FAK").upper()
-                            no_fak_match = "no orders found to match with FAK order" in str(exc)
-                            can_retry = order_type == "FAK" and no_fak_match and attempt < live_retries
-                            if not can_retry:
-                                raise
-                            print(
-                                f"[bot] LIVE: FAK no-fill for {slug}; retrying "
-                                f"{attempt + 1}/{live_retries} in {live_retry_delay:.1f}s "
-                                f"at cap={live_cap:.4f}",
-                                flush=True,
-                            )
-                            if live_retry_delay:
-                                await asyncio.sleep(live_retry_delay)
-
-                    if live_order is None:
-                        raise RuntimeError("live retry loop exited without an order")
-
-                    self.live_balance -= live_order["stake"]
-                    print(
-                        f"[bot] LIVE: filled orderID={live_order['order_id']}  "
-                        f"stake=${live_order['stake']:.2f}  price={live_order['fill_price']:.4f}  "
-                        f"cap={live_order.get('max_fill_price', live_cap):.4f}  "
-                        f"tx={live_order['tx_hash']}",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(f"[bot] LIVE: order failed for {slug} ({exc}) — paper only", flush=True)
-                    self._log_live_attempt_failed(
-                        slug,
-                        side,
-                        stake,
-                        entry_price,
-                        live_cap,
-                        str(exc),
-                        seconds_remaining=seconds_remaining,
-                        strategy=strategy,
+                    await self._exec_router.dispatch(
+                        market=market,
+                        slug=slug,
+                        side=side,
+                        stake=stake,
+                        paper_entry_price=entry_price,
+                        seconds_remaining=seconds_remaining or 0.0,
+                        end_ts=end_ts,
                         diff_at_entry=diff_at_entry,
                         price_to_beat=price_to_beat,
+                        strategy=strategy,
+                        diff_now_getter=self._current_diff_for_slug,
                     )
-                    live_should_retry = True
-        elif os.getenv("POLYMARKET_LIVE", "false").lower() == "true" and not live_enabled:
-            print(f"[bot] LIVE: disabled for {slug} strategy={strategy} — paper/shadow only", flush=True)
+                    self._shadow_dispatch_count += 1
+                except Exception as exc:
+                    print(f"[bot] LIVE: maker dispatch failed for {slug} ({exc}) — paper only", flush=True)
+                    self._log_live_attempt_failed(
+                        slug, side, stake, entry_price, entry_price, f"maker_dispatch_error: {exc}",
+                        seconds_remaining=seconds_remaining, strategy=strategy,
+                        diff_at_entry=diff_at_entry, price_to_beat=price_to_beat,
+                    )
+        else:
+            if EXEC_MODE == "shadow_only":
+                pass  # paper/shadow accounting only
+            elif not live_enabled:
+                print(f"[bot] LIVE: disabled for {slug} strategy={strategy} — paper/shadow only", flush=True)
 
         self.balance -= stake
         pos = {
@@ -2690,8 +2801,6 @@ class PaperBot:
         self.positions.append(pos)
         db.save_open_position(pos)
         db.save_bot_state(self.balance)
-        if live_should_retry:
-            asyncio.create_task(self._retry_live_fill(pos, market, side, stake, entry_price))
         if start_ts is None:
             start_ts = _extract_start_ts(slug)
         win_start = datetime.utcfromtimestamp(start_ts).strftime("%H:%M") if start_ts is not None else "?"
@@ -2704,94 +2813,160 @@ class PaperBot:
             flush=True,
         )
 
-    async def _retry_live_fill(
-        self,
-        pos: dict,
-        market: Optional[dict],
-        side: str,
-        stake: float,
-        paper_entry_price: float,
-    ) -> None:
-        """Keep trying to attach a live fill to an already-open paper position."""
-        slug = pos["market_slug"]
-        if market is None or slug in self._live_retry_slugs:
-            return
+    async def _retry_live_fill(self, *args, **kwargs) -> None:
+        """Deprecated: FAK retry loop replaced by MakerExecutor diff-decay cancel."""
+        return None
 
-        max_profit_price = float(os.getenv("LIVE_RETRY_MAX_PRICE", "0.62"))
-        retry_interval = max(0.5, float(os.getenv("LIVE_RETRY_INTERVAL_SEC", "3.0")))
-        stop_before_close = max(
-            LIVE_MIN_SECONDS_BEFORE_CLOSE,
-            float(os.getenv("LIVE_RETRY_STOP_BEFORE_CLOSE_SEC", str(LIVE_MIN_SECONDS_BEFORE_CLOSE))),
-        )
-        max_attempts = max(0, int(os.getenv("LIVE_RETRY_MAX_ATTEMPTS", "12")))
-        live_cap = min(CROWD_MAX, max_profit_price)
-
-        if not (CROWD_MIN <= paper_entry_price <= CROWD_MAX):
-            print(
-                f"[bot] LIVE RETRY: disabled for {slug}; paper_entry_price={paper_entry_price:.3f} "
-                f"outside crowd band [{CROWD_MIN},{CROWD_MAX}]",
-                flush=True,
-            )
-            return
-        if live_cap < CROWD_MIN:
-            print(
-                f"[bot] LIVE RETRY: disabled for {slug}; cap={live_cap:.4f} below CROWD_MIN={CROWD_MIN:.2f}",
-                flush=True,
-            )
-            return
-
-        self._live_retry_slugs.add(slug)
+    def _current_diff_for_slug(self, slug: str) -> Optional[float]:
+        """Return latest BTC-vs-reference diff for a slug, or None if unknown."""
+        hist = self._market_diff_history.get(slug)
+        if not hist:
+            return None
         try:
-            for attempt in range(1, max_attempts + 1):
-                if time.time() >= (float(pos["end_ts"]) - stop_before_close):
-                    print(f"[bot] LIVE RETRY: stop for {slug}; too close to close", flush=True)
-                    return
+            return float(hist[-1][2])
+        except Exception:
+            return None
 
-                current_pos = next((p for p in self.positions if p["market_slug"] == slug), None)
-                if current_pos is None or current_pos.get("live_order_id"):
-                    return
+    async def _on_maker_fill(self, fill: dict) -> None:
+        """Callback invoked by MakerExecutor when a resting order matches."""
+        if EXEC_MODE != "maker_live":
+            print(
+                f"[bot] SHADOW FILL (no state mutation): {fill.get('market_slug')} "
+                f"order_id={fill.get('order_id')} price={fill.get('fill_price')} "
+                f"stake={fill.get('stake')}",
+                flush=True,
+            )
+            return
+        slug = fill.get("market_slug")
+        if not slug:
+            return
+        pos = next((p for p in self.positions if p["market_slug"] == slug), None)
+        if pos is None:
+            print(f"[bot] MAKER FILL ignored: no open position for {slug}", flush=True)
+            return
+        pos["live_order_id"] = fill.get("order_id")
+        pos["live_stake"] = float(fill.get("stake", 0.0))
+        pos["live_fill_price"] = float(fill.get("fill_price", 0.0))
+        try:
+            db.save_open_position(pos)
+        except Exception as exc:
+            print(f"[bot] MAKER FILL: db save_open_position failed for {slug}: {exc}", flush=True)
+        self.live_balance -= float(fill.get("stake", 0.0))
+        print(
+            f"[bot] MAKER FILLED {pos['side']:>4} {slug} "
+            f"stake=${pos['live_stake']:.2f} price={pos['live_fill_price']:.4f} "
+            f"order_id={pos['live_order_id']}",
+            flush=True,
+        )
 
+    # ── Shadow safety harness ──────────────────────────────────────────────────
+
+    def _install_shadow_canaries(self) -> None:
+        """Overwrite live execution entry-points with hard-stop traps.
+
+        Called once at startup in maker_shadow. Any call to these functions
+        means a code path reached the live CLOB when it must not have.
+        """
+        from . import live_clob as _lc
+
+        def _trap(name: str):
+            async def _canary(*args, **kwargs):
+                _SHADOW_HARD_STOP(
+                    f"live_clob.{name} called in EXEC_MODE=maker_shadow — "
+                    f"real order would have been placed"
+                )
+            return _canary
+
+        _lc.place_order    = _trap("place_order")
+        _lc.place_gtc_buy  = _trap("place_gtc_buy")
+        print("[bot] shadow canaries installed on live_clob.place_order + place_gtc_buy", flush=True)
+
+    async def _shadow_watchdog(self) -> None:
+        """Periodic integrity checks while running in maker_shadow.
+
+        Hard-stops the process if any invariant is violated:
+          1. live_balance must not change from its boot value
+          2. After first dispatch, db_shadow must contain at least one row
+        """
+        await asyncio.sleep(10)  # let feeds settle first
+        dispatch_db_checked = False
+
+        while self.running:
+            # ── Check 1: live_balance must be frozen ──────────────────────────
+            if (
+                self._live_balance_at_shadow_boot is not None
+                and self.live_balance != self._live_balance_at_shadow_boot
+            ):
+                _SHADOW_HARD_STOP(
+                    f"live_balance mutated in maker_shadow: "
+                    f"boot={self._live_balance_at_shadow_boot:.4f} "
+                    f"now={self.live_balance:.4f}"
+                )
+
+            # ── Check 2: after first dispatch, DB must have a row ─────────────
+            if self._shadow_dispatch_count > 0 and not dispatch_db_checked:
                 try:
-                    from . import live_clob
-                    live_order = await live_clob.place_order(
-                        market,
-                        side,
-                        stake,
-                        max_fill_price=live_cap,
-                    )
+                    counts = db_shadow.counts_24h()
+                    total = sum(counts.values())
+                    if total == 0:
+                        _SHADOW_HARD_STOP(
+                            f"dispatch count={self._shadow_dispatch_count} but "
+                            f"db_shadow shows 0 rows — shadow_clob may not be writing"
+                        )
+                    else:
+                        print(
+                            f"[shadow-watchdog] DB integrity OK after first dispatch: "
+                            f"{counts}",
+                            flush=True,
+                        )
+                        dispatch_db_checked = True
                 except Exception as exc:
-                    print(
-                        f"[bot] LIVE RETRY: {slug} attempt {attempt}/{max_attempts} failed "
-                        f"cap={live_cap:.4f}: {exc}",
-                        flush=True,
-                    )
-                    self._log_live_attempt_failed(
-                        pos,
-                        side,
-                        stake,
-                        paper_entry_price,
-                        live_cap,
-                        str(exc),
-                    )
-                    await asyncio.sleep(retry_interval)
-                    continue
+                    print(f"[shadow-watchdog] db_shadow.counts_24h failed: {exc}", flush=True)
 
-                current_pos["live_order_id"] = live_order["order_id"]
-                current_pos["live_stake"] = live_order["stake"]
-                current_pos["live_fill_price"] = live_order["fill_price"]
-                db.save_open_position(current_pos)
-                self.live_balance -= live_order["stake"]
+            await asyncio.sleep(5)
+
+    async def _shadow_selfcheck(self) -> None:
+        """After 60 s, verify book WS produces a valid top-of-book for at least one
+        active 5 m token. Sets self._shadow_ready when satisfied."""
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
+        try:
+            markets = await self._fetch_active_markets()
+        except Exception as exc:
+            print(f"[bot] shadow self-check: fetch_active_markets failed: {exc}", flush=True)
+            return
+        token_id: Optional[str] = None
+        for m in markets:
+            try:
+                from .live_clob import token_for_side
+                token_id = token_for_side(m, "Up")
+                self._clob_book_feed.subscribe(token_id)
+                break
+            except Exception:
+                continue
+        if token_id is None:
+            print("[bot] shadow self-check: no active 5m market token resolved", flush=True)
+            return
+        deadline = time.time() + 120
+        while time.time() < deadline and self.running:
+            top = self._clob_book_feed.top(token_id, max_age_sec=2.0)
+            if (
+                top is not None
+                and top.bid_price is not None
+                and top.ask_price is not None
+                and top.bid_price < top.ask_price
+            ):
+                self._shadow_ready = True
                 print(
-                    f"[bot] LIVE RETRY FILLED {side:>4} {slug} "
-                    f"stake=${live_order['stake']:.2f} price={live_order['fill_price']:.4f} "
-                    f"cap={live_cap:.4f} tx={live_order['tx_hash']}",
+                    f"[bot] shadow self-check PASSED token={token_id[:10]} "
+                    f"bid={top.bid_price:.4f} ask={top.ask_price:.4f}",
                     flush=True,
                 )
                 return
-
-            print(f"[bot] LIVE RETRY: gave up on {slug} after {max_attempts} attempts", flush=True)
-        finally:
-            self._live_retry_slugs.discard(slug)
+            await asyncio.sleep(2)
+        print("[bot] shadow self-check FAILED — refusing shadow dispatch", flush=True)
 
     async def _force_close(self, pos: dict):
         """Close a position that never received a winner from Polymarket.
