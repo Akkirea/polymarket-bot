@@ -275,6 +275,85 @@ async def diagnose() -> dict:
     return results
 
 
+# ── Maker-side execution helpers (used by MakerExecutor) ──────────────────────
+
+async def place_gtc_buy(
+    market: dict,
+    side: str,
+    stake_usdc: float,
+    limit_price: float,
+) -> dict:
+    """Place a single resting GTC BUY limit order. Returns SDK response dict.
+
+    Stake is in USDC; size in shares = stake/limit_price.
+    Raises LiveClobError on rejection. POLYMARKET_LIVE must be true.
+    """
+    if os.getenv("POLYMARKET_LIVE", "false").lower() != "true":
+        raise LiveClobError("POLYMARKET_LIVE must be true to place live orders")
+
+    min_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
+    max_price = float(os.getenv("MAX_LIVE_PRICE", "0.70"))
+    if not (min_price <= float(limit_price) <= max_price):
+        raise LiveClobError(
+            f"limit_price {float(limit_price):.4f} outside [{min_price:.2f},{max_price:.2f}]"
+        )
+
+    sdk = _load_sdk()
+    client = _client(sdk)
+    token_id = token_for_side(market, side)
+    tick_size = client.get_tick_size(token_id)
+    neg_risk = client.get_neg_risk(token_id)
+
+    stake = round(float(stake_usdc), 2)
+    if stake < 0.01:
+        raise LiveClobError(f"Stake ${stake:.4f} below $0.01 minimum")
+
+    price = round(float(limit_price), 4)
+    shares = round(stake / price, 4) if price > 0 else 0.0
+
+    order = client.create_order(
+        order_args=sdk["OrderArgs"](
+            token_id=token_id,
+            price=price,
+            size=shares,
+            side="BUY",
+        ),
+        options=sdk["PartialCreateOrderOptions"](tick_size=tick_size, neg_risk=bool(neg_risk)),
+    )
+    resp = _to_plain(client.post_order(order, sdk["OrderType"].GTC))
+
+    if not isinstance(resp, dict):
+        raise LiveClobError(f"GTC order returned unexpected response: {resp}")
+    order_id = resp.get("orderID") or resp.get("order_id")
+    if not order_id:
+        raise LiveClobError(f"GTC order response missing orderID: {resp}")
+
+    return {
+        "order_id": order_id,
+        "token_id": token_id,
+        "side": side,
+        "limit_price": price,
+        "stake_usdc": stake,
+        "shares": shares,
+        "response": resp,
+    }
+
+
+async def cancel_order(order_id: str) -> bool:
+    """Cancel a resting order. Returns True on success."""
+    sdk = _load_sdk()
+    client = _client(sdk)
+    resp = _to_plain(client.cancel_order(sdk["OrderPayload"](orderID=order_id)))
+    return isinstance(resp, dict) and not resp.get("error")
+
+
+def get_book_rest(token_id: str) -> dict:
+    """REST fallback for orderbook top-of-book; used only when WS feed is stale."""
+    sdk = _load_sdk()
+    client = _client(sdk)
+    return _to_plain(client.get_order_book(token_id))
+
+
 async def place_order(
     market: dict,
     side: str,
