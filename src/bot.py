@@ -501,12 +501,23 @@ class PaperBot:
                 counts = db_shadow.counts_24h()
             except Exception:
                 pass
+        sim_snap: dict = {}
+        if self._shadow_sim is not None:
+            try:
+                sim_snap = self._shadow_sim.status_snapshot()
+            except Exception:
+                sim_snap = {}
+        # Fix 1: per-token freshness map for the measurement-phase smoke test.
+        freshness: dict = {"book_ages_sec": {}, "trade_ages_sec": {}}
+        try:
+            if hasattr(self._clob_book_feed, "freshness_snapshot"):
+                freshness = self._clob_book_feed.freshness_snapshot()
+        except Exception:
+            pass
         return {
             "exec_mode": EXEC_MODE,
             "ready": self._shadow_ready,
-            "orders_open_in_memory": (
-                self._shadow_sim.status_snapshot()["open_orders"] if self._shadow_sim else 0
-            ),
+            "orders_open_in_memory": sim_snap.get("open_orders", 0),
             "orders_open_db": counts.get("open", 0),
             "orders_filled_aggressive_24h": counts.get("filled_aggressive_24h", 0),
             "orders_filled_conservative_24h": counts.get("filled_conservative_24h", 0),
@@ -515,6 +526,14 @@ class PaperBot:
             "last_trade_event_ts": getattr(self._clob_book_feed, "last_trade_event_ts", 0.0),
             "ws_book_connected": getattr(self._clob_book_feed, "connected", False),
             "book_subscriptions": len(getattr(self._clob_book_feed, "_subscriptions", set()) or set()),
+            # Fix 1 telemetry
+            "last_book_update_by_token": freshness.get("book_ages_sec", {}),
+            "last_trade_event_by_token": freshness.get("trade_ages_sec", {}),
+            # Fix 2 telemetry
+            "queue_ahead_zero_count": sim_snap.get("queue_ahead_zero_count", 0),
+            "queue_ahead_nonzero_count": sim_snap.get("queue_ahead_nonzero_count", 0),
+            "direction_rejections_total": sim_snap.get("direction_rejections_total", 0),
+            "trades_missing_aggressor_total": sim_snap.get("trades_missing_aggressor_total", 0),
         }
 
     def get_recent_trades(self, n: int = 20, mode: str = "paper") -> list:
@@ -2719,6 +2738,27 @@ class PaperBot:
         if EXEC_MODE == "maker_shadow" and not self._shadow_ready:
             print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
             execution_enabled = False
+        # Fix 1: per-token freshness gate. The selfcheck-driven _shadow_ready flag
+        # is one-shot; this gate is checked on every dispatch and uses per-token
+        # last-update timestamps. First dispatch for a never-seen token is allowed
+        # to pass (router will subscribe inside dispatch); subsequent dispatches
+        # require recent book data for the specific token.
+        if EXEC_MODE == "maker_shadow" and execution_enabled and market is not None:
+            try:
+                from .live_clob import token_for_side as _tfs_check
+                _tok = _tfs_check(market, side)
+            except Exception:
+                _tok = None
+            if _tok and self._clob_book_feed.is_subscribed(_tok):
+                age = self._clob_book_feed.get_token_age(_tok)
+                if age is None or age > 30.0:
+                    age_str = "never" if age is None else f"{age:.1f}s"
+                    print(
+                        f"[bot] SKIP: token={str(_tok)[:12]}.. stale (age={age_str}, max=30s) "
+                        f"slug={slug}",
+                        flush=True,
+                    )
+                    execution_enabled = False
         if execution_enabled:
             if seconds_remaining is not None and seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
                 print(
