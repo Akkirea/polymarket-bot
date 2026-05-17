@@ -55,7 +55,11 @@ def _ensure_table() -> None:
             trade_prints_during_window INTEGER DEFAULT 0,
             book_ws_uptime_pct REAL,
             code_version TEXT DEFAULT 'maker_shadow_v1',
-            exec_mode TEXT
+            exec_mode TEXT,
+            queue_ahead_at_placement REAL,
+            queue_cleared_before_fill REAL DEFAULT 0,
+            trade_aggressor_side TEXT,
+            direction_rejections INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_maker_shadow_slug ON maker_shadow_attempts(market_slug);
         CREATE INDEX IF NOT EXISTS idx_maker_shadow_dispatched ON maker_shadow_attempts(dispatched_at);
@@ -67,6 +71,25 @@ def _ensure_table() -> None:
                 conn.commit()
             except Exception:
                 pass
+            # Fix 2 migration: ALTER existing deployments to add the new columns.
+            # Postgres supports IF NOT EXISTS; SQLite errors on duplicate so we
+            # swallow per-statement failures.
+            migrations = [
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN queue_ahead_at_placement REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN queue_cleared_before_fill REAL DEFAULT 0",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN trade_aggressor_side TEXT",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN direction_rejections INTEGER DEFAULT 0",
+            ]
+            for stmt in migrations:
+                try:
+                    conn.execute(stmt)
+                    try:
+                        conn.commit()
+                    except Exception:
+                        pass
+                except Exception:
+                    # Column already exists (or unsupported syntax) — ignore.
+                    pass
         finally:
             conn.close()
         _initialised = True
@@ -106,6 +129,9 @@ _UPDATE_COLS = {
     "settlement_outcome", "hypothetical_pnl_conservative",
     "hypothetical_pnl_aggressive", "book_updates_during_window",
     "trade_prints_during_window", "book_ws_uptime_pct",
+    # Fix 2 audit columns
+    "queue_ahead_at_placement", "queue_cleared_before_fill",
+    "trade_aggressor_side", "direction_rejections",
 }
 
 

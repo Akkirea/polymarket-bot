@@ -48,6 +48,11 @@ class ClobBookFeed:
         self._connected_evt = asyncio.Event()
         self._trade_callback: Optional[Callable] = None
         self._book_callback: Optional[Callable] = None
+        # Per-token freshness (Fix 1): each subscribed token has its own update timestamp
+        # so the freshness gate cannot be satisfied by activity on a different token.
+        self._last_book_update_by_token: dict[str, float] = {}
+        self._last_trade_event_by_token: dict[str, float] = {}
+        # Aggregate timestamps retained for status/back-compat; do NOT use for gating.
         self.last_trade_event_ts: float = 0.0
         self.last_book_update_ts: float = 0.0
 
@@ -70,6 +75,33 @@ class ClobBookFeed:
         self._subscriptions.add(token_id)
         if self._ws is not None:
             asyncio.create_task(self._send_subscribe([token_id]))
+
+    def is_subscribed(self, token_id: str) -> bool:
+        return str(token_id) in self._subscriptions
+
+    def get_token_age(self, token_id: str) -> Optional[float]:
+        """Seconds since last book update for this token, or None if never updated."""
+        ts = self._last_book_update_by_token.get(str(token_id), 0.0)
+        if ts <= 0:
+            return None
+        return time.time() - ts
+
+    def is_token_fresh(self, token_id: str, max_age: float = 30.0) -> bool:
+        age = self.get_token_age(token_id)
+        return age is not None and age < max_age
+
+    def freshness_snapshot(self) -> dict:
+        """Per-token age in seconds for the status endpoint."""
+        now = time.time()
+        book_ages: dict = {}
+        trade_ages: dict = {}
+        for tok in self._subscriptions:
+            tok_s = str(tok)
+            b = self._last_book_update_by_token.get(tok_s, 0.0)
+            t = self._last_trade_event_by_token.get(tok_s, 0.0)
+            book_ages[tok_s[:12]] = round(now - b, 1) if b > 0 else None
+            trade_ages[tok_s[:12]] = round(now - t, 1) if t > 0 else None
+        return {"book_ages_sec": book_ages, "trade_ages_sec": trade_ages}
 
     def top(self, token_id: str, *, max_age_sec: float = 1.5) -> Optional[TopOfBook]:
         t = self._tops.get(str(token_id))
@@ -173,15 +205,17 @@ class ClobBookFeed:
         if evt_type in {"book", "order_book"}:
             bid_price, bid_size = self._best_level(evt.get("bids"))
             ask_price, ask_size = self._best_level(evt.get("asks"))
+            now_ts = time.time()
             self._tops[token_id] = TopOfBook(
                 token_id=token_id,
                 bid_price=bid_price,
                 bid_size=bid_size,
                 ask_price=ask_price,
                 ask_size=ask_size,
-                last_update=time.time(),
+                last_update=now_ts,
             )
-            self.last_book_update_ts = time.time()
+            self._last_book_update_by_token[token_id] = now_ts
+            self.last_book_update_ts = now_ts
             if self._book_callback is not None:
                 try:
                     self._book_callback(token_id, bid_price, bid_size)
@@ -205,15 +239,17 @@ class ClobBookFeed:
                 new_bid_price, new_bid_size = price, size
             elif side in {"sell", "ask"}:
                 new_ask_price, new_ask_size = price, size
+            now_ts = time.time()
             self._tops[token_id] = TopOfBook(
                 token_id=token_id,
                 bid_price=new_bid_price,
                 bid_size=new_bid_size,
                 ask_price=new_ask_price,
                 ask_size=new_ask_size,
-                last_update=time.time(),
+                last_update=now_ts,
             )
-            self.last_book_update_ts = time.time()
+            self._last_book_update_by_token[token_id] = now_ts
+            self.last_book_update_ts = now_ts
             if self._book_callback is not None:
                 try:
                     self._book_callback(token_id, new_bid_price, new_bid_size)
@@ -239,10 +275,36 @@ class ClobBookFeed:
                     ts = ts / 1000.0
             except (TypeError, ValueError):
                 ts = time.time()
-            self.last_trade_event_ts = time.time()
+            # Fix 2: extract aggressor side. Polymarket WS may publish under
+            # different keys; normalise to BUY/SELL or None when missing.
+            raw_side = (
+                evt.get("side")
+                or evt.get("taker_side")
+                or evt.get("taker_order_side")
+                or evt.get("aggressor_side")
+                or evt.get("maker_side")  # if maker_side present, invert below
+            )
+            aggressor_side: Optional[str] = None
+            if raw_side:
+                s = str(raw_side).upper().strip()
+                if s in {"BUY", "B", "BID"}:
+                    aggressor_side = "BUY"
+                elif s in {"SELL", "S", "ASK"}:
+                    aggressor_side = "SELL"
+                # If event used maker_side semantics, the aggressor is the opposite.
+                if evt.get("maker_side") and not (
+                    evt.get("side") or evt.get("taker_side")
+                    or evt.get("taker_order_side") or evt.get("aggressor_side")
+                ):
+                    aggressor_side = "SELL" if aggressor_side == "BUY" else (
+                        "BUY" if aggressor_side == "SELL" else None
+                    )
+            now_ts = time.time()
+            self._last_trade_event_by_token[token_id] = now_ts
+            self.last_trade_event_ts = now_ts
             if self._trade_callback is not None:
                 try:
-                    self._trade_callback(token_id, price, size, ts)
+                    self._trade_callback(token_id, price, size, ts, aggressor_side)
                 except Exception as exc:
                     print(f"[clob-book] trade_callback error: {exc}", flush=True)
             return
