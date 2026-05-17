@@ -25,6 +25,7 @@ import aiohttp
 
 from . import db
 from . import db_shadow
+from .instrumentation.attribution import attribution  # observability-only; removable
 from .binance_ws import BinancePriceFeed, OrderBookFeed
 from .chainlink import get_btc_price, get_price_at_ts as chainlink_price_at_ts
 from .rtds_ws import PolymarketRtdsPriceFeed
@@ -534,6 +535,8 @@ class PaperBot:
             "queue_ahead_nonzero_count": sim_snap.get("queue_ahead_nonzero_count", 0),
             "direction_rejections_total": sim_snap.get("direction_rejections_total", 0),
             "trades_missing_aggressor_total": sim_snap.get("trades_missing_aggressor_total", 0),
+            # Dispatch attribution (observability-only; removable)
+            "dispatch_attribution": attribution.snapshot(),
         }
 
     def get_recent_trades(self, n: int = 20, mode: str = "paper") -> list:
@@ -906,6 +909,7 @@ class PaperBot:
 
                 if direction is None:
                     print(f"[bot] SKIP: {slug} no clear signal — {signals}", flush=True)
+                    attribution.bump("no_clear_signal", strategy=strategy)
                     continue
 
                 entry_price = _side_price(market, direction)
@@ -2481,11 +2485,13 @@ class PaperBot:
                     )
                     db.log_bot_signal(slug, filter_hit="chop", outcome="skipped",
                                       direction=direction, diff=diff_initial, chop_range=chop_range)
+                    attribution.bump("chop_filter")
                     return None, {"source": "none", "momentum": None}
             else:
                 print(f"[bot] SKIP (chop): {slug} no {chop_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_chop_history", outcome="skipped",
                                   direction=direction, diff=diff_initial)
+                attribution.bump("chop_filter")
                 return None, {"source": "none", "momentum": None}
 
             # Condition b2: momentum filter — configured momentum must agree with direction
@@ -2738,6 +2744,7 @@ class PaperBot:
         if EXEC_MODE == "maker_shadow" and not self._shadow_ready:
             print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
             execution_enabled = False
+            attribution.bump("ws_unhealthy", strategy=strategy)
         # Fix 1: per-token freshness gate. The selfcheck-driven _shadow_ready flag
         # is one-shot; this gate is checked on every dispatch and uses per-token
         # last-update timestamps. First dispatch for a never-seen token is allowed
@@ -2759,6 +2766,7 @@ class PaperBot:
                         flush=True,
                     )
                     execution_enabled = False
+                    attribution.bump("token_stale", strategy=strategy)
         if execution_enabled:
             if seconds_remaining is not None and seconds_remaining < LIVE_MIN_SECONDS_BEFORE_CLOSE:
                 print(
@@ -2778,6 +2786,7 @@ class PaperBot:
                     diff_at_entry=diff_at_entry,
                     price_to_beat=price_to_beat,
                 )
+                attribution.bump("market_closed", strategy=strategy)
             elif not (CROWD_MIN <= entry_price <= CROWD_MAX):
                 reason = (
                     f"entry_price {entry_price:.3f} outside crowd band "
@@ -2789,10 +2798,13 @@ class PaperBot:
                     seconds_remaining=seconds_remaining, strategy=strategy,
                     diff_at_entry=diff_at_entry, price_to_beat=price_to_beat,
                 )
+                attribution.bump("execution_disabled", strategy=strategy)
             elif market is None:
                 print(f"[bot] LIVE: no market dict for {slug} — paper only", flush=True)
+                attribution.bump("no_market", strategy=strategy)
             elif self._exec_router is None:
                 print(f"[bot] LIVE: exec router not initialised — paper only", flush=True)
+                attribution.bump("execution_disabled", strategy=strategy)
             else:
                 try:
                     await self._exec_router.dispatch(
@@ -2809,6 +2821,7 @@ class PaperBot:
                         diff_now_getter=self._current_diff_for_slug,
                     )
                     self._shadow_dispatch_count += 1
+                    attribution.bump("dispatch_called", strategy=strategy)
                 except Exception as exc:
                     print(f"[bot] LIVE: maker dispatch failed for {slug} ({exc}) — paper only", flush=True)
                     self._log_live_attempt_failed(
@@ -2816,11 +2829,14 @@ class PaperBot:
                         seconds_remaining=seconds_remaining, strategy=strategy,
                         diff_at_entry=diff_at_entry, price_to_beat=price_to_beat,
                     )
+                    attribution.bump("execution_disabled", strategy=strategy)
         else:
             if EXEC_MODE == "shadow_only":
+                attribution.bump("execution_disabled", strategy=strategy)
                 pass  # paper/shadow accounting only
             elif not live_enabled:
                 print(f"[bot] LIVE: disabled for {slug} strategy={strategy} — paper/shadow only", flush=True)
+                attribution.bump("execution_disabled", strategy=strategy)
 
         self.balance -= stake
         pos = {
