@@ -223,7 +223,7 @@ MARKET_FAMILIES = [
         "reversal_threshold": 20.0,
         "chop_window": 60,
         "momentum_window": 30,
-        "chop_min_move": 15.0,
+        "chop_min_move": 12.0,
     },
 ]
 
