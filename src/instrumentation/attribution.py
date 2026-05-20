@@ -21,7 +21,14 @@ from typing import Optional
 
 # The exact, fixed set of reasons the operator asked for. Unknown reasons are
 # silently dropped so a typo cannot raise from a hot path.
+#
+# Original gating-chain codes (Option-A era): the outer attribution layer.
+# Inner-signal-veto codes (post-Option-A): refine `no_clear_signal` into the
+# specific sub-reason inside `_evaluate_signals`. Strict superset: existing
+# readers continue to see the original 9 keys; new readers can read the 5
+# additional keys for finer attribution.
 REASONS: tuple = (
+    # Outer chain
     "no_clear_signal",
     "chop_filter",
     "no_market",
@@ -31,6 +38,12 @@ REASONS: tuple = (
     "market_closed",
     "exposure_cap",
     "dispatch_called",
+    # Inner signal vetoes
+    "diff_threshold",
+    "momentum_mismatch",
+    "funding_conflict",
+    "rtds_edge_block",
+    "btc_price_unavailable",
 )
 
 

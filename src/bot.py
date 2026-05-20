@@ -2362,6 +2362,7 @@ class PaperBot:
         chop_window = float(spec.get("chop_window", 10)) if spec else 10.0
         momentum_window = float(spec.get("momentum_window", 5)) if spec else 5.0
         chop_min_move = float(spec.get("chop_min_move", MIN_MOMENTUM_MOVE)) if spec else MIN_MOMENTUM_MOVE
+        _strat_tag = spec.get("strategy") if spec else None  # attribution: per-strategy tag inside _evaluate_signals
         prefix = spec["slug_prefix"] if spec else slug.rsplit("-", 1)[0]
         prev_slug = f"{prefix}-{int(start_ts - interval)}"
         prev_final  = self._final_price_cache.get(prev_slug)
@@ -2419,6 +2420,7 @@ class PaperBot:
             if live_price is None:
                 print(f"[bot] BTC: unavailable for {slug} — skipping, no trade", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_btc_price", outcome="skipped")
+                attribution.bump("btc_price_unavailable", strategy=_strat_tag)
                 return None, {"source": "none", "momentum": None}
 
             # Condition a: strong initial move from reference price
@@ -2436,6 +2438,7 @@ class PaperBot:
                     print(f"[bot] SKIP RTDS LIVE: {slug} {edge_reason}", flush=True)
                     db.log_bot_signal(slug, filter_hit="rtds_live_edge", outcome="skipped",
                                       direction=direction, diff=diff_initial)
+                    attribution.bump("rtds_edge_block", strategy=f"{_strat_tag or '_unspecified_'}:pre-guard")
                     return None, {"source": "none", "momentum": None}
                 print(f"[bot] RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
             elif abs(diff_initial) < diff_threshold:
@@ -2446,6 +2449,7 @@ class PaperBot:
                 )
                 db.log_bot_signal(slug, filter_hit="diff_threshold", outcome="skipped",
                                   direction=direction, diff=diff_initial)
+                attribution.bump("diff_threshold", strategy=_strat_tag)
                 return None, {"source": "none", "momentum": None}
 
             funding_rate = await self._get_btc_funding_rate()
@@ -2470,6 +2474,7 @@ class PaperBot:
                         )
                         db.log_bot_signal(slug, filter_hit="funding_conflict", outcome="skipped",
                                           direction=direction, diff=diff_initial)
+                        attribution.bump("funding_conflict", strategy=_strat_tag)
                         return None, {"source": "none", "momentum": None}
                     print(f"[bot] funding OK: {slug} {funding_rate:+.4f}%  direction={direction}", flush=True)
 
@@ -2507,6 +2512,7 @@ class PaperBot:
                     db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
                                       direction=direction, diff=diff_initial,
                                       momentum=momentum, chop_range=chop_range)
+                    attribution.bump("momentum_mismatch", strategy=f"{_strat_tag or '_unspecified_'}:Up-vs-falling")
                     return None, {"source": "none", "momentum": None}
                 if direction == "Down" and momentum > 0:
                     print(
@@ -2517,12 +2523,14 @@ class PaperBot:
                     db.log_bot_signal(slug, filter_hit="momentum", outcome="skipped",
                                       direction=direction, diff=diff_initial,
                                       momentum=momentum, chop_range=chop_range)
+                    attribution.bump("momentum_mismatch", strategy=f"{_strat_tag or '_unspecified_'}:Down-vs-rising")
                     return None, {"source": "none", "momentum": None}
                 print(f"[bot] momentum OK: {slug} {momentum_window:.0f}s=${momentum:+.2f}  direction={direction}", flush=True)
             else:
                 print(f"[bot] SKIP (momentum): {slug} no {momentum_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_momentum_history", outcome="skipped",
                                   direction=direction, diff=diff_initial, chop_range=chop_range)
+                attribution.bump("momentum_mismatch", strategy=f"{_strat_tag or '_unspecified_'}:no-history")
                 return None, {"source": "none", "momentum": None}
 
             # Condition c: reversal guard — wait 3s, re-fetch, confirm move still holding
@@ -2555,6 +2563,7 @@ class PaperBot:
                     db.log_bot_signal(slug, filter_hit="rtds_live_reversal_edge", outcome="skipped",
                                       direction=direction, diff=diff_initial,
                                       momentum=momentum, chop_range=chop_range)
+                    attribution.bump("rtds_edge_block", strategy=f"{_strat_tag or '_unspecified_'}:post-guard")
                     return None, {"source": "none", "momentum": None}
 
             print(
