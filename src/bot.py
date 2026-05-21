@@ -2490,13 +2490,15 @@ class PaperBot:
                     )
                     db.log_bot_signal(slug, filter_hit="chop", outcome="skipped",
                                       direction=direction, diff=diff_initial, chop_range=chop_range)
-                    attribution.bump("chop_filter")
+                    _chop_ratio = (chop_range / chop_min_move) if chop_min_move else 0.0
+                    _chop_bucket = "near" if _chop_ratio >= 0.75 else ("mid" if _chop_ratio >= 0.5 else "far")
+                    attribution.bump("chop_filter", strategy=f"{_strat_tag or '_unspecified_'}:{_chop_bucket}")
                     return None, {"source": "none", "momentum": None}
             else:
                 print(f"[bot] SKIP (chop): {slug} no {chop_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_chop_history", outcome="skipped",
                                   direction=direction, diff=diff_initial)
-                attribution.bump("chop_filter")
+                attribution.bump("chop_filter", strategy=f"{_strat_tag or '_unspecified_'}:no-history")
                 return None, {"source": "none", "momentum": None}
 
             # Condition b2: momentum filter — configured momentum must agree with direction
