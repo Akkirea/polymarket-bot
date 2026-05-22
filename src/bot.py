@@ -1335,6 +1335,21 @@ class PaperBot:
             return None
         return closest_price
 
+    def _classify_chop_no_history(self, n: float) -> str:
+        # Mutually exclusive: history_empty | buffer_warmup | sparse_gap
+        target = time.time() - n
+        b = self._binance_feed._price_history
+        f = self._btc_price_timestamps
+        if not b and not f:
+            return "history_empty"
+        oldest = None
+        if b:
+            oldest = min(p[0] for p in b)
+        if f:
+            f_old = min(p[0] for p in f)
+            oldest = f_old if oldest is None else min(oldest, f_old)
+        return "buffer_warmup" if oldest is not None and oldest > target else "sparse_gap"
+
     def _record_diff_snapshot(self, slug: str, seconds_remaining: float, diff: float) -> None:
         """Record a (ts, seconds_remaining, diff) snapshot for signal maturity tracking."""
         history = self._market_diff_history.setdefault(slug, [])
@@ -2498,7 +2513,8 @@ class PaperBot:
                 print(f"[bot] SKIP (chop): {slug} no {chop_window:.0f}s reading", flush=True)
                 db.log_bot_signal(slug, filter_hit="no_chop_history", outcome="skipped",
                                   direction=direction, diff=diff_initial)
-                attribution.bump("chop_filter", strategy=f"{_strat_tag or '_unspecified_'}:no-history")
+                _chop_nh_cause = self._classify_chop_no_history(chop_window)
+                attribution.bump("chop_filter", strategy=f"{_strat_tag or '_unspecified_'}:no-history:{_chop_nh_cause}")
                 return None, {"source": "none", "momentum": None}
 
             # Condition b2: momentum filter — configured momentum must agree with direction
