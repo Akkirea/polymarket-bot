@@ -26,6 +26,7 @@ import aiohttp
 from . import db
 from . import db_shadow
 from .instrumentation.attribution import attribution  # observability-only; removable
+from .instrumentation.momentum_shadow import momentum_shadow  # observability-only; removable
 from .binance_ws import BinancePriceFeed, OrderBookFeed
 from .chainlink import get_btc_price, get_price_at_ts as chainlink_price_at_ts
 from .rtds_ws import PolymarketRtdsPriceFeed
@@ -537,6 +538,8 @@ class PaperBot:
             "trades_missing_aggressor_total": sim_snap.get("trades_missing_aggressor_total", 0),
             # Dispatch attribution (observability-only; removable)
             "dispatch_attribution": attribution.snapshot(),
+            # Momentum-gate shadow experiment (observability-only; removable)
+            "momentum_shadow": momentum_shadow.snapshot(),
         }
 
     def get_recent_trades(self, n: int = 20, mode: str = "paper") -> list:
@@ -2520,6 +2523,7 @@ class PaperBot:
             # Condition b2: momentum filter — configured momentum must agree with direction
             price_momentum_window_ago = self._get_price_n_seconds_ago(momentum_window)
             momentum = (live_price - price_momentum_window_ago) if price_momentum_window_ago is not None else None
+            momentum_shadow.record(_strat_tag, direction, momentum)  # observability-only
             if price_momentum_window_ago is not None:
                 if direction == "Up" and momentum < 0:
                     print(
