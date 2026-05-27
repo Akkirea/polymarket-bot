@@ -55,6 +55,19 @@ class ClobBookFeed:
         # Aggregate timestamps retained for status/back-compat; do NOT use for gating.
         self.last_trade_event_ts: float = 0.0
         self.last_book_update_ts: float = 0.0
+        # WS instrumentation (observability-only): distinguishes silent-market vs
+        # heartbeat-only / parse-failure / schema-drift / subscribe-failure modes.
+        self.ws_messages_received_total: int = 0
+        self.ws_text_pong_total: int = 0
+        self.ws_messages_unparseable_total: int = 0
+        self.ws_events_by_type: dict[str, int] = {}
+        self.parsed_book_updates_total: int = 0
+        self.parsed_price_change_total: int = 0
+        self.parsed_trade_total: int = 0
+        self.ws_events_unrouted_total: int = 0
+        self.ws_reconnects_total: int = 0
+        self.last_ws_message_ts: float = 0.0
+        self.last_ws_subscribe_sent_ts: float = 0.0
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -126,6 +139,7 @@ class ClobBookFeed:
     async def connect(self) -> None:
         self._running = True
         fail_streak = 0
+        iteration = 0
         while self._running:
             try:
                 async with websockets.connect(
@@ -136,6 +150,8 @@ class ClobBookFeed:
                     self._ws = ws
                     fail_streak = 0
                     self._connected_evt.set()
+                    if iteration > 0:
+                        self.ws_reconnects_total += 1
                     print(f"[clob-book] connected: {WS_URL}", flush=True)
                     if self._subscriptions:
                         await self._send_subscribe(sorted(self._subscriptions))
@@ -153,6 +169,7 @@ class ClobBookFeed:
             finally:
                 self._ws = None
                 self._connected_evt.clear()
+                iteration += 1
             if self._running:
                 await asyncio.sleep(min(30, 2 + fail_streak * 2))
 
@@ -167,10 +184,13 @@ class ClobBookFeed:
         }
         try:
             await self._ws.send(json.dumps(payload))
+            self.last_ws_subscribe_sent_ts = time.time()
         except Exception as exc:
             print(f"[clob-book] subscribe send failed: {exc}", flush=True)
 
     async def _handle_message(self, raw) -> None:
+        self.ws_messages_received_total += 1
+        self.last_ws_message_ts = time.time()
         if isinstance(raw, bytes):
             try:
                 raw = raw.decode("utf-8")
@@ -179,10 +199,12 @@ class ClobBookFeed:
         if not isinstance(raw, str) or not raw:
             return
         if raw in {"PONG", "pong", "PING", "ping"}:
+            self.ws_text_pong_total += 1
             return
         try:
             data = json.loads(raw)
         except Exception:
+            self.ws_messages_unparseable_total += 1
             return
         events = data if isinstance(data, list) else [data]
         for evt in events:
@@ -191,6 +213,11 @@ class ClobBookFeed:
             self._apply_event(evt)
 
     def _apply_event(self, evt: dict) -> None:
+        evt_type = (evt.get("event_type") or evt.get("type") or "").lower()
+        # by-type telemetry: count every event regardless of token_id presence so we can
+        # detect schema drift (unknown types) and "events arrive but lack token_id" cases.
+        bucket = evt_type if evt_type else "<no_evt_type>"
+        self.ws_events_by_type[bucket] = self.ws_events_by_type.get(bucket, 0) + 1
         token_id = (
             evt.get("asset_id")
             or evt.get("token_id")
@@ -200,7 +227,6 @@ class ClobBookFeed:
         if not token_id:
             return
         token_id = str(token_id)
-        evt_type = (evt.get("event_type") or evt.get("type") or "").lower()
 
         if evt_type in {"book", "order_book"}:
             bid_price, bid_size = self._best_level(evt.get("bids"))
@@ -216,6 +242,7 @@ class ClobBookFeed:
             )
             self._last_book_update_by_token[token_id] = now_ts
             self.last_book_update_ts = now_ts
+            self.parsed_book_updates_total += 1
             if self._book_callback is not None:
                 try:
                     self._book_callback(token_id, bid_price, bid_size)
@@ -250,6 +277,7 @@ class ClobBookFeed:
             )
             self._last_book_update_by_token[token_id] = now_ts
             self.last_book_update_ts = now_ts
+            self.parsed_price_change_total += 1
             if self._book_callback is not None:
                 try:
                     self._book_callback(token_id, new_bid_price, new_bid_size)
@@ -302,6 +330,7 @@ class ClobBookFeed:
             now_ts = time.time()
             self._last_trade_event_by_token[token_id] = now_ts
             self.last_trade_event_ts = now_ts
+            self.parsed_trade_total += 1
             if self._trade_callback is not None:
                 try:
                     self._trade_callback(token_id, price, size, ts, aggressor_side)
@@ -309,6 +338,7 @@ class ClobBookFeed:
                     print(f"[clob-book] trade_callback error: {exc}", flush=True)
             return
         else:
+            self.ws_events_unrouted_total += 1
             return
 
         evt_obj = self._update_events.get(token_id)

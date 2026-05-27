@@ -528,6 +528,19 @@ class PaperBot:
             "last_trade_event_ts": getattr(self._clob_book_feed, "last_trade_event_ts", 0.0),
             "ws_book_connected": getattr(self._clob_book_feed, "connected", False),
             "book_subscriptions": len(getattr(self._clob_book_feed, "_subscriptions", set()) or set()),
+            # WS instrumentation (observability-only; removable). Distinguishes
+            # silent-market vs heartbeat-only vs parser-drop vs subscribe-failure.
+            "ws_messages_received_total": getattr(self._clob_book_feed, "ws_messages_received_total", 0),
+            "ws_text_pong_total": getattr(self._clob_book_feed, "ws_text_pong_total", 0),
+            "ws_messages_unparseable_total": getattr(self._clob_book_feed, "ws_messages_unparseable_total", 0),
+            "ws_events_unrouted_total": getattr(self._clob_book_feed, "ws_events_unrouted_total", 0),
+            "parsed_book_updates_total": getattr(self._clob_book_feed, "parsed_book_updates_total", 0),
+            "parsed_price_change_total": getattr(self._clob_book_feed, "parsed_price_change_total", 0),
+            "parsed_trade_total": getattr(self._clob_book_feed, "parsed_trade_total", 0),
+            "ws_reconnects_total": getattr(self._clob_book_feed, "ws_reconnects_total", 0),
+            "last_ws_message_ts": getattr(self._clob_book_feed, "last_ws_message_ts", 0.0),
+            "last_ws_subscribe_sent_ts": getattr(self._clob_book_feed, "last_ws_subscribe_sent_ts", 0.0),
+            "ws_events_by_type": dict(getattr(self._clob_book_feed, "ws_events_by_type", {})),
             # Fix 1 telemetry
             "last_book_update_by_token": freshness.get("book_ages_sec", {}),
             "last_trade_event_by_token": freshness.get("trade_ages_sec", {}),
