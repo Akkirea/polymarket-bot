@@ -258,17 +258,22 @@ class ClobBookFeed:
                 samples.append({"ts": time.time(), "evt": preview})
         except Exception:
             pass
-        token_id = (
-            evt.get("asset_id")
-            or evt.get("token_id")
-            or evt.get("market")
-            or evt.get("assetId")
-        )
-        if not token_id:
-            return
-        token_id = str(token_id)
-
+        # Route by evt_type FIRST. Identifier extraction differs between event
+        # types: book / last_trade_price carry the per-token id at top level as
+        # `asset_id`, while price_change nests one record per affected asset
+        # inside `price_changes[].asset_id` (the top-level `market` field is the
+        # condition_id and is NOT a valid `_tops` key). Routing first avoids the
+        # condition_id-vs-asset_id mismatch that previously dropped every
+        # price_change event silently.
         if evt_type in {"book", "order_book"}:
+            token_id = (
+                evt.get("asset_id")
+                or evt.get("token_id")
+                or evt.get("assetId")
+            )
+            if not token_id:
+                return
+            token_id = str(token_id)
             bid_price, bid_size = self._best_level(evt.get("bids"))
             ask_price, ask_size = self._best_level(evt.get("asks"))
             now_ts = time.time()
@@ -288,7 +293,80 @@ class ClobBookFeed:
                     self._book_callback(token_id, bid_price, bid_size)
                 except Exception as exc:
                     print(f"[clob-book] book_callback error: {exc}", flush=True)
-        elif evt_type in {"price_change", "tick_size_change", "level_update"}:
+            evt_obj = self._update_events.get(token_id)
+            if evt_obj is not None:
+                evt_obj.set()
+            return
+
+        if evt_type == "price_change":
+            changes = evt.get("price_changes") or evt.get("changes") or []
+            if not isinstance(changes, list):
+                return
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                inner_id = (
+                    change.get("asset_id")
+                    or change.get("token_id")
+                    or change.get("assetId")
+                )
+                if not inner_id:
+                    continue
+                inner_id = str(inner_id)
+                current = self._tops.get(inner_id)
+                if current is None:
+                    # Wait for a `book` snapshot for this asset before applying
+                    # incremental level updates; partial state would otherwise
+                    # mis-represent the opposite side.
+                    continue
+                side = (change.get("side") or "").lower()
+                try:
+                    price = float(change.get("price")) if change.get("price") is not None else None
+                    size = float(change.get("size")) if change.get("size") is not None else None
+                except (TypeError, ValueError):
+                    continue
+                new_bid_price = current.bid_price
+                new_bid_size = current.bid_size
+                new_ask_price = current.ask_price
+                new_ask_size = current.ask_size
+                if side in {"buy", "bid"}:
+                    new_bid_price, new_bid_size = price, size
+                elif side in {"sell", "ask"}:
+                    new_ask_price, new_ask_size = price, size
+                now_ts = time.time()
+                self._tops[inner_id] = TopOfBook(
+                    token_id=inner_id,
+                    bid_price=new_bid_price,
+                    bid_size=new_bid_size,
+                    ask_price=new_ask_price,
+                    ask_size=new_ask_size,
+                    last_update=now_ts,
+                )
+                self._last_book_update_by_token[inner_id] = now_ts
+                self.last_book_update_ts = now_ts
+                if self._book_callback is not None:
+                    try:
+                        self._book_callback(inner_id, new_bid_price, new_bid_size)
+                    except Exception as exc:
+                        print(f"[clob-book] book_callback error: {exc}", flush=True)
+                inner_evt = self._update_events.get(inner_id)
+                if inner_evt is not None:
+                    inner_evt.set()
+            self.parsed_price_change_total += 1
+            return
+
+        if evt_type in {"tick_size_change", "level_update"}:
+            # Preserve prior flat-shape handling for event types not observed in
+            # the validation window. If the server starts emitting these, they
+            # will appear via ws_events_by_type for follow-up classification.
+            token_id = (
+                evt.get("asset_id")
+                or evt.get("token_id")
+                or evt.get("assetId")
+            )
+            if not token_id:
+                return
+            token_id = str(token_id)
             current = self._tops.get(token_id)
             if current is None:
                 return
@@ -317,13 +395,25 @@ class ClobBookFeed:
             )
             self._last_book_update_by_token[token_id] = now_ts
             self.last_book_update_ts = now_ts
-            self.parsed_price_change_total += 1
             if self._book_callback is not None:
                 try:
                     self._book_callback(token_id, new_bid_price, new_bid_size)
                 except Exception as exc:
                     print(f"[clob-book] book_callback error: {exc}", flush=True)
-        elif evt_type in {"trade", "last_trade_price", "matched", "trades"}:
+            evt_obj = self._update_events.get(token_id)
+            if evt_obj is not None:
+                evt_obj.set()
+            return
+
+        if evt_type in {"trade", "last_trade_price", "matched", "trades"}:
+            token_id = (
+                evt.get("asset_id")
+                or evt.get("token_id")
+                or evt.get("assetId")
+            )
+            if not token_id:
+                return
+            token_id = str(token_id)
             try:
                 price = float(evt.get("price") or evt.get("matched_price") or 0)
                 size = float(
@@ -377,13 +467,9 @@ class ClobBookFeed:
                 except Exception as exc:
                     print(f"[clob-book] trade_callback error: {exc}", flush=True)
             return
-        else:
-            self.ws_events_unrouted_total += 1
-            return
 
-        evt_obj = self._update_events.get(token_id)
-        if evt_obj is not None:
-            evt_obj.set()
+        self.ws_events_unrouted_total += 1
+        return
 
     @staticmethod
     def _best_level(levels):
