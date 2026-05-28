@@ -68,6 +68,13 @@ class ClobBookFeed:
         self.ws_reconnects_total: int = 0
         self.last_ws_message_ts: float = 0.0
         self.last_ws_subscribe_sent_ts: float = 0.0
+        # Debug capture (time-limited): first N raw event samples per evt_type and
+        # ring buffer of reconnect markers with book-counter snapshots. Used to
+        # disambiguate ID mismatch / nested-changes / unknown failure modes.
+        self._raw_sample_limit: int = 5
+        self._raw_samples: dict[str, list] = {}
+        self._reconnect_log_limit: int = 16
+        self._reconnect_log: list = []
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -152,6 +159,18 @@ class ClobBookFeed:
                     self._connected_evt.set()
                     if iteration > 0:
                         self.ws_reconnects_total += 1
+                        try:
+                            self._reconnect_log.append({
+                                "ts": time.time(),
+                                "reconnect_n": self.ws_reconnects_total,
+                                "book_total_at_reconnect": self.parsed_book_updates_total,
+                                "ws_msgs_at_reconnect": self.ws_messages_received_total,
+                                "by_type_snapshot": dict(self.ws_events_by_type),
+                            })
+                            if len(self._reconnect_log) > self._reconnect_log_limit:
+                                self._reconnect_log.pop(0)
+                        except Exception:
+                            pass
                     print(f"[clob-book] connected: {WS_URL}", flush=True)
                     if self._subscriptions:
                         await self._send_subscribe(sorted(self._subscriptions))
@@ -218,6 +237,27 @@ class ClobBookFeed:
         # detect schema drift (unknown types) and "events arrive but lack token_id" cases.
         bucket = evt_type if evt_type else "<no_evt_type>"
         self.ws_events_by_type[bucket] = self.ws_events_by_type.get(bucket, 0) + 1
+        # Debug capture: first N samples per evt_type, key-and-shape preview only.
+        try:
+            samples = self._raw_samples.setdefault(bucket, [])
+            if len(samples) < self._raw_sample_limit:
+                preview: dict = {}
+                for k, v in evt.items():
+                    if isinstance(v, list):
+                        first = v[0] if v else None
+                        if isinstance(first, dict):
+                            first_repr = {"_keys": sorted(first.keys()), "_first": {kk: str(vv)[:60] for kk, vv in list(first.items())[:6]}}
+                        else:
+                            first_repr = str(first)[:120] if first is not None else None
+                        preview[k] = {"_type": "list", "len": len(v), "first": first_repr}
+                    elif isinstance(v, dict):
+                        preview[k] = {"_type": "dict", "keys": sorted(v.keys())[:12]}
+                    else:
+                        s = str(v)
+                        preview[k] = s[:200] if len(s) > 200 else v
+                samples.append({"ts": time.time(), "evt": preview})
+        except Exception:
+            pass
         token_id = (
             evt.get("asset_id")
             or evt.get("token_id")

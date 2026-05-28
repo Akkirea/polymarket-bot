@@ -541,6 +541,9 @@ class PaperBot:
             "last_ws_message_ts": getattr(self._clob_book_feed, "last_ws_message_ts", 0.0),
             "last_ws_subscribe_sent_ts": getattr(self._clob_book_feed, "last_ws_subscribe_sent_ts", 0.0),
             "ws_events_by_type": dict(getattr(self._clob_book_feed, "ws_events_by_type", {})),
+            # Debug capture (time-limited; removable): raw event-key previews + reconnect log
+            "ws_raw_samples": {k: list(v) for k, v in getattr(self._clob_book_feed, "_raw_samples", {}).items()},
+            "ws_reconnect_log": list(getattr(self._clob_book_feed, "_reconnect_log", [])),
             # Fix 1 telemetry
             "last_book_update_by_token": freshness.get("book_ages_sec", {}),
             "last_trade_event_by_token": freshness.get("trade_ages_sec", {}),
