@@ -550,6 +550,11 @@ class PaperBot:
             "last_close_exc_type": getattr(self._clob_book_feed, "last_close_exc_type", None),
             "last_close_exc_msg": getattr(self._clob_book_feed, "last_close_exc_msg", None),
             "last_close_ts": getattr(self._clob_book_feed, "last_close_ts", 0.0),
+            # Text-PING keepalive experiment (observability for the heartbeat path).
+            "text_pings_sent_total": getattr(self._clob_book_feed, "text_pings_sent_total", 0),
+            "text_pings_send_errors_total": getattr(self._clob_book_feed, "text_pings_send_errors_total", 0),
+            "last_text_ping_ts": getattr(self._clob_book_feed, "last_text_ping_ts", 0.0),
+            "text_pong_received_total": getattr(self._clob_book_feed, "text_pong_received_total", 0),
             # Debug capture (time-limited; removable): raw event-key previews + reconnect log
             "ws_raw_samples": {k: list(v) for k, v in getattr(self._clob_book_feed, "_raw_samples", {}).items()},
             "ws_reconnect_log": list(getattr(self._clob_book_feed, "_reconnect_log", [])),
