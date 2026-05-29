@@ -85,6 +85,22 @@ class ClobBookFeed:
         self.last_close_exc_type: Optional[str] = None
         self.last_close_exc_msg: Optional[str] = None
         self.last_close_ts: float = 0.0
+        # Text-PING keepalive experiment. Polymarket CLOB docs require the
+        # client to send text "PING" every 10s on the market channel; their
+        # official real-time-data-client (src/client.ts) sends text "ping"
+        # every 5s. Our implementation previously relied solely on the
+        # websockets-library protocol-level pings (ping_interval=20,
+        # ping_timeout=10, unchanged here). This branch adds a parallel
+        # application-level text-ping task to test whether the post-burst
+        # silence / 30s recv-timeout reconnect spiral is caused by the
+        # missing client-initiated heartbeat. Pure addition; no other
+        # connect / recv-timeout / reconnect-policy changes.
+        self._text_ping_interval_sec: float = 5.0
+        self._text_ping_payload: str = "ping"
+        self.text_pings_sent_total: int = 0
+        self.text_pings_send_errors_total: int = 0
+        self.last_text_ping_ts: float = 0.0
+        self.text_pong_received_total: int = 0
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -159,6 +175,7 @@ class ClobBookFeed:
         iteration = 0
         last_exc_type: Optional[str] = None
         while self._running:
+            ping_task: Optional[asyncio.Task] = None
             try:
                 async with websockets.connect(
                     WS_URL,
@@ -189,6 +206,9 @@ class ClobBookFeed:
                     print(f"[clob-book] connected: {WS_URL}", flush=True)
                     if self._subscriptions:
                         await self._send_subscribe(sorted(self._subscriptions))
+                    # Spawn the text-PING keepalive task scoped to this connection.
+                    # Cancelled in finally; lifetime bounded by this `async with`.
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
                     while self._running:
                         msg = await asyncio.wait_for(ws.recv(), timeout=30)
                         await self._handle_message(msg)
@@ -212,6 +232,12 @@ class ClobBookFeed:
                     flush=True,
                 )
             finally:
+                if ping_task is not None and not ping_task.done():
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 self._ws = None
                 self._connected_evt.clear()
                 iteration += 1
@@ -219,6 +245,38 @@ class ClobBookFeed:
                 await asyncio.sleep(min(30, 2 + fail_streak * 2))
 
     # ── Internals ────────────────────────────────────────────────────────────
+
+    async def _ping_loop(self, ws) -> None:
+        """Send an application-level text "ping" every ``_text_ping_interval_sec``
+        for the lifetime of the supplied connection.
+
+        Lifetime is bounded by the connection: the task is spawned inside the
+        ``async with websockets.connect(...)`` block in ``connect`` and is
+        cancelled in the ``finally``. The captured ``ws`` reference ensures we
+        never send on a successor connection.
+
+        Errors from ``ws.send`` are counted but do NOT raise — recv-timeout /
+        the existing reconnect loop handles connection death. Cancellation is
+        the normal exit path on reconnect.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._text_ping_interval_sec)
+                try:
+                    await ws.send(self._text_ping_payload)
+                    self.text_pings_sent_total += 1
+                    self.last_text_ping_ts = time.time()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.text_pings_send_errors_total += 1
+                    print(
+                        f"[clob-book] text-ping send failed: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    return
+        except asyncio.CancelledError:
+            return
 
     async def _send_subscribe(self, token_ids) -> None:
         if self._ws is None:
@@ -245,6 +303,12 @@ class ClobBookFeed:
             return
         if raw in {"PONG", "pong", "PING", "ping"}:
             self.ws_text_pong_total += 1
+            if raw in {"PONG", "pong"}:
+                # Specific counter for incoming PONG (server's response to our
+                # text PING) so we can distinguish it from any unsolicited PING
+                # the server might initiate. ws_text_pong_total is preserved
+                # unchanged for back-compat.
+                self.text_pong_received_total += 1
             return
         try:
             data = json.loads(raw)
