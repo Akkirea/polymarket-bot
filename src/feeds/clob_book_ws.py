@@ -75,6 +75,16 @@ class ClobBookFeed:
         self._raw_samples: dict[str, list] = {}
         self._reconnect_log_limit: int = 16
         self._reconnect_log: list = []
+        # Reconnect-cause classifier. Distinguishes TimeoutError (our 30s recv
+        # timeout) from ConnectionClosedError (the websockets-lib protocol-pong
+        # timeout / server-initiated close) from other failure modes. Lets us
+        # verify whether the existing protocol-level ping_interval=20 +
+        # ping_timeout=10 keepalive is actually getting Pong responses before
+        # adding a parallel application-level text-PING heartbeat.
+        self.ws_reconnect_causes: dict[str, int] = {}
+        self.last_close_exc_type: Optional[str] = None
+        self.last_close_exc_msg: Optional[str] = None
+        self.last_close_ts: float = 0.0
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -147,6 +157,7 @@ class ClobBookFeed:
         self._running = True
         fail_streak = 0
         iteration = 0
+        last_exc_type: Optional[str] = None
         while self._running:
             try:
                 async with websockets.connect(
@@ -166,6 +177,10 @@ class ClobBookFeed:
                                 "book_total_at_reconnect": self.parsed_book_updates_total,
                                 "ws_msgs_at_reconnect": self.ws_messages_received_total,
                                 "by_type_snapshot": dict(self.ws_events_by_type),
+                                # Attribution: which exception ended the
+                                # previous connection. None on the very first
+                                # connect; populated thereafter.
+                                "prev_close_cause": last_exc_type,
                             })
                             if len(self._reconnect_log) > self._reconnect_log_limit:
                                 self._reconnect_log.pop(0)
@@ -180,9 +195,20 @@ class ClobBookFeed:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                exc_type = type(exc).__name__
+                last_exc_type = exc_type
+                self.ws_reconnect_causes[exc_type] = (
+                    self.ws_reconnect_causes.get(exc_type, 0) + 1
+                )
+                self.last_close_exc_type = exc_type
+                try:
+                    self.last_close_exc_msg = str(exc)[:200]
+                except Exception:
+                    self.last_close_exc_msg = None
+                self.last_close_ts = time.time()
                 fail_streak += 1
                 print(
-                    f"[clob-book] WS error ({type(exc).__name__}: {exc}), streak={fail_streak}",
+                    f"[clob-book] WS error ({exc_type}: {exc}), streak={fail_streak}",
                     flush=True,
                 )
             finally:
