@@ -75,6 +75,23 @@ class ClobBookFeed:
         self._raw_samples: dict[str, list] = {}
         self._reconnect_log_limit: int = 16
         self._reconnect_log: list = []
+        # H4 investigation (observation-only): characterize what the server
+        # sends across the connect → burst → silence → recv-timeout → reconnect
+        # cycle. Polymarket CLOB docs say the market channel expects the CLIENT
+        # to send text "PING" every 10s and the server responds with text
+        # "PONG"; our code never sends a PING (line ~197 only consumes
+        # incoming PING/PONG silently). Hypothesis: server silences the data
+        # stream on non-pinging clients after the initial subscribe burst.
+        # Instrumentation below lets us empirically confirm/refute it without
+        # changing reconnect or timeout behaviour.
+        self.ws_messages_empty_total: int = 0
+        self.ws_messages_non_string_total: int = 0
+        self.ws_messages_non_dict_event_total: int = 0
+        self.ws_messages_empty_dict_total: int = 0
+        self.last_event_ts_by_type: dict[str, float] = {}
+        self._recent_frames_limit: int = 40
+        self._recent_frame_max_chars: int = 400
+        self._recent_frames: list = []
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -208,14 +225,42 @@ class ClobBookFeed:
             print(f"[clob-book] subscribe send failed: {exc}", flush=True)
 
     async def _handle_message(self, raw) -> None:
+        now_recv = time.time()
         self.ws_messages_received_total += 1
-        self.last_ws_message_ts = time.time()
+        self.last_ws_message_ts = now_recv
+        # H4: ring-buffer last N raw frames (truncated) so we can see exactly
+        # what arrives at every recv (subscribe acks, idle frames, the
+        # mystery +1-frame-per-reconnect, anything we silently swallow today).
+        try:
+            preview_body = raw
+            if isinstance(preview_body, bytes):
+                try:
+                    preview_body = preview_body.decode("utf-8", errors="replace")
+                except Exception:
+                    preview_body = repr(preview_body)
+            elif not isinstance(preview_body, str):
+                preview_body = repr(preview_body)
+            self._recent_frames.append({
+                "ts": now_recv,
+                "len": len(preview_body) if isinstance(preview_body, (str, bytes)) else 0,
+                "body": preview_body[: self._recent_frame_max_chars]
+                    if isinstance(preview_body, str) else "",
+            })
+            if len(self._recent_frames) > self._recent_frames_limit:
+                self._recent_frames.pop(0)
+        except Exception:
+            pass
         if isinstance(raw, bytes):
             try:
                 raw = raw.decode("utf-8")
             except Exception:
+                self.ws_messages_non_string_total += 1
                 return
-        if not isinstance(raw, str) or not raw:
+        if not isinstance(raw, str):
+            self.ws_messages_non_string_total += 1
+            return
+        if not raw:
+            self.ws_messages_empty_total += 1
             return
         if raw in {"PONG", "pong", "PING", "ping"}:
             self.ws_text_pong_total += 1
@@ -228,6 +273,10 @@ class ClobBookFeed:
         events = data if isinstance(data, list) else [data]
         for evt in events:
             if not isinstance(evt, dict):
+                self.ws_messages_non_dict_event_total += 1
+                continue
+            if not evt:
+                self.ws_messages_empty_dict_total += 1
                 continue
             self._apply_event(evt)
 
@@ -237,6 +286,10 @@ class ClobBookFeed:
         # detect schema drift (unknown types) and "events arrive but lack token_id" cases.
         bucket = evt_type if evt_type else "<no_evt_type>"
         self.ws_events_by_type[bucket] = self.ws_events_by_type.get(bucket, 0) + 1
+        # H4: per-type last-seen timestamp so we can measure idle time per
+        # event class (last book vs last price_change vs last trade) without
+        # losing it to the global last_book_update_ts.
+        self.last_event_ts_by_type[bucket] = time.time()
         # Debug capture: first N samples per evt_type, key-and-shape preview only.
         try:
             samples = self._raw_samples.setdefault(bucket, [])

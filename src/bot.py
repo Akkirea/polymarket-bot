@@ -544,6 +544,14 @@ class PaperBot:
             # Debug capture (time-limited; removable): raw event-key previews + reconnect log
             "ws_raw_samples": {k: list(v) for k, v in getattr(self._clob_book_feed, "_raw_samples", {}).items()},
             "ws_reconnect_log": list(getattr(self._clob_book_feed, "_reconnect_log", [])),
+            # H4 investigation (observation-only; removable). Silent-path
+            # counters + per-type last-seen + raw-frame ring buffer.
+            "ws_messages_empty_total": getattr(self._clob_book_feed, "ws_messages_empty_total", 0),
+            "ws_messages_non_string_total": getattr(self._clob_book_feed, "ws_messages_non_string_total", 0),
+            "ws_messages_non_dict_event_total": getattr(self._clob_book_feed, "ws_messages_non_dict_event_total", 0),
+            "ws_messages_empty_dict_total": getattr(self._clob_book_feed, "ws_messages_empty_dict_total", 0),
+            "last_event_ts_by_type": dict(getattr(self._clob_book_feed, "last_event_ts_by_type", {})),
+            "ws_recent_frames": list(getattr(self._clob_book_feed, "_recent_frames", [])),
             # Fix 1 telemetry
             "last_book_update_by_token": freshness.get("book_ages_sec", {}),
             "last_trade_event_by_token": freshness.get("trade_ages_sec", {}),
