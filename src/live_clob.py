@@ -124,6 +124,81 @@ def _client(sdk: dict):
 CODE_VERSION = "v2-poly1271"
 
 
+# ── Funder gas pre-flight ────────────────────────────────────────────────────
+# Module-level cache keyed by funder address: {addr: (checked_at, balance_matic,
+# ok, error_msg)}. Refreshed at most once per cache_ttl_sec; conservative on
+# RPC failure (ok=False so dispatch is blocked rather than silently proceeded).
+_FUNDER_GAS_CACHE: dict = {}
+
+
+async def check_funder_gas(
+    min_matic: float = 0.0,
+    cache_ttl_sec: float = 60.0,
+    rpc_url: Optional[str] = None,
+    funder_address: Optional[str] = None,
+) -> dict:
+    """Return the FUNDER's MATIC balance via Polygon JSON-RPC eth_getBalance.
+
+    Cached for cache_ttl_sec to avoid hammering the RPC under a tight signal
+    loop. On RPC failure returns ok=False with an error string so the caller
+    (a gate) can fail-closed (conservative) rather than fail-open.
+
+    Result shape:
+        {
+            "funder": "<addr or empty>",
+            "balance_matic": float,        # 0.0 on failure
+            "ok": bool,                    # balance >= min_matic AND no rpc error
+            "checked_at": float,           # epoch sec of the underlying RPC call
+            "stale_sec": float,            # age of the returned value
+            "error": str | None,
+            "min_matic": float,
+        }
+    """
+    addr = funder_address or _env("FUNDER_ADDRESS") or ""
+    if not addr:
+        return {
+            "funder": "", "balance_matic": 0.0, "ok": False,
+            "checked_at": 0.0, "stale_sec": 0.0,
+            "error": "no_funder_address", "min_matic": min_matic,
+        }
+    rpc = rpc_url or os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    now = time.time()
+    cached = _FUNDER_GAS_CACHE.get(addr)
+    if cached is not None and (now - cached[0]) < cache_ttl_sec:
+        checked_at, bal, _ok_unused, err = cached
+        ok = (err is None) and (bal >= min_matic)
+        return {
+            "funder": addr, "balance_matic": bal, "ok": ok,
+            "checked_at": checked_at, "stale_sec": now - checked_at,
+            "error": err, "min_matic": min_matic,
+        }
+    # Fresh fetch.
+    payload = {
+        "jsonrpc": "2.0", "method": "eth_getBalance",
+        "params": [addr, "latest"], "id": 1,
+    }
+    bal_matic = 0.0
+    err: Optional[str] = None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.post(rpc, json=payload) as resp:
+                body = await resp.json()
+                hex_bal = body.get("result")
+                if not isinstance(hex_bal, str) or not hex_bal.startswith("0x"):
+                    err = f"unexpected_rpc_response: {body!r}"[:200]
+                else:
+                    bal_matic = int(hex_bal, 16) / 1e18
+    except Exception as exc:
+        err = f"rpc_error: {type(exc).__name__}: {exc}"[:200]
+    _FUNDER_GAS_CACHE[addr] = (now, bal_matic, err is None and bal_matic >= min_matic, err)
+    return {
+        "funder": addr, "balance_matic": bal_matic,
+        "ok": err is None and bal_matic >= min_matic,
+        "checked_at": now, "stale_sec": 0.0,
+        "error": err, "min_matic": min_matic,
+    }
+
+
 def env_summary() -> dict:
     """Return non-secret live config status for diagnostics."""
     private_key = _env("PRIVATE_KEY", "PK")

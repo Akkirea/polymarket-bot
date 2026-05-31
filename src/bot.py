@@ -112,6 +112,13 @@ OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.5"))
 OB_SUSTAINED_SECONDS   = float(os.getenv("OB_SUSTAINED_SECONDS",   "5.0"))
 OB_SHADOW_WINDOW       = (60, 210)  # wider than lag-follow; leading signal fires early
 
+# ── Risk controls (aggregate) ────────────────────────────────────────────────
+# Funder gas pre-flight: refuse live dispatch when on-chain MATIC balance of
+# FUNDER_ADDRESS is below this threshold. 0.0 disables the gate (default).
+# Polled via Polygon JSON-RPC with a 60s cache; conservative on RPC failure
+# (treats RPC error as "below threshold" → blocks dispatch).
+LIVE_MIN_FUNDER_MATIC = float(os.getenv("LIVE_MIN_FUNDER_MATIC", "0.0"))
+
 # ── Execution mode ────────────────────────────────────────────────────────────
 # Values: shadow_only | maker_shadow | maker_live
 EXEC_MODE = os.getenv("EXEC_MODE", "shadow_only").lower()
@@ -2806,6 +2813,25 @@ class PaperBot:
             print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
             execution_enabled = False
             attribution.bump("ws_unhealthy", strategy=strategy)
+        # Funder gas pre-flight. Refuses live dispatch when FUNDER_ADDRESS MATIC
+        # balance is below threshold OR Polygon RPC is unreachable (fail-closed
+        # by design). Disabled when LIVE_MIN_FUNDER_MATIC == 0.0. Cached for
+        # 60s inside live_clob.check_funder_gas to avoid RPC hammering.
+        if execution_enabled and LIVE_MIN_FUNDER_MATIC > 0.0:
+            try:
+                from . import live_clob as _lc
+                _gas = await _lc.check_funder_gas(min_matic=LIVE_MIN_FUNDER_MATIC)
+            except Exception as _exc:
+                _gas = {"ok": False, "balance_matic": 0.0, "error": f"check_failed: {_exc}"}
+            if not _gas.get("ok"):
+                print(
+                    f"[bot] FUNDER GAS LOW: balance={_gas.get('balance_matic'):.6f} MATIC "
+                    f"min={LIVE_MIN_FUNDER_MATIC} err={_gas.get('error')} — "
+                    f"live dispatch blocked for {slug}",
+                    flush=True,
+                )
+                execution_enabled = False
+                attribution.bump("funder_gas_low", strategy=strategy)
         # Fix 1: per-token freshness gate. The selfcheck-driven _shadow_ready flag
         # is one-shot; this gate is checked on every dispatch and uses per-token
         # last-update timestamps. First dispatch for a never-seen token is allowed
