@@ -112,6 +112,14 @@ OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.5"))
 OB_SUSTAINED_SECONDS   = float(os.getenv("OB_SUSTAINED_SECONDS",   "5.0"))
 OB_SHADOW_WINDOW       = (60, 210)  # wider than lag-follow; leading signal fires early
 
+# ── Risk controls (aggregate) ────────────────────────────────────────────────
+# Daily-loss circuit breaker: halt live dispatch once today's realized LIVE PnL
+# (sum across all live-mode bot_trades closed since UTC midnight) is at or below
+# the negative threshold. 0.0 disables the gate (default). The check is cheap
+# (single DB query per dispatch attempt) and persistence is implicit since the
+# source of truth is the trade ledger itself.
+LIVE_DAILY_LOSS_HALT = float(os.getenv("LIVE_DAILY_LOSS_HALT", "0.0"))
+
 # ── Execution mode ────────────────────────────────────────────────────────────
 # Values: shadow_only | maker_shadow | maker_live
 EXEC_MODE = os.getenv("EXEC_MODE", "shadow_only").lower()
@@ -2806,6 +2814,23 @@ class PaperBot:
             print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
             execution_enabled = False
             attribution.bump("ws_unhealthy", strategy=strategy)
+        # Daily-loss circuit breaker. Halts LIVE dispatch when today's realized
+        # live PnL is at or below -LIVE_DAILY_LOSS_HALT. Disabled when set to 0.
+        # Paper/shadow data collection continues; only execution_enabled is gated.
+        if execution_enabled and LIVE_DAILY_LOSS_HALT > 0.0:
+            try:
+                _today_pnl = db.today_live_pnl()
+            except Exception as _exc:
+                _today_pnl = 0.0
+                print(f"[bot] daily-loss check failed (treating as 0): {_exc}", flush=True)
+            if _today_pnl <= -LIVE_DAILY_LOSS_HALT:
+                print(
+                    f"[bot] DAILY-LOSS HALT: today_live_pnl=${_today_pnl:+.4f} "
+                    f"<= -${LIVE_DAILY_LOSS_HALT:.4f} — live dispatch blocked for {slug}",
+                    flush=True,
+                )
+                execution_enabled = False
+                attribution.bump("daily_loss_halt", strategy=strategy)
         # Fix 1: per-token freshness gate. The selfcheck-driven _shadow_ready flag
         # is one-shot; this gate is checked on every dispatch and uses per-token
         # last-update timestamps. First dispatch for a never-seen token is allowed

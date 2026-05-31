@@ -863,6 +863,32 @@ def load_live_state(initial_balance: float) -> dict:
     return {"balance": balance}
 
 
+def today_live_pnl(now=None) -> float:
+    """Sum of realized LIVE-mode PnL for trades closed since UTC midnight today.
+
+    Used by the daily-loss circuit breaker. Closed_at values are ISO-8601 UTC
+    strings; string `>=` comparison against a midnight-prefix is sufficient as
+    long as the format is stable, which load_live_state / save_open_position
+    paths guarantee (datetime.now(timezone.utc).isoformat()).
+    """
+    from datetime import datetime, timezone
+    if now is None:
+        now = datetime.now(timezone.utc)
+    midnight_iso = now.strftime("%Y-%m-%dT00:00:00")
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT COALESCE(SUM(pnl), 0) AS total
+             FROM bot_trades
+            WHERE pnl IS NOT NULL
+              AND mode = 'live'
+              AND COALESCE(outcome, '') != 'unresolved'
+              AND closed_at >= %s""",
+        (midnight_iso,),
+    ).fetchone()
+    conn.close()
+    return float(row["total"] or 0.0)
+
+
 def load_live_performance() -> dict:
     """Return aggregate win/loss/P&L from resolved live trades."""
     conn = get_connection()
