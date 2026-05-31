@@ -126,6 +126,11 @@ LIVE_DAILY_LOSS_HALT = float(os.getenv("LIVE_DAILY_LOSS_HALT", "0.0"))
 # where 3 simultaneous positions could otherwise consume 12% of wallet without
 # an aggregate ceiling.
 LIVE_MAX_AGGREGATE_EXPOSURE_PCT = float(os.getenv("LIVE_MAX_AGGREGATE_EXPOSURE_PCT", "0.0"))
+# Funder gas pre-flight: refuse live dispatch when on-chain MATIC balance of
+# FUNDER_ADDRESS is below this threshold. 0.0 disables the gate (default).
+# Polled via Polygon JSON-RPC with a 60s cache; conservative on RPC failure
+# (treats RPC error as "below threshold" → blocks dispatch).
+LIVE_MIN_FUNDER_MATIC = float(os.getenv("LIVE_MIN_FUNDER_MATIC", "0.0"))
 
 # ── Execution mode ────────────────────────────────────────────────────────────
 # Values: shadow_only | maker_shadow | maker_live
@@ -2859,6 +2864,25 @@ class PaperBot:
                 )
                 execution_enabled = False
                 attribution.bump("exposure_cap", strategy=strategy)
+        # Funder gas pre-flight. Refuses live dispatch when FUNDER_ADDRESS MATIC
+        # balance is below threshold OR Polygon RPC is unreachable (fail-closed
+        # by design). Disabled when LIVE_MIN_FUNDER_MATIC == 0.0. Cached for
+        # 60s inside live_clob.check_funder_gas to avoid RPC hammering.
+        if execution_enabled and LIVE_MIN_FUNDER_MATIC > 0.0:
+            try:
+                from . import live_clob as _lc
+                _gas = await _lc.check_funder_gas(min_matic=LIVE_MIN_FUNDER_MATIC)
+            except Exception as _exc:
+                _gas = {"ok": False, "balance_matic": 0.0, "error": f"check_failed: {_exc}"}
+            if not _gas.get("ok"):
+                print(
+                    f"[bot] FUNDER GAS LOW: balance={_gas.get('balance_matic'):.6f} MATIC "
+                    f"min={LIVE_MIN_FUNDER_MATIC} err={_gas.get('error')} — "
+                    f"live dispatch blocked for {slug}",
+                    flush=True,
+                )
+                execution_enabled = False
+                attribution.bump("funder_gas_low", strategy=strategy)
         # Fix 1: per-token freshness gate. The selfcheck-driven _shadow_ready flag
         # is one-shot; this gate is checked on every dispatch and uses per-token
         # last-update timestamps. First dispatch for a never-seen token is allowed
