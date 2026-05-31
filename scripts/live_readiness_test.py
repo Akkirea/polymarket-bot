@@ -23,11 +23,13 @@ Usage:
     cd <repo-root>
     POLYGON_RPC_URL=... FUNDER_ADDRESS=... PRIVATE_KEY=... \\
         API_KEY=... API_SECRET=... API_PASSPHRASE=... SIGNATURE_TYPE=3 \\
-        python -m scripts.live_readiness_test
+        python scripts/live_readiness_test.py
 
-    # Optionally also place + cancel a $1 GTC limit far below market:
+    # Optionally also place + cancel a $1 GTC limit on the operator-chosen
+    # token (best_ask must be at least test_price + LIVE_TEST_SAFETY_MARGIN
+    # above the test price; defaults: test_price=$0.30, margin=$0.10):
     LIVE_TEST_TOKEN=<token_id> POLYMARKET_LIVE_TEST=true \\
-        python -m scripts.live_readiness_test --place-test-order
+        python scripts/live_readiness_test.py --place-test-order
 """
 
 from __future__ import annotations
@@ -41,8 +43,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Allow `python scripts/live_readiness_test.py` from anywhere by ensuring the
-# repo root is on sys.path. `python -m scripts.live_readiness_test` from the
-# repo root also works without this.
+# repo root is on sys.path so `from src.live_clob import ...` resolves. The
+# scripts/ directory is intentionally NOT a Python package; invoke this script
+# directly, not via `python -m`.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -170,24 +173,79 @@ def step_order_book_read(token_id: Optional[str]) -> dict:
 
 
 async def step_test_order(token_id: Optional[str]) -> dict:
+    """Place + cancel a $1 GTC limit on EXACTLY the operator-chosen token.
+
+    Defect #1 fix: routes through LIVE_TEST_TOKEN; never calls
+    fetch_active_btc_5m_market() — the operator's token is the only token used.
+
+    Defect #2 fix: reads the current order book for the chosen token, computes
+    the best ask, and refuses to place unless best_ask >= test_price + safety
+    margin (default 0.10). Fail-closed when the book is empty/unreachable.
+    """
     if not token_id:
         _emit("test_order", "SKIP", "LIVE_TEST_TOKEN not set")
         return {"__skip__": True}
     if os.getenv("POLYMARKET_LIVE_TEST", "false").lower() != "true":
         _emit("test_order", "SKIP", "POLYMARKET_LIVE_TEST != true")
         return {"__skip__": True}
-    # Place a $1 GTC limit at MIN_LIVE_PRICE (far below market) — guaranteed
-    # not to fill against current asks. Cancel after a short delay.
-    from src.live_clob import place_gtc_buy, cancel_order, fetch_active_btc_5m_market
+    from src.live_clob import (
+        place_gtc_buy,
+        cancel_order,
+        get_book_rest,
+        _inspect_buy_liquidity,
+    )
 
-    market = await fetch_active_btc_5m_market()
-    min_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
-    placed = await place_gtc_buy(market, "Up", 1.00, min_price)
+    test_price = float(os.getenv("MIN_LIVE_PRICE", "0.30"))
+    safety_margin = float(os.getenv("LIVE_TEST_SAFETY_MARGIN", "0.10"))
+
+    # Defect #2 — Pre-flight: refuse to place if best_ask is too close to
+    # test_price (i.e., a fill could happen). Reads the live order book for
+    # the operator-chosen LIVE_TEST_TOKEN, not the auto-selected market.
+    try:
+        book = get_book_rest(token_id)
+    except Exception as exc:  # noqa: BLE001
+        _emit("test_order:book_check", "FAIL", f"get_book_rest failed: {exc}")
+        return {"ok": False, "error": f"book_read_failed: {exc}"}
+    liquidity = _inspect_buy_liquidity(book, max_price=1.0)
+    best_ask = liquidity.get("best_ask")
+    if best_ask is None:
+        _emit(
+            "test_order:book_check",
+            "FAIL",
+            f"no asks in book for token={token_id[:12]}.. (fail-closed)",
+        )
+        return {"ok": False, "error": "no_asks_in_book"}
+    safety_floor = test_price + safety_margin
+    if best_ask < safety_floor:
+        _emit(
+            "test_order:book_check",
+            "FAIL",
+            f"best_ask={best_ask:.4f} < test_price+margin={safety_floor:.4f} "
+            f"(test_price={test_price:.2f}, margin={safety_margin:.2f}) — fill risk",
+        )
+        return {"ok": False, "error": "best_ask_too_close"}
+    _emit(
+        "test_order:book_check",
+        "PASS",
+        f"best_ask={best_ask:.4f} >= test_price+margin={safety_floor:.4f}",
+    )
+
+    # Defect #1 — Route the order via LIVE_TEST_TOKEN by constructing a
+    # minimal market dict directly. token_for_side(market, "Up") will resolve
+    # clobTokenIds[0] which is the operator's exact token. No call to
+    # fetch_active_btc_5m_market() — the operator's choice is the only choice.
+    market_for_test: dict = {
+        "outcomes": ["Up", "Down"],
+        "clobTokenIds": [token_id, ""],
+        "_sz_label": "LIVE_TEST_TOKEN",
+    }
+
+    placed = await place_gtc_buy(market_for_test, "Up", 1.00, test_price)
     order_id = placed.get("order_id")
     _emit(
         "test_order:place",
         "PASS",
-        f"order_id={order_id} price={min_price} stake=$1.00",
+        f"order_id={order_id} token={token_id[:12]}.. price={test_price} stake=$1.00",
     )
     await asyncio.sleep(2.0)
     cancelled = await cancel_order(order_id)
@@ -196,7 +254,7 @@ async def step_test_order(token_id: Optional[str]) -> dict:
         "PASS" if cancelled else "FAIL",
         f"order_id={order_id} cancelled={cancelled}",
     )
-    return {"placed": placed, "cancelled": cancelled}
+    return {"placed": placed, "cancelled": cancelled, "best_ask": best_ask}
 
 
 # Orchestration ──────────────────────────────────────────────────────────────
