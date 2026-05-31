@@ -37,6 +37,7 @@ REASONS: tuple = (
     "ws_unhealthy",
     "market_closed",
     "exposure_cap",
+    "daily_loss_halt",
     "dispatch_called",
     # Inner signal vetoes
     "diff_threshold",
