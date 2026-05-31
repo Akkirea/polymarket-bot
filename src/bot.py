@@ -3055,11 +3055,26 @@ class PaperBot:
             print(f"[bot] shadow self-check: fetch_active_markets failed: {exc}", flush=True)
             return
         token_id: Optional[str] = None
-        for m in markets:
+        # Rank candidates by reported gamma volume DESC so the WS-health probe
+        # lands on the most-active open market instead of arbitrary first-open.
+        # H4 confirmed the prior first-open behaviour frequently selected post-
+        # burst-silent markets. Signal evaluation still iterates ALL markets
+        # independently in _tick; this change affects only the self-check
+        # subscription chosen at startup.
+        markets_by_volume = sorted(
+            markets, key=lambda m: float(m.get("volume") or 0.0), reverse=True
+        )
+        for m in markets_by_volume:
             try:
                 from .live_clob import token_for_side
                 token_id = token_for_side(m, "Up")
                 self._clob_book_feed.subscribe(token_id)
+                _vol = float(m.get("volume") or 0.0)
+                print(
+                    f"[bot] shadow self-check: picked highest-volume candidate "
+                    f"slug={m.get('slug')} volume=${_vol:.0f}",
+                    flush=True,
+                )
                 break
             except Exception:
                 continue
