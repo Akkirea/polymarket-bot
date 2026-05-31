@@ -112,6 +112,15 @@ OB_IMBALANCE_THRESHOLD = float(os.getenv("OB_IMBALANCE_THRESHOLD", "0.5"))
 OB_SUSTAINED_SECONDS   = float(os.getenv("OB_SUSTAINED_SECONDS",   "5.0"))
 OB_SHADOW_WINDOW       = (60, 210)  # wider than lag-follow; leading signal fires early
 
+# ── Risk controls (aggregate) ────────────────────────────────────────────────
+# Aggregate exposure cap: maximum cumulative LIVE stake (sum of live_stake
+# across self.positions) as a fraction of live_balance, including the
+# prospective new stake. 0.0 disables the gate (default). Complements the
+# hardcoded position-count cap (=3) and the per-trade Kelly cap; closes the gap
+# where 3 simultaneous positions could otherwise consume 12% of wallet without
+# an aggregate ceiling.
+LIVE_MAX_AGGREGATE_EXPOSURE_PCT = float(os.getenv("LIVE_MAX_AGGREGATE_EXPOSURE_PCT", "0.0"))
+
 # ── Execution mode ────────────────────────────────────────────────────────────
 # Values: shadow_only | maker_shadow | maker_live
 EXEC_MODE = os.getenv("EXEC_MODE", "shadow_only").lower()
@@ -2806,6 +2815,27 @@ class PaperBot:
             print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
             execution_enabled = False
             attribution.bump("ws_unhealthy", strategy=strategy)
+        # Aggregate exposure cap. Sums live_stake across currently-open
+        # positions (those with a live_order_id); blocks the new dispatch if
+        # (existing + new) / live_balance would exceed the configured fraction.
+        # Disabled when LIVE_MAX_AGGREGATE_EXPOSURE_PCT == 0.0 (default).
+        if execution_enabled and LIVE_MAX_AGGREGATE_EXPOSURE_PCT > 0.0:
+            _current_live_exposure = sum(
+                float(p.get("live_stake") or 0.0)
+                for p in self.positions
+                if p.get("live_order_id")
+            )
+            _live_bal_for_cap = max(_live_bal, 1e-9)  # guard div-by-zero
+            _projected_pct = (_current_live_exposure + stake) / _live_bal_for_cap
+            if _projected_pct > LIVE_MAX_AGGREGATE_EXPOSURE_PCT:
+                print(
+                    f"[bot] EXPOSURE CAP: current=${_current_live_exposure:.4f} "
+                    f"+ new=${stake:.4f} = {_projected_pct*100:.1f}% > "
+                    f"{LIVE_MAX_AGGREGATE_EXPOSURE_PCT*100:.1f}% — live dispatch blocked for {slug}",
+                    flush=True,
+                )
+                execution_enabled = False
+                attribution.bump("exposure_cap", strategy=strategy)
         # Fix 1: per-token freshness gate. The selfcheck-driven _shadow_ready flag
         # is one-shot; this gate is checked on every dispatch and uses per-token
         # last-update timestamps. First dispatch for a never-seen token is allowed
