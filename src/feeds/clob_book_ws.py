@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -48,6 +49,14 @@ class ClobBookFeed:
         self._connected_evt = asyncio.Event()
         self._trade_callback: Optional[Callable] = None
         self._book_callback: Optional[Callable] = None
+        # Subscription lifecycle (durable fix for STALE_SUBSCRIPTION):
+        # The book feed maintains exactly one "primary" subscription at a time,
+        # rotated periodically by PaperBot._book_subscription_manager to track the
+        # current highest-volume active 5m market.
+        self.current_token_id: Optional[str] = None
+        self.last_subscription_change_ts: float = 0.0
+        self.subscription_change_count_total: int = 0
+        self.subscription_change_log: deque = deque(maxlen=50)
         # Per-token freshness (Fix 1): each subscribed token has its own update timestamp
         # so the freshness gate cannot be satisfied by activity on a different token.
         self._last_book_update_by_token: dict[str, float] = {}
@@ -119,8 +128,107 @@ class ClobBookFeed:
         if not token_id or token_id in self._subscriptions:
             return
         self._subscriptions.add(token_id)
+        # Track current_token_id on first-ever subscription so the lifecycle
+        # manager has a baseline to compare against. Subsequent subscribe()
+        # calls (additive, e.g. router dispatch) do not change the primary.
+        if self.current_token_id is None:
+            self.current_token_id = token_id
+            self.last_subscription_change_ts = time.time()
+            self.subscription_change_count_total += 1
+            self.subscription_change_log.append({
+                "ts": self.last_subscription_change_ts,
+                "old": None,
+                "new": token_id,
+                "reason": "INITIAL_BOOT",
+            })
         if self._ws is not None:
             asyncio.create_task(self._send_subscribe([token_id]))
+
+    def replace_primary_subscription(self, token_id: str, reason: str) -> bool:
+        """Atomically rotate the primary subscription to token_id.
+
+        Used by PaperBot._book_subscription_manager. Removes the current primary
+        token from the local subscription set and per-token freshness maps, adds
+        the new token, and schedules a WS reconnect so the server-side
+        subscription state is also cleared. Returns True if a swap occurred.
+        """
+        token_id = str(token_id)
+        if not token_id:
+            return False
+        if self.current_token_id == token_id and token_id in self._subscriptions:
+            return False
+        old = self.current_token_id
+        if old is not None:
+            self._subscriptions.discard(old)
+            self._tops.pop(old, None)
+            self._update_events.pop(old, None)
+            self._last_book_update_by_token.pop(old, None)
+            self._last_trade_event_by_token.pop(old, None)
+        self._subscriptions.add(token_id)
+        self.current_token_id = token_id
+        self.last_subscription_change_ts = time.time()
+        self.subscription_change_count_total += 1
+        self.subscription_change_log.append({
+            "ts": self.last_subscription_change_ts,
+            "old": old,
+            "new": token_id,
+            "reason": reason,
+        })
+        # Notify server: send subscribe immediately on current WS (additive on
+        # server side), and force a reconnect to drop server-side state for the
+        # old token. The connect loop will resume with _subscriptions containing
+        # only the new token.
+        if self._ws is not None:
+            asyncio.create_task(self._send_subscribe([token_id]))
+        self.force_reconnect()
+        return True
+
+    def force_reconnect(self) -> None:
+        """Schedule a WS close. The connect() loop will reconnect with the
+        current _subscriptions set."""
+        ws = self._ws
+        if ws is None:
+            return
+
+        async def _close():
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+        try:
+            asyncio.create_task(_close())
+        except RuntimeError:
+            # No running loop (e.g. called from a non-async context)
+            pass
+
+    def subscription_status(self) -> dict:
+        """Snapshot for /api/bot/status telemetry."""
+        now = time.time()
+        cutoff = now - 86400
+        change_log = list(self.subscription_change_log)
+        count_24h = sum(1 for e in change_log if e.get("ts", 0) >= cutoff)
+        last_age = (
+            round(now - self.last_subscription_change_ts, 1)
+            if self.last_subscription_change_ts > 0 else None
+        )
+        recent = []
+        for e in change_log[-5:]:
+            recent.append({
+                "ts": e.get("ts"),
+                "age_sec": round(now - e.get("ts", 0), 1) if e.get("ts") else None,
+                "old": (e.get("old") or "")[:12] if e.get("old") else None,
+                "new": (e.get("new") or "")[:12] if e.get("new") else None,
+                "reason": e.get("reason"),
+            })
+        return {
+            "current_token_id": self.current_token_id,
+            "current_token_id_short": (self.current_token_id or "")[:12] if self.current_token_id else None,
+            "last_subscription_change_age_sec": last_age,
+            "subscription_change_count_total": self.subscription_change_count_total,
+            "subscription_change_count_24h": count_24h,
+            "subscription_change_log_recent": recent,
+        }
 
     def is_subscribed(self, token_id: str) -> bool:
         return str(token_id) in self._subscriptions
