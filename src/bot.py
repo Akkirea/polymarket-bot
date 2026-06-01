@@ -223,7 +223,7 @@ MARKET_FAMILIES = [
         "slug_prefix": "btc-updown-5m",
         "interval": 300,
         "strategy": "chainlink-reversal-guard",
-        "live_enabled": True,
+        "live_enabled": False,
         "mode": "shadow",
         "entry_window": (ENTRY_WINDOW_LO, ENTRY_WINDOW_HI),
         "diff_threshold": PRICE_DIFF_THRESHOLD,
