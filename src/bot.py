@@ -290,6 +290,7 @@ class PaperBot:
         self._shadow_sim: Optional[ShadowFillSimulator] = None
         self._shadow_ready: bool = False
         self._shadow_watchdog_task: Optional[asyncio.Task] = None
+        self._book_subscription_mgr_task: Optional[asyncio.Task] = None
         self._shadow_dispatch_count: int = 0       # incremented by router dispatch
         self._live_balance_at_shadow_boot: Optional[float] = None
         self._entered_slugs: set = set()           # avoid re-entering the same market
@@ -391,6 +392,7 @@ class PaperBot:
                 exec_mode=EXEC_MODE,
             )
             self._shadow_selfcheck_task = loop.create_task(self._shadow_selfcheck())
+            self._book_subscription_mgr_task = loop.create_task(self._book_subscription_manager())
             if EXEC_MODE == "maker_shadow":
                 self._install_shadow_canaries()
                 self._live_balance_at_shadow_boot = self.live_balance
@@ -458,6 +460,13 @@ class PaperBot:
             except asyncio.CancelledError:
                 pass
             self._shadow_selfcheck_task = None
+        if self._book_subscription_mgr_task is not None:
+            self._book_subscription_mgr_task.cancel()
+            try:
+                await self._book_subscription_mgr_task
+            except asyncio.CancelledError:
+                pass
+            self._book_subscription_mgr_task = None
         self._clob_book_feed.stop()
         if self._clob_book_task:
             self._clob_book_task.cancel()
@@ -536,7 +545,15 @@ class PaperBot:
                 freshness = self._clob_book_feed.freshness_snapshot()
         except Exception:
             pass
+        # Subscription lifecycle telemetry (durable fix for STALE_SUBSCRIPTION).
+        subscription: dict = {}
+        try:
+            if hasattr(self._clob_book_feed, "subscription_status"):
+                subscription = self._clob_book_feed.subscription_status()
+        except Exception:
+            pass
         return {
+            "subscription": subscription,
             "exec_mode": EXEC_MODE,
             "ready": self._shadow_ready,
             "orders_open_in_memory": sim_snap.get("open_orders", 0),
@@ -3119,6 +3136,90 @@ class PaperBot:
                     print(f"[shadow-watchdog] db_shadow.counts_24h failed: {exc}", flush=True)
 
             await asyncio.sleep(5)
+
+    async def _book_subscription_manager(self) -> None:
+        """Durable fix for STALE_SUBSCRIPTION.
+
+        Periodically reconciles ClobBookFeed's primary subscription against the
+        currently active BTC 5m markets. Rotates when the subscribed token's
+        market is closed (MARKET_CLOSED) or when a higher-volume active 5m
+        market exists (VOLUME_ROTATION).
+
+        Runs whenever EXEC_MODE in {maker_shadow, maker_live}. Independent of
+        dispatch / signal pipeline.
+        """
+        WARMUP_SEC = 30
+        INTERVAL_SEC = 60
+        try:
+            await asyncio.sleep(WARMUP_SEC)
+        except asyncio.CancelledError:
+            return
+        while self.running:
+            try:
+                await self._reconcile_book_subscription()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"[book-sub-mgr] reconcile error: {exc}", flush=True)
+            try:
+                await asyncio.sleep(INTERVAL_SEC)
+            except asyncio.CancelledError:
+                return
+
+    async def _reconcile_book_subscription(self) -> None:
+        markets = await self._fetch_active_markets()
+        btc_5m = [
+            m for m in markets
+            if (m.get("slug") or "").startswith("btc-updown-5m-")
+        ]
+        if not btc_5m:
+            return
+        btc_5m.sort(key=lambda m: float(m.get("volume") or 0.0), reverse=True)
+
+        from .live_clob import token_for_side
+        target_token: Optional[str] = None
+        target_slug: Optional[str] = None
+        target_vol: float = 0.0
+        for m in btc_5m:
+            try:
+                tok = token_for_side(m, "Up")
+                if tok:
+                    target_token = tok
+                    target_slug = m.get("slug")
+                    target_vol = float(m.get("volume") or 0.0)
+                    break
+            except Exception:
+                continue
+
+        if target_token is None:
+            return
+
+        current = self._clob_book_feed.current_token_id
+        if current == target_token:
+            return  # already on the right token; no swap
+
+        # Classify reason
+        if current is None:
+            reason = "INITIAL_BOOT"
+        else:
+            current_in_active_set = False
+            for m in btc_5m:
+                try:
+                    if token_for_side(m, "Up") == current:
+                        current_in_active_set = True
+                        break
+                except Exception:
+                    continue
+            reason = "VOLUME_ROTATION" if current_in_active_set else "MARKET_CLOSED"
+
+        swapped = self._clob_book_feed.replace_primary_subscription(target_token, reason)
+        if swapped:
+            old_short = (current or "")[:12] if current else None
+            print(
+                f"[book-sub-mgr] SWAP reason={reason} old={old_short} "
+                f"new={target_token[:12]} slug={target_slug} vol=${target_vol:.0f}",
+                flush=True,
+            )
 
     async def _shadow_selfcheck(self) -> None:
         """After 60 s, verify book WS produces a valid top-of-book for at least one
