@@ -748,7 +748,8 @@ class PaperBot:
 
             # ── Pre-signal limit order management (5m live markets only) ──────
             if (
-                bool(market.get("_sz_live_enabled", True))
+                EXEC_MODE == "maker_live"
+                and bool(market.get("_sz_live_enabled", True))
                 and slug.startswith("btc-updown-5m-")
             ):
                 # Compute reference price once — reused by pre-signal and lag-follow paths
