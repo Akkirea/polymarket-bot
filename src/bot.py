@@ -397,6 +397,12 @@ class PaperBot:
                 self._install_shadow_canaries()
                 self._live_balance_at_shadow_boot = self.live_balance
                 self._shadow_watchdog_task = loop.create_task(self._shadow_watchdog())
+            # Boot-time signal that LAG_FOLLOW_LIVE_ENABLED env is actually true in
+            # this deployed process. Bumped exactly once at start(); absence in the
+            # attribution snapshot proves Hypothesis A (env-not-set).
+            if LAG_FOLLOW_LIVE_ENABLED:
+                attribution.bump("lag_follow_env_enabled", strategy="btc5-lag-follow-live")
+                print(f"[bot] LAG_FOLLOW_LIVE_ENABLED=true — env signal recorded", flush=True)
             print(f"[bot] EXEC_MODE={EXEC_MODE} — router initialised", flush=True)
         else:
             print(f"[bot] EXEC_MODE={EXEC_MODE} — no live/shadow execution layer", flush=True)
@@ -1789,6 +1795,7 @@ class PaperBot:
     ) -> bool:
         """Promote the validated btc5-lag-follow-shadow rule into conservative live execution."""
         slug = market["slug"]
+        attribution.bump("lag_follow_00_entered", strategy="btc5-lag-follow-live")
 
         # ── Hour gate: skip live entry in statistically bad hours ────────────
         if hour_et in LIVE_BLOCKED_HOURS:
@@ -1797,6 +1804,7 @@ class PaperBot:
                 f"(LIVE_BLOCKED_HOURS={LIVE_BLOCKED_HOURS})",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_hour", strategy="btc5-lag-follow-live")
             return False
 
         reference_price = _extract_official_price_to_beat(market)
@@ -1815,10 +1823,12 @@ class PaperBot:
                 f"[bot] LAG-FOLLOW LIVE SKIP: {slug} all reference sources unavailable",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_reference", strategy="btc5-lag-follow-live")
             return False
 
         live_price, live_source = await self._get_signal_price()
         if live_price is None:
+            attribution.bump("lag_follow_reject_live_price", strategy="btc5-lag-follow-live")
             return False
 
         diff = live_price - reference_price
@@ -1826,11 +1836,13 @@ class PaperBot:
         side_price = _side_price(market, side)
         live_max_price = min(LAG_FOLLOW_LIVE_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE, CROWD_MAX)
         if not (CROWD_MIN <= side_price <= live_max_price):
+            attribution.bump("lag_follow_reject_side_band", strategy="btc5-lag-follow-live")
             return False
         if reference_source == RTDS_LIVE_FALLBACK_SOURCE:
             edge_ok, edge_reason = self._rtds_live_edge_ok(diff, side_price)
             if not edge_ok:
                 print(f"[bot] LAG-FOLLOW RTDS LIVE SKIP: {slug} {edge_reason}", flush=True)
+                attribution.bump("lag_follow_reject_edge_filter", strategy="btc5-lag-follow-live")
                 return False
             print(f"[bot] LAG-FOLLOW RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
         else:
@@ -1840,6 +1852,7 @@ class PaperBot:
                     f"< threshold $50.00 ({seconds_remaining:.0f}s remaining)",
                     flush=True,
                 )
+                attribution.bump("lag_follow_reject_edge_filter", strategy="btc5-lag-follow-live")
                 return False
 
         # ── Symmetric-zone gate: crowd skeptical (< 0.55) needs $75+ diff ──
@@ -1851,6 +1864,7 @@ class PaperBot:
                 f"(side_price={side_price:.3f} diff=${abs(diff):.2f})",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_symmetric_zone", strategy="btc5-lag-follow-live")
             return False
 
         # ── Crowd floor: reject if crowd disagrees too strongly with signal ──
@@ -1861,6 +1875,7 @@ class PaperBot:
                 f"< floor {floor:.2f} for diff ${abs(diff):.2f}",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_crowd_floor", strategy="btc5-lag-follow-live")
             return False
 
         # ── Signal maturity: reject fresh spikes, penalise falling diffs ────
@@ -1876,6 +1891,7 @@ class PaperBot:
                 f"only {maturity['sustained_secs']:.0f}s above threshold",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_maturity_fresh", strategy="btc5-lag-follow-live")
             return False
         if maturity["trend"] == "falling":
             print(
@@ -1883,6 +1899,7 @@ class PaperBot:
                 f"peak=${maturity['peak_diff']:.0f} now=${abs(diff):.0f}",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_maturity_falling", strategy="btc5-lag-follow-live")
             return False
 
         # Recheck disabled: continuous diff-decay cancel is enforced inside MakerExecutor.
@@ -1890,6 +1907,7 @@ class PaperBot:
         price_10s_ago = self._get_price_n_seconds_ago(10)
         price_30s_ago = self._get_price_n_seconds_ago(30)
         if price_10s_ago is None or price_30s_ago is None:
+            attribution.bump("lag_follow_reject_momentum_history", strategy="btc5-lag-follow-live")
             return False
         momentum_10 = live_price - price_10s_ago
         momentum_30 = live_price - price_30s_ago
@@ -1902,6 +1920,7 @@ class PaperBot:
                 f"10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f}",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_momentum_aligned", strategy="btc5-lag-follow-live")
             return False
         if side == "Down" and not (momentum_10 < 0 and momentum_30 < 0):
             print(
@@ -1909,6 +1928,7 @@ class PaperBot:
                 f"10s=${momentum_10:+.2f} 30s=${momentum_30:+.2f}",
                 flush=True,
             )
+            attribution.bump("lag_follow_reject_momentum_aligned", strategy="btc5-lag-follow-live")
             return False
 
         # ── HTF trend filter: 10-minute BTC trend must not strongly oppose signal ──
@@ -1928,6 +1948,7 @@ class PaperBot:
                         f"but signal=Up — sustained downtrend blocks entry",
                         flush=True,
                     )
+                    attribution.bump("lag_follow_reject_htf_trend", strategy="btc5-lag-follow-live")
                     return False
                 if side == "Down" and htf_trend > HTF_TREND_THRESHOLD:
                     print(
@@ -1935,6 +1956,7 @@ class PaperBot:
                         f"but signal=Down — sustained uptrend blocks entry",
                         flush=True,
                     )
+                    attribution.bump("lag_follow_reject_htf_trend", strategy="btc5-lag-follow-live")
                     return False
                 print(
                     f"[bot] LAG-FOLLOW LIVE HTF OK: {slug} 10m trend={htf_trend:+.2f} side={side}",
@@ -1951,6 +1973,7 @@ class PaperBot:
             f"secs={seconds_remaining:.1f} source={live_source} ref={reference_source}",
             flush=True,
         )
+        attribution.bump("lag_follow_13_dispatch_candidate", strategy="btc5-lag-follow-live")
         if side_price < 0.55:
             strategy = "btc5-lag-follow-live-symmetric"
         elif reference_source == RTDS_LIVE_FALLBACK_SOURCE:
