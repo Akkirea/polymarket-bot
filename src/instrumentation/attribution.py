@@ -46,6 +46,23 @@ REASONS: tuple = (
     "funding_conflict",
     "rtds_edge_block",
     "btc_price_unavailable",
+    # Lag-follow funnel (per-stage observability for _maybe_open_lag_follow_live;
+    # paired with attribution.bump() call sites in bot.py committed in bdb7247)
+    "lag_follow_env_enabled",
+    "lag_follow_00_entered",
+    "lag_follow_reject_hour",
+    "lag_follow_reject_reference",
+    "lag_follow_reject_live_price",
+    "lag_follow_reject_side_band",
+    "lag_follow_reject_edge_filter",
+    "lag_follow_reject_symmetric_zone",
+    "lag_follow_reject_crowd_floor",
+    "lag_follow_reject_maturity_fresh",
+    "lag_follow_reject_maturity_falling",
+    "lag_follow_reject_momentum_history",
+    "lag_follow_reject_momentum_aligned",
+    "lag_follow_reject_htf_trend",
+    "lag_follow_13_dispatch_candidate",
 )
 
 
