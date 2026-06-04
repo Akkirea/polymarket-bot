@@ -1810,14 +1810,19 @@ class PaperBot:
         reference_price = _extract_official_price_to_beat(market)
         reference_source = "polymarket-official" if reference_price is not None else None
         if reference_price is None:
+            attribution.bump("lag_follow_ref_inline_none", strategy="btc5-lag-follow-live")
             ptb = await self._fetch_official_price_to_beat(slug)
             if ptb is not None:
                 reference_price, reference_source = ptb, "polymarket-official"
+            else:
+                attribution.bump("lag_follow_ref_fetch_none", strategy="btc5-lag-follow-live")
         if reference_price is None:
             rtds_raw, rtds_src = self._rtds_live_fallback_reference(market)
             if rtds_raw is not None:
                 reference_price = rtds_raw - RTDS_BIAS_CORRECTION
                 reference_source = rtds_src
+            else:
+                attribution.bump("lag_follow_ref_rtds_none", strategy="btc5-lag-follow-live")
         if reference_price is None:
             print(
                 f"[bot] LAG-FOLLOW LIVE SKIP: {slug} all reference sources unavailable",
