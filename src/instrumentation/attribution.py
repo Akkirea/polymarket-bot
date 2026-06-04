@@ -63,6 +63,10 @@ REASONS: tuple = (
     "lag_follow_reject_momentum_aligned",
     "lag_follow_reject_htf_trend",
     "lag_follow_13_dispatch_candidate",
+    # L2 sub-attribution: which reference source returned None
+    "lag_follow_ref_inline_none",
+    "lag_follow_ref_fetch_none",
+    "lag_follow_ref_rtds_none",
 )
 
 
