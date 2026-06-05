@@ -67,6 +67,11 @@ REASONS: tuple = (
     "lag_follow_ref_inline_none",
     "lag_follow_ref_fetch_none",
     "lag_follow_ref_rtds_none",
+    # maturity_fresh sub-attribution by sustained_secs bucket (Stage 1; counterfactual deferred)
+    "lag_follow_maturity_fresh_lt_5s",
+    "lag_follow_maturity_fresh_5_to_10s",
+    "lag_follow_maturity_fresh_10_to_15s",
+    "lag_follow_maturity_fresh_15_to_20s",
 )
 
 

@@ -1896,6 +1896,16 @@ class PaperBot:
                 f"only {maturity['sustained_secs']:.0f}s above threshold",
                 flush=True,
             )
+            _mf_ssecs = float(maturity.get("sustained_secs") or 0.0)
+            if _mf_ssecs < 5.0:
+                _mf_bucket = "lt_5s"
+            elif _mf_ssecs < 10.0:
+                _mf_bucket = "5_to_10s"
+            elif _mf_ssecs < 15.0:
+                _mf_bucket = "10_to_15s"
+            else:
+                _mf_bucket = "15_to_20s"
+            attribution.bump(f"lag_follow_maturity_fresh_{_mf_bucket}", strategy="btc5-lag-follow-live")
             attribution.bump("lag_follow_reject_maturity_fresh", strategy="btc5-lag-follow-live")
             return False
         if maturity["trend"] == "falling":
