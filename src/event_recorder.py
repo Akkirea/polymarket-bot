@@ -27,12 +27,14 @@ class EventRecorder:
         *,
         enabled: bool,
         event_types: Optional[set[str]] = None,
+        price_change_top_only: bool = True,
         queue_max: int = 20000,
         batch_size: int = 500,
         flush_interval_sec: float = 1.0,
     ):
         self.enabled = enabled
         self.event_types = event_types or {"book", "price_change", "last_trade_price", "trade"}
+        self.price_change_top_only = price_change_top_only
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, queue_max))
         self.batch_size = max(1, batch_size)
         self.flush_interval_sec = max(0.1, flush_interval_sec)
@@ -55,6 +57,7 @@ class EventRecorder:
         return cls(
             enabled=_truthy(os.getenv("CLOB_EVENT_RECORDER_ENABLED", "false")),
             event_types=event_types,
+            price_change_top_only=_truthy(os.getenv("CLOB_EVENT_RECORDER_PRICE_CHANGE_TOP_ONLY", "true")),
             queue_max=int(os.getenv("CLOB_EVENT_RECORDER_QUEUE_MAX", "20000")),
             batch_size=int(os.getenv("CLOB_EVENT_RECORDER_BATCH_SIZE", "500")),
             flush_interval_sec=float(os.getenv("CLOB_EVENT_RECORDER_FLUSH_SEC", "1.0")),
@@ -85,7 +88,12 @@ class EventRecorder:
         evt_type = (evt.get("event_type") or evt.get("type") or "").lower()
         if self.event_types and evt_type not in self.event_types:
             return
-        rows = _rows_for_event(evt, received_ts=received_ts or time.time(), evt_type=evt_type)
+        rows = _rows_for_event(
+            evt,
+            received_ts=received_ts or time.time(),
+            evt_type=evt_type,
+            price_change_top_only=self.price_change_top_only,
+        )
         for row in rows:
             try:
                 self.queue.put_nowait(row)
@@ -104,6 +112,7 @@ class EventRecorder:
             "last_insert_ts": self.last_insert_ts,
             "last_error": self.last_error,
             "event_types": sorted(self.event_types),
+            "price_change_top_only": self.price_change_top_only,
         }
 
     async def _run(self) -> None:
@@ -150,7 +159,13 @@ def _event_ts(evt: dict) -> Optional[float]:
         return None
 
 
-def _rows_for_event(evt: dict, *, received_ts: float, evt_type: str) -> list[dict]:
+def _rows_for_event(
+    evt: dict,
+    *,
+    received_ts: float,
+    evt_type: str,
+    price_change_top_only: bool = True,
+) -> list[dict]:
     market = evt.get("market") or evt.get("condition_id") or evt.get("conditionId")
     event_hash = evt.get("hash") or evt.get("transaction_hash")
     payload = json.dumps(evt, separators=(",", ":"), sort_keys=True)
@@ -171,6 +186,12 @@ def _rows_for_event(evt: dict, *, received_ts: float, evt_type: str) -> list[dic
             for change in changes:
                 if not isinstance(change, dict):
                     continue
+                if price_change_top_only:
+                    price = str(change.get("price"))
+                    best_bid = str(change.get("best_bid"))
+                    best_ask = str(change.get("best_ask"))
+                    if price != best_bid and price != best_ask:
+                        continue
                 tok = change.get("asset_id") or change.get("token_id") or change.get("assetId")
                 if tok is not None:
                     token_ids.append(str(tok))
@@ -222,7 +243,6 @@ def _ensure_table() -> None:
 def _insert_rows(rows: list[dict]) -> int:
     if not rows:
         return 0
-    _ensure_table()
     conn = db.get_connection()
     try:
         for row in rows:
