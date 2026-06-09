@@ -243,6 +243,8 @@ def _ensure_table() -> None:
 def _insert_rows(rows: list[dict]) -> int:
     if not rows:
         return 0
+    if getattr(db, "_USE_PG", False):
+        return _insert_rows_pg(rows)
     conn = db.get_connection()
     try:
         for row in rows:
@@ -265,3 +267,34 @@ def _insert_rows(rows: list[dict]) -> int:
         return len(rows)
     finally:
         conn.close()
+
+
+def _insert_rows_pg(rows: list[dict]) -> int:
+    values = [
+        (
+            row["received_at"],
+            row["received_ts"],
+            row["event_ts"],
+            row["event_type"],
+            row["market"],
+            row["token_id"],
+            row["event_hash"],
+            row["payload"],
+        )
+        for row in rows
+    ]
+    raw = db.psycopg2.connect(db._DATABASE_URL)
+    try:
+        cur = raw.cursor()
+        db.psycopg2.extras.execute_values(
+            cur,
+            """INSERT INTO clob_ws_events
+               (received_at, received_ts, event_ts, event_type, market, token_id, event_hash, payload)
+               VALUES %s""",
+            values,
+            page_size=len(values),
+        )
+        raw.commit()
+        return len(rows)
+    finally:
+        raw.close()
