@@ -598,6 +598,11 @@ class PaperBot:
             "text_pings_send_errors_total": getattr(self._clob_book_feed, "text_pings_send_errors_total", 0),
             "last_text_ping_ts": getattr(self._clob_book_feed, "last_text_ping_ts", 0.0),
             "text_pong_received_total": getattr(self._clob_book_feed, "text_pong_received_total", 0),
+            "event_recorder": (
+                self._clob_book_feed.event_recorder_status()
+                if hasattr(self._clob_book_feed, "event_recorder_status")
+                else {"enabled": False}
+            ),
             # Debug capture (time-limited; removable): raw event-key previews + reconnect log
             "ws_raw_samples": {k: list(v) for k, v in getattr(self._clob_book_feed, "_raw_samples", {}).items()},
             "ws_reconnect_log": list(getattr(self._clob_book_feed, "_reconnect_log", [])),

@@ -21,6 +21,8 @@ from typing import Callable, Optional
 
 import websockets
 
+from ..event_recorder import EventRecorder
+
 
 WS_URL = os.getenv(
     "POLY_CLOB_MARKET_WS",
@@ -110,6 +112,7 @@ class ClobBookFeed:
         self.text_pings_send_errors_total: int = 0
         self.last_text_ping_ts: float = 0.0
         self.text_pong_received_total: int = 0
+        self._event_recorder = EventRecorder.from_env()
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -257,6 +260,9 @@ class ClobBookFeed:
             trade_ages[tok_s[:12]] = round(now - t, 1) if t > 0 else None
         return {"book_ages_sec": book_ages, "trade_ages_sec": trade_ages}
 
+    def event_recorder_status(self) -> dict:
+        return self._event_recorder.status()
+
     def top(self, token_id: str, *, max_age_sec: float = 1.5) -> Optional[TopOfBook]:
         t = self._tops.get(str(token_id))
         if t is None:
@@ -276,9 +282,15 @@ class ClobBookFeed:
 
     def stop(self) -> None:
         self._running = False
+        if self._event_recorder.enabled:
+            try:
+                asyncio.create_task(self._event_recorder.stop())
+            except RuntimeError:
+                pass
 
     async def connect(self) -> None:
         self._running = True
+        await self._event_recorder.start()
         fail_streak = 0
         iteration = 0
         last_exc_type: Optional[str] = None
@@ -431,6 +443,10 @@ class ClobBookFeed:
 
     def _apply_event(self, evt: dict) -> None:
         evt_type = (evt.get("event_type") or evt.get("type") or "").lower()
+        try:
+            self._event_recorder.record(evt, received_ts=self.last_ws_message_ts or time.time())
+        except Exception:
+            pass
         # by-type telemetry: count every event regardless of token_id presence so we can
         # detect schema drift (unknown types) and "events arrive but lack token_id" cases.
         bucket = evt_type if evt_type else "<no_evt_type>"
