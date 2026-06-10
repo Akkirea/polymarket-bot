@@ -17,6 +17,9 @@ from typing import Optional
 from . import db
 
 
+ALLOWED_EVENT_TYPES = {"book", "last_trade_price"}
+
+
 def _truthy(value: str) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
 
@@ -28,13 +31,15 @@ class EventRecorder:
         enabled: bool,
         event_types: Optional[set[str]] = None,
         price_change_top_only: bool = True,
+        max_rows_per_minute: int = 1000,
         queue_max: int = 20000,
         batch_size: int = 500,
         flush_interval_sec: float = 1.0,
     ):
         self.enabled = enabled
-        self.event_types = event_types or {"book", "price_change", "last_trade_price", "trade"}
+        self.event_types = (event_types or ALLOWED_EVENT_TYPES) & ALLOWED_EVENT_TYPES
         self.price_change_top_only = price_change_top_only
+        self.max_rows_per_minute = max(1, int(max_rows_per_minute))
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, queue_max))
         self.batch_size = max(1, batch_size)
         self.flush_interval_sec = max(0.1, flush_interval_sec)
@@ -44,20 +49,27 @@ class EventRecorder:
         self.inserted_total = 0
         self.dropped_total = 0
         self.flush_errors_total = 0
+        self.rate_limited_total = 0
+        self.not_attempt_scoped_total = 0
         self.last_insert_ts = 0.0
         self.last_error: Optional[str] = None
+        self._active_attempt_tokens: dict[str, int] = {}
+        self._minute_window_start = int(time.time() // 60) * 60
+        self._minute_rows = 0
+        self._last_rate_warning_minute = 0
 
     @classmethod
     def from_env(cls) -> "EventRecorder":
         types_raw = os.getenv(
             "CLOB_EVENT_RECORDER_TYPES",
-            "book,price_change,last_trade_price,trade",
+            "book,last_trade_price",
         )
         event_types = {x.strip().lower() for x in types_raw.split(",") if x.strip()}
         return cls(
             enabled=_truthy(os.getenv("CLOB_EVENT_RECORDER_ENABLED", "false")),
             event_types=event_types,
             price_change_top_only=_truthy(os.getenv("CLOB_EVENT_RECORDER_PRICE_CHANGE_TOP_ONLY", "true")),
+            max_rows_per_minute=int(os.getenv("CLOB_EVENT_RECORDER_MAX_ROWS_PER_MIN", "1000")),
             queue_max=int(os.getenv("CLOB_EVENT_RECORDER_QUEUE_MAX", "20000")),
             batch_size=int(os.getenv("CLOB_EVENT_RECORDER_BATCH_SIZE", "500")),
             flush_interval_sec=float(os.getenv("CLOB_EVENT_RECORDER_FLUSH_SEC", "1.0")),
@@ -80,13 +92,36 @@ class EventRecorder:
             await self._task
         except asyncio.CancelledError:
             pass
-        self._task = None
+        finally:
+            self._task = None
+
+    def start_attempt(self, token_id: str) -> None:
+        token = str(token_id or "")
+        if token:
+            self._active_attempt_tokens[token] = self._active_attempt_tokens.get(token, 0) + 1
+
+    def stop_attempt(self, token_id: str) -> None:
+        token = str(token_id or "")
+        if not token:
+            return
+        count = self._active_attempt_tokens.get(token, 0)
+        if count <= 1:
+            self._active_attempt_tokens.pop(token, None)
+        else:
+            self._active_attempt_tokens[token] = count - 1
 
     def record(self, evt: dict, *, received_ts: Optional[float] = None) -> None:
         if not self.enabled:
             return
         evt_type = (evt.get("event_type") or evt.get("type") or "").lower()
-        if self.event_types and evt_type not in self.event_types:
+        if evt_type not in self.event_types:
+            return
+        token_id = _token_id_for_event(evt, evt_type)
+        if not token_id or token_id not in self._active_attempt_tokens:
+            self.not_attempt_scoped_total += 1
+            return
+        if not self._allow_rows(1):
+            self.rate_limited_total += 1
             return
         rows = _rows_for_event(
             evt,
@@ -108,12 +143,33 @@ class EventRecorder:
             "enqueued_total": self.enqueued_total,
             "inserted_total": self.inserted_total,
             "dropped_total": self.dropped_total,
+            "rate_limited_total": self.rate_limited_total,
+            "not_attempt_scoped_total": self.not_attempt_scoped_total,
             "flush_errors_total": self.flush_errors_total,
             "last_insert_ts": self.last_insert_ts,
             "last_error": self.last_error,
             "event_types": sorted(self.event_types),
             "price_change_top_only": self.price_change_top_only,
+            "max_rows_per_minute": self.max_rows_per_minute,
+            "active_attempt_tokens": len(self._active_attempt_tokens),
         }
+
+    def _allow_rows(self, count: int) -> bool:
+        now_minute = int(time.time() // 60) * 60
+        if now_minute != self._minute_window_start:
+            self._minute_window_start = now_minute
+            self._minute_rows = 0
+        if self._minute_rows + count > self.max_rows_per_minute:
+            if self._last_rate_warning_minute != now_minute:
+                self._last_rate_warning_minute = now_minute
+                print(
+                    f"[event-recorder] write rate guard tripped: "
+                    f"{self._minute_rows}+{count}>{self.max_rows_per_minute} rows/min; skipping",
+                    flush=True,
+                )
+            return False
+        self._minute_rows += count
+        return True
 
     async def _run(self) -> None:
         batch: list[dict] = []
@@ -157,6 +213,22 @@ def _event_ts(evt: dict) -> Optional[float]:
         return ts / 1000.0 if ts > 10_000_000_000 else ts
     except (TypeError, ValueError):
         return None
+
+
+def _token_id_for_event(evt: dict, evt_type: str) -> Optional[str]:
+    if evt_type == "price_change":
+        changes = evt.get("price_changes") or evt.get("changes") or []
+        if not isinstance(changes, list):
+            return None
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            tok = change.get("asset_id") or change.get("token_id") or change.get("assetId")
+            if tok is not None:
+                return str(tok)
+        return None
+    tok = evt.get("asset_id") or evt.get("token_id") or evt.get("assetId")
+    return str(tok) if tok is not None else None
 
 
 def _rows_for_event(

@@ -171,6 +171,8 @@ class ExecutionRouter:
             token_id = _token_for_side(market, side)
             self._book.subscribe(token_id)
             self._fill_source.subscribe(_condition_id(market))
+            if hasattr(self._book, "start_event_recording_attempt"):
+                self._book.start_event_recording_attempt(token_id)
 
             market["_sz_regime"] = regime
             market["_sz_diff_at_dispatch"] = diff_at_entry
@@ -204,7 +206,12 @@ class ExecutionRouter:
             task = asyncio.create_task(executor.run(), name=f"maker:{slug}:{side}")
             handle = DispatchHandle(slug=slug, side=side, task=task, executor=executor)
             self._active[key] = handle
-            task.add_done_callback(lambda _t: self._active.pop(key, None))
+            def _cleanup(_t):
+                self._active.pop(key, None)
+                if hasattr(self._book, "stop_event_recording_attempt"):
+                    self._book.stop_event_recording_attempt(token_id)
+
+            task.add_done_callback(_cleanup)
             return handle
 
     def _wrap_on_fill(self, slug: str) -> Callable[[dict], Awaitable[None]]:

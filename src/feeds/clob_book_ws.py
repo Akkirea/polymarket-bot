@@ -263,6 +263,12 @@ class ClobBookFeed:
     def event_recorder_status(self) -> dict:
         return self._event_recorder.status()
 
+    def start_event_recording_attempt(self, token_id: str) -> None:
+        self._event_recorder.start_attempt(token_id)
+
+    def stop_event_recording_attempt(self, token_id: str) -> None:
+        self._event_recorder.stop_attempt(token_id)
+
     def top(self, token_id: str, *, max_age_sec: float = 1.5) -> Optional[TopOfBook]:
         t = self._tops.get(str(token_id))
         if t is None:
