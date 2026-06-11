@@ -87,6 +87,10 @@ LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
 RTDS_PREVCLOSE_SHADOW_STRATEGY = "btc5-rtds-prevclose-shadow"
 RTDS_LIVE_FALLBACK_SOURCE = "rtds-live-fallback"
 RTDS_LIVE_FALLBACK_ENABLED = os.getenv("RTDS_LIVE_FALLBACK_ENABLED", "true").lower() == "true"
+MAKER_SHADOW_LOCAL_REFERENCE_ENABLED = os.getenv(
+    "MAKER_SHADOW_LOCAL_REFERENCE_ENABLED", "true"
+).lower() == "true"
+MAKER_SHADOW_LOCAL_REFERENCE_SUFFIX = "local-reference"
 # Kline (Binance 5m open) and RTDS prices are consistently ~$33/$30 ABOVE the actual
 # Chainlink Data Streams price Polymarket uses for settlement. Subtract this correction
 # so the reference used for diff and strategy tag reflects the real expected beat.
@@ -975,6 +979,12 @@ class PaperBot:
                     or prev_final_price_to_beat is not None
                     or rtds_price_to_beat is not None
                 )
+                maker_shadow_local_reference_ok = (
+                    EXEC_MODE == "maker_shadow"
+                    and MAKER_SHADOW_LOCAL_REFERENCE_ENABLED
+                    and not live_reference_ok
+                    and local_price_to_beat is not None
+                )
                 target_label = (
                     f"{EARLY_LIVE_WINDOW_LO}-{EARLY_LIVE_WINDOW_HI}s early-live"
                     if in_early_live_window else f"{entry_lo}-{entry_hi}s"
@@ -987,6 +997,8 @@ class PaperBot:
                 )
                 if price_source == RTDS_LIVE_FALLBACK_SOURCE and not shadow_mode:
                     strategy = f"{strategy}-rtds-fallback"
+                elif maker_shadow_local_reference_ok and not shadow_mode:
+                    strategy = f"{strategy}-{MAKER_SHADOW_LOCAL_REFERENCE_SUFFIX}"
                 direction, signals = await self._evaluate_signals(market, price_to_beat, price_source)
 
                 if direction is None:
@@ -1042,8 +1054,8 @@ class PaperBot:
                 )
                 if not live_reference_ok:
                     print(
-                        f"[bot] LIVE DISABLED: {slug} official priceToBeat unavailable; "
-                        "paper only to avoid local-reference mismatch",
+                        f"[bot] LIVE DISABLED: {slug} trusted reference unavailable; "
+                        f"{'maker-shadow local-reference dispatch enabled' if maker_shadow_local_reference_ok else 'paper only to avoid local-reference mismatch'}",
                         flush=True,
                     )
                 await self._open_position(
@@ -1055,7 +1067,10 @@ class PaperBot:
                     strategy=strategy,
                     hour_et=hour_et,
                     market=market,
-                    live_enabled=bool(market.get("_sz_live_enabled", True)) and live_reference_ok,
+                    live_enabled=(
+                        bool(market.get("_sz_live_enabled", True))
+                        and (live_reference_ok or maker_shadow_local_reference_ok)
+                    ),
                 )
                 break
 
@@ -1828,6 +1843,20 @@ class PaperBot:
                 reference_source = rtds_src
             else:
                 attribution.bump("lag_follow_ref_rtds_none", strategy="btc5-lag-follow-live")
+        maker_shadow_local_reference = False
+        if (
+            reference_price is None
+            and EXEC_MODE == "maker_shadow"
+            and MAKER_SHADOW_LOCAL_REFERENCE_ENABLED
+        ):
+            reference_price, reference_source = self._local_previous_close_reference(market)
+            maker_shadow_local_reference = reference_price is not None
+            if maker_shadow_local_reference:
+                print(
+                    f"[bot] LAG-FOLLOW MAKER-SHADOW LOCAL REFERENCE: {slug} "
+                    f"ref=${reference_price:,.2f} ({reference_source})",
+                    flush=True,
+                )
         if reference_price is None:
             print(
                 f"[bot] LAG-FOLLOW LIVE SKIP: {slug} all reference sources unavailable",
@@ -1994,7 +2023,9 @@ class PaperBot:
             flush=True,
         )
         attribution.bump("lag_follow_13_dispatch_candidate", strategy="btc5-lag-follow-live")
-        if side_price < 0.55:
+        if maker_shadow_local_reference:
+            strategy = f"btc5-lag-follow-live-{MAKER_SHADOW_LOCAL_REFERENCE_SUFFIX}"
+        elif side_price < 0.55:
             strategy = "btc5-lag-follow-live-symmetric"
         elif reference_source == RTDS_LIVE_FALLBACK_SOURCE:
             strategy = "btc5-lag-follow-live-rtds-fallback"
@@ -2498,7 +2529,15 @@ class PaperBot:
         has_official_reference = price_source == "polymarket-official" and price_to_beat is not None
         has_prev_final_reference = price_source == "prev-finalPrice" and price_to_beat is not None
         has_rtds_live_fallback = price_source == RTDS_LIVE_FALLBACK_SOURCE and price_to_beat is not None
-        if live_enabled and not (has_official_reference or has_prev_final_reference or has_rtds_live_fallback):
+        trusted_reference = has_official_reference or has_prev_final_reference or has_rtds_live_fallback
+        maker_shadow_local_reference = (
+            EXEC_MODE == "maker_shadow"
+            and MAKER_SHADOW_LOCAL_REFERENCE_ENABLED
+            and live_enabled
+            and not trusted_reference
+            and price_to_beat is not None
+        )
+        if live_enabled and not (trusted_reference or maker_shadow_local_reference):
             print(
                 f"[bot] SKIP: {slug} live-enabled market has no official/prev-final/RTDS-fallback reference; "
                 "local proxy disabled",
@@ -2506,6 +2545,12 @@ class PaperBot:
             )
             db.log_bot_signal(slug, filter_hit="no_trusted_reference", outcome="skipped")
             return None, {"source": "none", "momentum": None}
+        if maker_shadow_local_reference:
+            print(
+                f"[bot] MAKER-SHADOW LOCAL REFERENCE: {slug} "
+                f"ref=${price_to_beat:,.2f} ({price_source or 'local'})",
+                flush=True,
+            )
 
         if has_official_reference:
             reference_price = price_to_beat
