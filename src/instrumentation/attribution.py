@@ -72,6 +72,9 @@ REASONS: tuple = (
     "lag_follow_maturity_fresh_5_to_10s",
     "lag_follow_maturity_fresh_10_to_15s",
     "lag_follow_maturity_fresh_15_to_20s",
+    # Post-signal vetoes after _evaluate_signals returned ENTRY.
+    "post_signal_crowd_band",
+    "post_signal_early_confirm",
 )
 
 

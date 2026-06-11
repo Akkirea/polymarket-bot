@@ -91,6 +91,9 @@ MAKER_SHADOW_LOCAL_REFERENCE_ENABLED = os.getenv(
     "MAKER_SHADOW_LOCAL_REFERENCE_ENABLED", "true"
 ).lower() == "true"
 MAKER_SHADOW_LOCAL_REFERENCE_SUFFIX = "local-reference"
+MAKER_SHADOW_REQUIRE_BOOT_READY = os.getenv(
+    "MAKER_SHADOW_REQUIRE_BOOT_READY", "false"
+).lower() == "true"
 # Kline (Binance 5m open) and RTDS prices are consistently ~$33/$30 ABOVE the actual
 # Chainlink Data Streams price Polymarket uses for settlement. Subtract this correction
 # so the reference used for diff and strategy tag reflects the real expected beat.
@@ -562,10 +565,16 @@ class PaperBot:
                 subscription = self._clob_book_feed.subscription_status()
         except Exception:
             pass
+        dispatch_ready = (
+            self._shadow_ready
+            or (EXEC_MODE == "maker_shadow" and not MAKER_SHADOW_REQUIRE_BOOT_READY)
+        )
         return {
             "subscription": subscription,
             "exec_mode": EXEC_MODE,
-            "ready": self._shadow_ready,
+            "ready": dispatch_ready,
+            "boot_selfcheck_ready": self._shadow_ready,
+            "requires_boot_selfcheck": MAKER_SHADOW_REQUIRE_BOOT_READY,
             "orders_open_in_memory": sim_snap.get("open_orders", 0),
             "orders_open_db": counts.get("open", 0),
             "orders_filled_aggressive_24h": counts.get("filled_aggressive_24h", 0),
@@ -1009,20 +1018,28 @@ class PaperBot:
                 entry_price = _side_price(market, direction)
                 if not (CROWD_MIN <= entry_price <= CROWD_MAX):
                     print(
-                        f"[bot] SKIP: {direction} price={entry_price:.3f} outside "
-                        f"profitability range [{CROWD_MIN}, {CROWD_MAX}]",
+                        f"[bot] POST-SIGNAL SKIP: {slug} {direction} price={entry_price:.3f} outside "
+                        f"profitability range [{CROWD_MIN}, {CROWD_MAX}] "
+                        f"diff=${signals.get('diff_initial') or 0.0:+.2f} source={signals.get('source')}",
                         flush=True,
                     )
                     db.log_bot_signal(slug, filter_hit="crowd_price", outcome="skipped",
                                       direction=direction, diff=signals.get("diff_initial"))
+                    attribution.bump("post_signal_crowd_band", strategy=strategy)
                     continue
 
                 if in_early_live_window:
                     early_ok, early_reason = self._early_live_confirmation(market, direction, signals)
                     if not early_ok:
-                        print(f"[bot] SKIP EARLY LIVE: {slug} {early_reason}", flush=True)
+                        print(
+                            f"[bot] POST-SIGNAL SKIP EARLY LIVE: {slug} {early_reason} "
+                            f"direction={direction} price={entry_price:.3f} "
+                            f"diff=${signals.get('diff_initial') or 0.0:+.2f}",
+                            flush=True,
+                        )
                         db.log_bot_signal(slug, filter_hit="early_live_confirmation", outcome="skipped",
                                           direction=direction, diff=signals.get("diff_initial"))
+                        attribution.bump("post_signal_early_confirm", strategy=strategy)
                         continue
 
                 if shadow_mode or signals.get("shadow_only"):
@@ -2928,10 +2945,16 @@ class PaperBot:
             and EXEC_MODE in {"maker_shadow", "maker_live"}
             and (EXEC_MODE == "maker_shadow" or os.getenv("POLYMARKET_LIVE", "false").lower() == "true")
         )
-        if EXEC_MODE == "maker_shadow" and not self._shadow_ready:
+        if EXEC_MODE == "maker_shadow" and MAKER_SHADOW_REQUIRE_BOOT_READY and not self._shadow_ready:
             print(f"[bot] SHADOW: dispatch skipped for {slug} — shadow_ready=False", flush=True)
             execution_enabled = False
             attribution.bump("ws_unhealthy", strategy=strategy)
+        elif EXEC_MODE == "maker_shadow" and not self._shadow_ready:
+            print(
+                f"[bot] SHADOW: boot self-check not ready for {slug}; "
+                "continuing under per-token freshness gate",
+                flush=True,
+            )
         # Daily-loss circuit breaker. Halts LIVE dispatch when today's realized
         # live PnL is at or below -LIVE_DAILY_LOSS_HALT. Disabled when set to 0.
         # Paper/shadow data collection continues; only execution_enabled is gated.
