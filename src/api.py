@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .bot import bot
 from . import db
+from . import db_shadow
 from .whale_tracker import WhaleTracker
 from . import live_clob
 from .markets import (
@@ -493,6 +494,18 @@ def get_live_attempts(limit: int = 100):
 def get_live_attempt_summary():
     """Aggregate failed live attempts for dashboard cards."""
     return {"ok": True, "summary": db.get_live_order_attempt_summary()}
+
+
+@app.get("/api/bot/maker-shadow/attempts")
+def get_maker_shadow_attempts(limit: int = 100):
+    """Recent maker-shadow execution attempts for dashboard/replay audit."""
+    return {"ok": True, "attempts": db_shadow.recent_attempts(limit=limit)}
+
+
+@app.get("/api/bot/maker-shadow/summary")
+def get_maker_shadow_summary():
+    """Aggregate maker-shadow execution attempt health over the last 24h."""
+    return {"ok": True, "summary": db_shadow.summary_24h()}
 
 
 @app.get("/api/bot/rtds-reference-comparisons")

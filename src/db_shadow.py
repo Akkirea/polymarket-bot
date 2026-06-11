@@ -193,3 +193,76 @@ def counts_24h() -> dict:
         "filled_conservative_24h": _g("filled_cons", 2),
         "cancelled_24h": _g("cancelled", 3),
     }
+
+
+def recent_attempts(limit: int = 100) -> list[dict]:
+    """Return recent maker-shadow execution attempts for dashboard/replay audit."""
+    _ensure_table()
+    limit = max(1, min(int(limit), 500))
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT *
+                 FROM maker_shadow_attempts
+                ORDER BY dispatched_at DESC
+                LIMIT %s""",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def summary_24h() -> dict:
+    """Aggregate maker-shadow execution attempt health over the last 24h."""
+    _ensure_table()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            """SELECT
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN cancel_reason IS NULL
+                              AND hypothetical_filled_aggressive=0
+                              AND hypothetical_filled_conservative=0 THEN 1 ELSE 0 END) AS open_count,
+                   SUM(CASE WHEN hypothetical_filled_aggressive=1 THEN 1 ELSE 0 END) AS filled_aggr,
+                   SUM(CASE WHEN hypothetical_filled_conservative=1 THEN 1 ELSE 0 END) AS filled_cons,
+                   SUM(CASE WHEN cancel_reason IS NOT NULL THEN 1 ELSE 0 END) AS cancelled,
+                   COALESCE(AVG(queue_ahead_at_placement), 0) AS avg_queue_ahead,
+                   COALESCE(AVG(reprices_count), 0) AS avg_reprices,
+                   COALESCE(SUM(direction_rejections), 0) AS direction_rejections
+                 FROM maker_shadow_attempts
+                WHERE dispatched_at >= %s""",
+            (cutoff,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {
+            "total": 0,
+            "open": 0,
+            "filled_aggressive": 0,
+            "filled_conservative": 0,
+            "cancelled": 0,
+            "fill_rate_aggressive": 0.0,
+            "fill_rate_conservative": 0.0,
+            "avg_queue_ahead": 0.0,
+            "avg_reprices": 0.0,
+            "direction_rejections": 0,
+        }
+
+    total = int(row["total"] or 0)
+    filled_aggr = int(row["filled_aggr"] or 0)
+    filled_cons = int(row["filled_cons"] or 0)
+    return {
+        "total": total,
+        "open": int(row["open_count"] or 0),
+        "filled_aggressive": filled_aggr,
+        "filled_conservative": filled_cons,
+        "cancelled": int(row["cancelled"] or 0),
+        "fill_rate_aggressive": round(filled_aggr / total, 4) if total else 0.0,
+        "fill_rate_conservative": round(filled_cons / total, 4) if total else 0.0,
+        "avg_queue_ahead": round(float(row["avg_queue_ahead"] or 0.0), 4),
+        "avg_reprices": round(float(row["avg_reprices"] or 0.0), 4),
+        "direction_rejections": int(row["direction_rejections"] or 0),
+    }
