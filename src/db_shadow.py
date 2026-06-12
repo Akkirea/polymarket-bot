@@ -213,6 +213,87 @@ def recent_attempts(limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def load_unresolved_attempt_markets(limit: int = 200) -> list[dict]:
+    """Return distinct maker-shadow markets that still need settlement annotation."""
+    _ensure_table()
+    limit = max(1, min(int(limit), 500))
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT market_slug, MAX(dispatched_at) AS latest_at
+                 FROM maker_shadow_attempts
+                WHERE settlement_outcome IS NULL
+                GROUP BY market_slug
+                ORDER BY latest_at DESC
+                LIMIT %s""",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def settle_attempts_for_market(
+    market_slug: str,
+    winner: str,
+) -> dict:
+    """Annotate maker-shadow attempts for a resolved market and compute model P&L."""
+    _ensure_table()
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT id, side, intended_size_usdc, hypothetical_fill_price,
+                      hypothetical_filled_aggressive, hypothetical_filled_conservative
+                 FROM maker_shadow_attempts
+                WHERE market_slug = %s
+                  AND settlement_outcome IS NULL""",
+            (market_slug,),
+        ).fetchall()
+        updated = 0
+        aggr_pnl_total = 0.0
+        cons_pnl_total = 0.0
+        for row in rows:
+            side = row["side"]
+            stake = float(row["intended_size_usdc"] or 0.0)
+            fill_price = float(row["hypothetical_fill_price"] or 0.0)
+            if fill_price <= 0:
+                fill_price = 0.5
+            won = side == winner
+
+            aggr_filled = int(row["hypothetical_filled_aggressive"] or 0) == 1
+            cons_filled = int(row["hypothetical_filled_conservative"] or 0) == 1
+            aggr_pnl = stake * (1.0 / fill_price - 1.0) if (aggr_filled and won) else (-stake if aggr_filled else 0.0)
+            cons_pnl = stake * (1.0 / fill_price - 1.0) if (cons_filled and won) else (-stake if cons_filled else 0.0)
+            aggr_pnl_total += aggr_pnl
+            cons_pnl_total += cons_pnl
+
+            conn.execute(
+                """UPDATE maker_shadow_attempts
+                      SET settlement_outcome = %s,
+                          hypothetical_pnl_aggressive = %s,
+                          hypothetical_pnl_conservative = %s
+                    WHERE id = %s""",
+                (
+                    winner,
+                    round(aggr_pnl, 4),
+                    round(cons_pnl, 4),
+                    row["id"],
+                ),
+            )
+            updated += 1
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+    return {
+        "count": updated,
+        "hypothetical_pnl_aggressive": round(aggr_pnl_total, 4),
+        "hypothetical_pnl_conservative": round(cons_pnl_total, 4),
+    }
+
+
 def summary_24h() -> dict:
     """Aggregate maker-shadow execution attempt health over the last 24h."""
     _ensure_table()
@@ -228,6 +309,10 @@ def summary_24h() -> dict:
                    SUM(CASE WHEN hypothetical_filled_aggressive=1 THEN 1 ELSE 0 END) AS filled_aggr,
                    SUM(CASE WHEN hypothetical_filled_conservative=1 THEN 1 ELSE 0 END) AS filled_cons,
                    SUM(CASE WHEN cancel_reason IS NOT NULL THEN 1 ELSE 0 END) AS cancelled,
+                   SUM(CASE WHEN settlement_outcome IS NOT NULL THEN 1 ELSE 0 END) AS settled,
+                   SUM(CASE WHEN settlement_outcome IS NOT NULL AND side=settlement_outcome THEN 1 ELSE 0 END) AS won,
+                   COALESCE(SUM(hypothetical_pnl_aggressive), 0) AS pnl_aggr,
+                   COALESCE(SUM(hypothetical_pnl_conservative), 0) AS pnl_cons,
                    COALESCE(AVG(queue_ahead_at_placement), 0) AS avg_queue_ahead,
                    COALESCE(AVG(reprices_count), 0) AS avg_reprices,
                    COALESCE(SUM(direction_rejections), 0) AS direction_rejections
@@ -246,6 +331,11 @@ def summary_24h() -> dict:
             "cancelled": 0,
             "fill_rate_aggressive": 0.0,
             "fill_rate_conservative": 0.0,
+            "settled": 0,
+            "won": 0,
+            "win_rate": 0.0,
+            "hypothetical_pnl_aggressive": 0.0,
+            "hypothetical_pnl_conservative": 0.0,
             "avg_queue_ahead": 0.0,
             "avg_reprices": 0.0,
             "direction_rejections": 0,
@@ -254,6 +344,8 @@ def summary_24h() -> dict:
     total = int(row["total"] or 0)
     filled_aggr = int(row["filled_aggr"] or 0)
     filled_cons = int(row["filled_cons"] or 0)
+    settled = int(row["settled"] or 0)
+    won = int(row["won"] or 0)
     return {
         "total": total,
         "open": int(row["open_count"] or 0),
@@ -262,6 +354,11 @@ def summary_24h() -> dict:
         "cancelled": int(row["cancelled"] or 0),
         "fill_rate_aggressive": round(filled_aggr / total, 4) if total else 0.0,
         "fill_rate_conservative": round(filled_cons / total, 4) if total else 0.0,
+        "settled": settled,
+        "won": won,
+        "win_rate": round(won / settled, 4) if settled else 0.0,
+        "hypothetical_pnl_aggressive": round(float(row["pnl_aggr"] or 0.0), 4),
+        "hypothetical_pnl_conservative": round(float(row["pnl_cons"] or 0.0), 4),
         "avg_queue_ahead": round(float(row["avg_queue_ahead"] or 0.0), 4),
         "avg_reprices": round(float(row["avg_reprices"] or 0.0), 4),
         "direction_rejections": int(row["direction_rejections"] or 0),

@@ -346,6 +346,7 @@ class PaperBot:
         self._funding_rate: Optional[float] = None
         self._funding_rate_updated_at: float = 0.0
         self._funding_rate_source: Optional[str] = None
+        self._last_maker_shadow_attempt_reconcile: float = 0.0
         if self._pre_signal_orders:
             print(
                 f"[bot] Restored {len(self._pre_signal_orders)} resting pre-signal order(s) from DB: "
@@ -429,6 +430,7 @@ class PaperBot:
         loop.create_task(self._reconcile_unresolved_trades())
         loop.create_task(self._reconcile_unresolved_shadow_trades())
         loop.create_task(self._reconcile_unresolved_live_attempts())
+        loop.create_task(self._reconcile_unresolved_maker_shadow_attempts())
         self._task = loop.create_task(self._loop())
         print("[bot] Started — task created")
 
@@ -719,6 +721,9 @@ class PaperBot:
         print(f"[bot] _tick called  positions={len(self.positions)}", flush=True)
         # Continuously collect finalPrices for recent closed markets, independent of position state
         await self._collect_final_prices()
+        if EXEC_MODE == "maker_shadow" and time.time() - self._last_maker_shadow_attempt_reconcile >= 60.0:
+            self._last_maker_shadow_attempt_reconcile = time.time()
+            await self._reconcile_unresolved_maker_shadow_attempts()
 
         # Keep fallback history warm when Binance is stale/disconnected so the
         # 5s/10s momentum checks still have usable samples.
@@ -3715,6 +3720,40 @@ class PaperBot:
             )
         if settled_count:
             print(f"[bot] live attempts reconcile: settled {settled_count} failed attempt(s)", flush=True)
+
+    async def _reconcile_unresolved_maker_shadow_attempts(self) -> None:
+        if EXEC_MODE != "maker_shadow":
+            return
+        try:
+            unresolved = db_shadow.load_unresolved_attempt_markets()
+        except Exception as exc:
+            print(f"[bot] maker-shadow attempts reconcile: load failed: {exc}", flush=True)
+            return
+        if not unresolved:
+            return
+        print(f"[bot] maker-shadow attempts reconcile: checking {len(unresolved)} market(s)", flush=True)
+        settled_count = 0
+        for row in unresolved:
+            slug = row["market_slug"]
+            start_ts = _extract_start_ts(slug)
+            if start_ts is None:
+                continue
+            end_ts = start_ts + float(_market_interval(slug))
+            winner, _final_price, _poly_price_to_beat = await self._resolve_market(slug, end_ts)
+            if winner is None:
+                continue
+            settled = db_shadow.settle_attempts_for_market(slug, winner)
+            count = int(settled.get("count") or 0)
+            if count:
+                settled_count += count
+                print(
+                    f"[bot] maker-shadow attempts: {slug} settled → {winner} "
+                    f"rows={count} aggr_pnl=${settled.get('hypothetical_pnl_aggressive', 0):+.2f} "
+                    f"cons_pnl=${settled.get('hypothetical_pnl_conservative', 0):+.2f}",
+                    flush=True,
+                )
+        if settled_count:
+            print(f"[bot] maker-shadow attempts reconcile: settled {settled_count} attempt(s)", flush=True)
 
     async def _reconcile_unresolved_shadow_trades(self) -> None:
         unresolved = db.load_unresolved_shadow_trades()
