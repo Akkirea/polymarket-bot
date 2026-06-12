@@ -75,6 +75,11 @@ REASONS: tuple = (
     # Post-signal vetoes after _evaluate_signals returned ENTRY.
     "post_signal_crowd_band",
     "post_signal_early_confirm",
+    # Maker-shadow-only data collection lane. Never eligible for maker_live.
+    "shadow_sample_dispatched",
+    "shadow_sample_reject_cap",
+    "shadow_sample_reject_band",
+    "shadow_sample_reject_duplicate",
 )
 
 

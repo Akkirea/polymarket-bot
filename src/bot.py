@@ -94,6 +94,17 @@ MAKER_SHADOW_LOCAL_REFERENCE_SUFFIX = "local-reference"
 MAKER_SHADOW_REQUIRE_BOOT_READY = os.getenv(
     "MAKER_SHADOW_REQUIRE_BOOT_READY", "false"
 ).lower() == "true"
+MAKER_SHADOW_SAMPLING_ENABLED = os.getenv(
+    "MAKER_SHADOW_SAMPLING_ENABLED", "true"
+).lower() == "true"
+MAKER_SHADOW_SAMPLE_STRATEGY = "btc5-maker-shadow-sample-rtds-nearmiss"
+MAKER_SHADOW_SAMPLE_MIN_DIFF = float(os.getenv("MAKER_SHADOW_SAMPLE_MIN_DIFF", "15"))
+MAKER_SHADOW_SAMPLE_MAX_DIFF = float(os.getenv("MAKER_SHADOW_SAMPLE_MAX_DIFF", "30"))
+MAKER_SHADOW_SAMPLE_WINDOW_LO = float(os.getenv("MAKER_SHADOW_SAMPLE_WINDOW_LO", "60"))
+MAKER_SHADOW_SAMPLE_WINDOW_HI = float(os.getenv("MAKER_SHADOW_SAMPLE_WINDOW_HI", "180"))
+MAKER_SHADOW_SAMPLE_MAX_PER_HOUR = int(os.getenv("MAKER_SHADOW_SAMPLE_MAX_PER_HOUR", "3"))
+MAKER_SHADOW_SAMPLE_MAX_PER_DAY = int(os.getenv("MAKER_SHADOW_SAMPLE_MAX_PER_DAY", "20"))
+MAKER_SHADOW_SAMPLE_STAKE = float(os.getenv("MAKER_SHADOW_SAMPLE_STAKE", "1.00"))
 # Kline (Binance 5m open) and RTDS prices are consistently ~$33/$30 ABOVE the actual
 # Chainlink Data Streams price Polymarket uses for settlement. Subtract this correction
 # so the reference used for diff and strategy tag reflects the real expected beat.
@@ -301,6 +312,8 @@ class PaperBot:
         self._shadow_dispatch_count: int = 0       # incremented by router dispatch
         self._live_balance_at_shadow_boot: Optional[float] = None
         self._entered_slugs: set = set()           # avoid re-entering the same market
+        self._maker_shadow_sampled_slugs: set = set()
+        self._maker_shadow_sample_times: list = []
         self._volume_retry_slugs: set = set()      # slugs that can retry after main-window low volume
         self._live_retry_slugs: set = set()        # slugs with a background live-fill worker
         self._pre_signal_orders: dict = {          # slug → pre-signal order dict
@@ -569,12 +582,26 @@ class PaperBot:
             self._shadow_ready
             or (EXEC_MODE == "maker_shadow" and not MAKER_SHADOW_REQUIRE_BOOT_READY)
         )
+        sample_now = time.time()
+        sample_times = [ts for ts in self._maker_shadow_sample_times if sample_now - ts < 86400]
+        sample_hour = sum(1 for ts in sample_times if sample_now - ts < 3600)
         return {
             "subscription": subscription,
             "exec_mode": EXEC_MODE,
             "ready": dispatch_ready,
             "boot_selfcheck_ready": self._shadow_ready,
             "requires_boot_selfcheck": MAKER_SHADOW_REQUIRE_BOOT_READY,
+            "sampling": {
+                "enabled": MAKER_SHADOW_SAMPLING_ENABLED,
+                "strategy": MAKER_SHADOW_SAMPLE_STRATEGY,
+                "diff_band": [MAKER_SHADOW_SAMPLE_MIN_DIFF, MAKER_SHADOW_SAMPLE_MAX_DIFF],
+                "window_sec": [MAKER_SHADOW_SAMPLE_WINDOW_LO, MAKER_SHADOW_SAMPLE_WINDOW_HI],
+                "max_per_hour": MAKER_SHADOW_SAMPLE_MAX_PER_HOUR,
+                "max_per_day": MAKER_SHADOW_SAMPLE_MAX_PER_DAY,
+                "count_1h": sample_hour,
+                "count_24h": len(sample_times),
+                "sampled_slugs": len(self._maker_shadow_sampled_slugs),
+            },
             "orders_open_in_memory": sim_snap.get("open_orders", 0),
             "orders_open_db": counts.get("open", 0),
             "orders_filled_aggressive_24h": counts.get("filled_aggressive_24h", 0),
@@ -1472,6 +1499,113 @@ class PaperBot:
         cutoff = time.time() - 360
         self._market_diff_history[slug] = [e for e in history if e[0] >= cutoff]
 
+    def _maker_shadow_sample_counts(self) -> tuple[int, int]:
+        now = time.time()
+        self._maker_shadow_sample_times = [
+            ts for ts in self._maker_shadow_sample_times if now - ts < 86400
+        ]
+        hour = sum(1 for ts in self._maker_shadow_sample_times if now - ts < 3600)
+        return hour, len(self._maker_shadow_sample_times)
+
+    async def _maybe_dispatch_maker_shadow_sample(
+        self,
+        *,
+        market: dict,
+        slug: str,
+        side: str,
+        side_price: float,
+        end_ts: float,
+        start_ts: Optional[float],
+        reference_price: float,
+        diff: float,
+        seconds_remaining: float,
+        reason: str,
+    ) -> bool:
+        """Dispatch a maker-shadow-only near-miss sample without opening paper state."""
+        if EXEC_MODE != "maker_shadow" or not MAKER_SHADOW_SAMPLING_ENABLED:
+            return False
+        if self._exec_router is None:
+            return False
+        if slug in self._maker_shadow_sampled_slugs:
+            attribution.bump("shadow_sample_reject_duplicate", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+            return False
+        if not (MAKER_SHADOW_SAMPLE_WINDOW_LO <= seconds_remaining <= MAKER_SHADOW_SAMPLE_WINDOW_HI):
+            return False
+        abs_diff = abs(float(diff))
+        if not (MAKER_SHADOW_SAMPLE_MIN_DIFF <= abs_diff <= MAKER_SHADOW_SAMPLE_MAX_DIFF):
+            attribution.bump("shadow_sample_reject_band", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+            return False
+        if not (CROWD_MIN <= side_price <= CROWD_MAX):
+            attribution.bump("shadow_sample_reject_band", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+            return False
+
+        hour_count, day_count = self._maker_shadow_sample_counts()
+        if (
+            hour_count >= MAKER_SHADOW_SAMPLE_MAX_PER_HOUR
+            or day_count >= MAKER_SHADOW_SAMPLE_MAX_PER_DAY
+        ):
+            attribution.bump("shadow_sample_reject_cap", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+            return False
+
+        try:
+            from .live_clob import token_for_side as _tfs_check
+            token_id = _tfs_check(market, side)
+        except Exception:
+            token_id = None
+        if token_id and self._clob_book_feed.is_subscribed(token_id):
+            age = self._clob_book_feed.get_token_age(token_id)
+            if age is None or age > 30.0:
+                age_str = "never" if age is None else f"{age:.1f}s"
+                print(
+                    f"[bot] MAKER-SHADOW SAMPLE SKIP: token={str(token_id)[:12]}.. "
+                    f"stale (age={age_str}, max=30s) slug={slug}",
+                    flush=True,
+                )
+                attribution.bump("token_stale", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+                return False
+
+        stake = _round_order_size(max(
+            MAKER_SHADOW_SAMPLE_STAKE,
+            LIVE_MIN_ORDER_SIZE,
+            CLOB_MIN_SHARES * max(side_price, 0.01),
+        ))
+        try:
+            handle = await self._exec_router.dispatch(
+                market=market,
+                slug=slug,
+                side=side,
+                stake=stake,
+                paper_entry_price=side_price,
+                seconds_remaining=seconds_remaining,
+                end_ts=end_ts,
+                diff_at_entry=diff,
+                price_to_beat=reference_price,
+                strategy=MAKER_SHADOW_SAMPLE_STRATEGY,
+                diff_now_getter=self._current_diff_for_slug,
+            )
+        except Exception as exc:
+            print(f"[bot] MAKER-SHADOW SAMPLE dispatch failed for {slug}: {exc}", flush=True)
+            attribution.bump("execution_disabled", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+            return False
+
+        if handle is None:
+            return False
+
+        self._maker_shadow_sampled_slugs.add(slug)
+        self._entered_slugs.add(slug)
+        self._volume_retry_slugs.discard(slug)
+        self._maker_shadow_sample_times.append(time.time())
+        self._record_diff_snapshot(slug, seconds_remaining, diff)
+        attribution.bump("shadow_sample_dispatched", strategy=MAKER_SHADOW_SAMPLE_STRATEGY)
+        self._shadow_dispatch_count += 1
+        print(
+            f"[bot] MAKER-SHADOW SAMPLE DISPATCH: {side} {slug} "
+            f"price={side_price:.3f} diff=${diff:+.2f} secs={seconds_remaining:.1f} "
+            f"stake=${stake:.2f} reason={reason}",
+            flush=True,
+        )
+        return True
+
     def _signal_maturity(self, slug: str, threshold: float = 50.0) -> dict:
         """Analyse diff history for a market.
 
@@ -1899,6 +2033,20 @@ class PaperBot:
             if not edge_ok:
                 print(f"[bot] LAG-FOLLOW RTDS LIVE SKIP: {slug} {edge_reason}", flush=True)
                 attribution.bump("lag_follow_reject_edge_filter", strategy="btc5-lag-follow-live")
+                sampled = await self._maybe_dispatch_maker_shadow_sample(
+                    market=market,
+                    slug=slug,
+                    side=side,
+                    side_price=side_price,
+                    end_ts=end_ts,
+                    start_ts=start_ts,
+                    reference_price=reference_price,
+                    diff=diff,
+                    seconds_remaining=seconds_remaining,
+                    reason=edge_reason,
+                )
+                if sampled:
+                    return True
                 return False
             print(f"[bot] LAG-FOLLOW RTDS LIVE edge OK: {slug} {edge_reason}", flush=True)
         else:
