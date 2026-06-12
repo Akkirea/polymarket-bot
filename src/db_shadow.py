@@ -281,6 +281,7 @@ def recent_attempts(limit: int = 100) -> list[dict]:
     limit = max(1, min(int(limit), 500))
     conn = db.get_connection()
     try:
+        _repair_recent_settled_pnl(conn)
         rows = conn.execute(
             """WITH logical AS (
                    SELECT *
@@ -406,6 +407,7 @@ def summary_24h() -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     conn = db.get_connection()
     try:
+        _repair_recent_settled_pnl(conn)
         row = conn.execute(
             """WITH logical AS (
                    SELECT *
