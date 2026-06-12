@@ -11,6 +11,7 @@ from . import db
 
 _init_lock = threading.Lock()
 _initialised = False
+_REPAIR_PNL_HOURS = 48
 
 
 def _pk_type() -> str:
@@ -90,9 +91,63 @@ def _ensure_table() -> None:
                 except Exception:
                     # Column already exists (or unsupported syntax) — ignore.
                     pass
+            _repair_recent_settled_pnl(conn)
         finally:
             conn.close()
         _initialised = True
+
+
+def _pnl_for_fill(side: str, winner: str, fill_notional: float, fill_price: float) -> float:
+    if fill_notional <= 0:
+        return 0.0
+    if fill_price <= 0:
+        fill_price = 0.5
+    if side == winner:
+        return fill_notional * (1.0 / fill_price - 1.0)
+    return -fill_notional
+
+
+def _repair_recent_settled_pnl(conn) -> None:
+    """Backfill old settled rows to use actual filled notional instead of intended stake."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=_REPAIR_PNL_HOURS)).isoformat()
+    try:
+        rows = conn.execute(
+            """SELECT id, side, settlement_outcome, hypothetical_fill_price,
+                      hypothetical_size_filled_usdc,
+                      hypothetical_filled_aggressive, hypothetical_filled_conservative,
+                      hypothetical_pnl_aggressive, hypothetical_pnl_conservative
+                 FROM maker_shadow_attempts
+                WHERE dispatched_at >= %s
+                  AND settlement_outcome IS NOT NULL""",
+            (cutoff,),
+        ).fetchall()
+    except Exception:
+        return
+    for row in rows:
+        fill_notional = float(row["hypothetical_size_filled_usdc"] or 0.0)
+        fill_price = float(row["hypothetical_fill_price"] or 0.0)
+        winner = row["settlement_outcome"]
+        side = row["side"]
+        aggr_filled = int(row["hypothetical_filled_aggressive"] or 0) == 1
+        cons_filled = int(row["hypothetical_filled_conservative"] or 0) == 1
+        aggr_pnl = _pnl_for_fill(side, winner, fill_notional, fill_price) if aggr_filled else 0.0
+        cons_pnl = _pnl_for_fill(side, winner, fill_notional, fill_price) if cons_filled else 0.0
+        if (
+            round(float(row["hypothetical_pnl_aggressive"] or 0.0), 4) == round(aggr_pnl, 4)
+            and round(float(row["hypothetical_pnl_conservative"] or 0.0), 4) == round(cons_pnl, 4)
+        ):
+            continue
+        conn.execute(
+            """UPDATE maker_shadow_attempts
+                  SET hypothetical_pnl_aggressive = %s,
+                      hypothetical_pnl_conservative = %s
+                WHERE id = %s""",
+            (round(aggr_pnl, 4), round(cons_pnl, 4), row["id"]),
+        )
+    try:
+        conn.commit()
+    except Exception:
+        pass
 
 
 _INSERT_COLS = [
@@ -162,14 +217,39 @@ def counts_24h() -> dict:
     conn = db.get_connection()
     try:
         rows = conn.execute(
-            "SELECT "
-            " SUM(CASE WHEN cancel_reason IS NULL "
-            "          AND hypothetical_filled_conservative=0 "
-            "          AND hypothetical_filled_aggressive=0 THEN 1 ELSE 0 END) AS open_count, "
-            " SUM(CASE WHEN hypothetical_filled_aggressive=1 THEN 1 ELSE 0 END) AS filled_aggr, "
-            " SUM(CASE WHEN hypothetical_filled_conservative=1 THEN 1 ELSE 0 END) AS filled_cons, "
-            " SUM(CASE WHEN cancel_reason IS NOT NULL THEN 1 ELSE 0 END) AS cancelled "
-            "FROM maker_shadow_attempts WHERE dispatched_at >= %s",
+            """WITH logical AS (
+                   SELECT *
+                     FROM maker_shadow_attempts msa
+                    WHERE dispatched_at >= %s
+                      AND (
+                           hypothetical_filled_aggressive = 1
+                        OR hypothetical_filled_conservative = 1
+                        OR (
+                             NOT EXISTS (
+                                 SELECT 1
+                                   FROM maker_shadow_attempts f
+                                  WHERE f.market_slug = msa.market_slug
+                                    AND f.side = msa.side
+                                    AND (f.hypothetical_filled_aggressive = 1
+                                      OR f.hypothetical_filled_conservative = 1)
+                             )
+                             AND msa.id = (
+                                 SELECT MAX(last_row.id)
+                                   FROM maker_shadow_attempts last_row
+                                  WHERE last_row.market_slug = msa.market_slug
+                                    AND last_row.side = msa.side
+                             )
+                           )
+                      )
+               )
+               SELECT
+                   SUM(CASE WHEN cancel_reason IS NULL
+                              AND hypothetical_filled_conservative=0
+                              AND hypothetical_filled_aggressive=0 THEN 1 ELSE 0 END) AS open_count,
+                   SUM(CASE WHEN hypothetical_filled_aggressive=1 THEN 1 ELSE 0 END) AS filled_aggr,
+                   SUM(CASE WHEN hypothetical_filled_conservative=1 THEN 1 ELSE 0 END) AS filled_cons,
+                   SUM(CASE WHEN cancel_reason IS NOT NULL THEN 1 ELSE 0 END) AS cancelled
+                 FROM logical""",
             (cutoff,),
         ).fetchall()
     finally:
@@ -202,8 +282,30 @@ def recent_attempts(limit: int = 100) -> list[dict]:
     conn = db.get_connection()
     try:
         rows = conn.execute(
-            """SELECT *
-                 FROM maker_shadow_attempts
+            """WITH logical AS (
+                   SELECT *
+                     FROM maker_shadow_attempts msa
+                    WHERE hypothetical_filled_aggressive = 1
+                       OR hypothetical_filled_conservative = 1
+                       OR (
+                            NOT EXISTS (
+                                SELECT 1
+                                  FROM maker_shadow_attempts f
+                                 WHERE f.market_slug = msa.market_slug
+                                   AND f.side = msa.side
+                                   AND (f.hypothetical_filled_aggressive = 1
+                                     OR f.hypothetical_filled_conservative = 1)
+                            )
+                            AND msa.id = (
+                                SELECT MAX(last_row.id)
+                                  FROM maker_shadow_attempts last_row
+                                 WHERE last_row.market_slug = msa.market_slug
+                                   AND last_row.side = msa.side
+                            )
+                          )
+               )
+               SELECT *
+                 FROM logical
                 ORDER BY dispatched_at DESC
                 LIMIT %s""",
             (limit,),
@@ -243,6 +345,7 @@ def settle_attempts_for_market(
     try:
         rows = conn.execute(
             """SELECT id, side, intended_size_usdc, hypothetical_fill_price,
+                      hypothetical_size_filled_usdc,
                       hypothetical_filled_aggressive, hypothetical_filled_conservative
                  FROM maker_shadow_attempts
                 WHERE market_slug = %s
@@ -254,7 +357,8 @@ def settle_attempts_for_market(
         cons_pnl_total = 0.0
         for row in rows:
             side = row["side"]
-            stake = float(row["intended_size_usdc"] or 0.0)
+            fill_notional = float(row["hypothetical_size_filled_usdc"] or 0.0)
+            fallback_stake = float(row["intended_size_usdc"] or 0.0)
             fill_price = float(row["hypothetical_fill_price"] or 0.0)
             if fill_price <= 0:
                 fill_price = 0.5
@@ -262,8 +366,10 @@ def settle_attempts_for_market(
 
             aggr_filled = int(row["hypothetical_filled_aggressive"] or 0) == 1
             cons_filled = int(row["hypothetical_filled_conservative"] or 0) == 1
-            aggr_pnl = stake * (1.0 / fill_price - 1.0) if (aggr_filled and won) else (-stake if aggr_filled else 0.0)
-            cons_pnl = stake * (1.0 / fill_price - 1.0) if (cons_filled and won) else (-stake if cons_filled else 0.0)
+            aggr_notional = fill_notional if fill_notional > 0 else fallback_stake
+            cons_notional = fill_notional if fill_notional > 0 else fallback_stake
+            aggr_pnl = _pnl_for_fill(side, winner, aggr_notional, fill_price) if aggr_filled else 0.0
+            cons_pnl = _pnl_for_fill(side, winner, cons_notional, fill_price) if cons_filled else 0.0
             aggr_pnl_total += aggr_pnl
             cons_pnl_total += cons_pnl
 
@@ -301,7 +407,32 @@ def summary_24h() -> dict:
     conn = db.get_connection()
     try:
         row = conn.execute(
-            """SELECT
+            """WITH logical AS (
+                   SELECT *
+                     FROM maker_shadow_attempts msa
+                    WHERE dispatched_at >= %s
+                      AND (
+                           hypothetical_filled_aggressive = 1
+                        OR hypothetical_filled_conservative = 1
+                        OR (
+                             NOT EXISTS (
+                                 SELECT 1
+                                   FROM maker_shadow_attempts f
+                                  WHERE f.market_slug = msa.market_slug
+                                    AND f.side = msa.side
+                                    AND (f.hypothetical_filled_aggressive = 1
+                                      OR f.hypothetical_filled_conservative = 1)
+                             )
+                             AND msa.id = (
+                                 SELECT MAX(last_row.id)
+                                   FROM maker_shadow_attempts last_row
+                                  WHERE last_row.market_slug = msa.market_slug
+                                    AND last_row.side = msa.side
+                             )
+                           )
+                      )
+               )
+               SELECT
                    COUNT(*) AS total,
                    SUM(CASE WHEN cancel_reason IS NULL
                               AND hypothetical_filled_aggressive=0
@@ -316,8 +447,7 @@ def summary_24h() -> dict:
                    COALESCE(AVG(queue_ahead_at_placement), 0) AS avg_queue_ahead,
                    COALESCE(AVG(reprices_count), 0) AS avg_reprices,
                    COALESCE(SUM(direction_rejections), 0) AS direction_rejections
-                 FROM maker_shadow_attempts
-                WHERE dispatched_at >= %s""",
+                 FROM logical""",
             (cutoff,),
         ).fetchone()
     finally:

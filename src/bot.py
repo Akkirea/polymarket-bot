@@ -1184,6 +1184,9 @@ class PaperBot:
         else:
             slug = str(pos_or_slug)
 
+        if EXEC_MODE == "maker_shadow" and strategy == MAKER_SHADOW_SAMPLE_STRATEGY:
+            return
+
         try:
             db.log_live_order_attempt({
                 "market_slug": slug,

@@ -121,6 +121,12 @@ class MakerExecutor:
                 continue
             try:
                 await asyncio.wait_for(self._cancel_fn(oid), timeout=CANCEL_TIMEOUT_SEC)
+                if self._exec_mode == "maker_shadow":
+                    try:
+                        from .. import db_shadow
+                        db_shadow.update_attempt(oid, {"cancel_reason": reason})
+                    except Exception:
+                        pass
                 print(
                     f"[maker:{self._exec_mode}] CANCEL {self.slug} {self.plan.side} "
                     f"order_id={oid} reason={reason}",

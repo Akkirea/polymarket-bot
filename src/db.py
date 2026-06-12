@@ -19,6 +19,7 @@ from . import config
 # ── Backend detection ──────────────────────────────────────────────────────────
 _DATABASE_URL = os.environ.get("DATABASE_URL")
 _USE_PG       = bool(_DATABASE_URL)
+_MAKER_SHADOW_SAMPLE_STRATEGY = "btc5-maker-shadow-sample-rtds-nearmiss"
 
 if _USE_PG:
     import psycopg2
@@ -487,9 +488,10 @@ def load_unresolved_live_order_attempts(limit: int = 500) -> list:
         """SELECT market_slug, side, paper_entry_price
              FROM live_order_attempts
             WHERE outcome = 'unresolved'
+              AND COALESCE(strategy, '') != %s
             ORDER BY attempted_at DESC
             LIMIT %s""",
-        (limit,),
+        (_MAKER_SHADOW_SAMPLE_STRATEGY, limit),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -507,8 +509,9 @@ def settle_live_order_attempts(
         """SELECT id, side, intended_stake, paper_entry_price
              FROM live_order_attempts
             WHERE market_slug = %s
-              AND outcome = 'unresolved'""",
-        (market_slug,),
+              AND outcome = 'unresolved'
+              AND COALESCE(strategy, '') != %s""",
+        (market_slug, _MAKER_SHADOW_SAMPLE_STRATEGY),
     ).fetchall()
     updated = 0
     for row in rows:
@@ -553,6 +556,7 @@ def get_live_order_attempts(limit: int = 100) -> list:
              JOIN (
                    SELECT market_slug, side, COALESCE(strategy, '') AS strategy_key, MAX(attempted_at) AS latest_at
                      FROM live_order_attempts
+                    WHERE COALESCE(strategy, '') != %s
                     GROUP BY market_slug, side, COALESCE(strategy, '')
                   ) latest
                ON latest.market_slug = loa.market_slug
@@ -561,7 +565,7 @@ def get_live_order_attempts(limit: int = 100) -> list:
               AND latest.latest_at = loa.attempted_at
             ORDER BY loa.attempted_at DESC
             LIMIT %s""",
-        (limit,),
+        (_MAKER_SHADOW_SAMPLE_STRATEGY, limit),
     ).fetchall()
     conn.close()
     attempts = []
@@ -583,6 +587,7 @@ def get_live_order_attempt_summary() -> dict:
         WITH latest AS (
             SELECT market_slug, side, COALESCE(strategy, '') AS strategy_key, MAX(attempted_at) AS latest_at
               FROM live_order_attempts
+             WHERE COALESCE(strategy, '') != '{_MAKER_SHADOW_SAMPLE_STRATEGY}'
              GROUP BY market_slug, side, COALESCE(strategy, '')
         )
         SELECT loa.*
