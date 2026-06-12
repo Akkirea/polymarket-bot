@@ -583,7 +583,7 @@ def get_live_order_attempts(limit: int = 100) -> list:
 def get_live_order_attempt_summary() -> dict:
     """Aggregate missed live opportunities by latest attempt per market/side/strategy."""
     conn = get_connection()
-    deduped_sql = """
+    deduped_sql = f"""
         WITH latest AS (
             SELECT market_slug, side, COALESCE(strategy, '') AS strategy_key, MAX(attempted_at) AS latest_at
               FROM live_order_attempts
