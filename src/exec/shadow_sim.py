@@ -16,6 +16,8 @@ from .. import db_shadow
 
 EPS = 1e-9
 ELIGIBILITY_DELAY_SEC = 0.5
+POST_FILL_HORIZONS_SEC = (1.0, 3.0, 5.0, 10.0)
+POST_FILL_MAX_SEC = max(POST_FILL_HORIZONS_SEC)
 
 
 @dataclass
@@ -45,6 +47,7 @@ class _ShadowOrder:
     queue_cleared_before_fill: float = 0.0            # shares of queue consumed before our fill
     direction_rejections: int = 0                     # count of wrong-aggressor prints ignored
     trade_aggressor_side_on_fill: Optional[str] = None
+    post_fill_recorded: set[float] = field(default_factory=set)
     fill_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -149,9 +152,13 @@ class ShadowFillSimulator:
         ids = self._orders_by_token.get(tok)
         if not ids:
             return
+        mark_price = float(bid_price) if bid_price is not None else None
         for oid in list(ids):
             o = self._orders.get(oid)
-            if o is None or o.cancelled or o.filled_aggressive:
+            if o is None or o.cancelled:
+                continue
+            if o.filled_aggressive:
+                self._maybe_record_post_fill_mark(o, time.time(), mark_price)
                 continue
             o.book_updates_during_window += 1
             if bid_price is None:
@@ -202,7 +209,10 @@ class ShadowFillSimulator:
 
         for oid in list(ids):
             o = self._orders.get(oid)
-            if o is None or o.cancelled or o.filled_aggressive:
+            if o is None or o.cancelled:
+                continue
+            if o.filled_aggressive:
+                self._maybe_record_post_fill_mark(o, t_trade, price)
                 continue
             o.trade_prints_during_window += 1
             if t_trade < o.placed_at + ELIGIBILITY_DELAY_SEC:
@@ -275,8 +285,6 @@ class ShadowFillSimulator:
                 o.fill_price = o.limit_price
                 o.fill_at = ts
 
-        fully = o.size_filled_shares + EPS >= max_shares
-
         try:
             db_shadow.update_attempt(o.order_id, {
                 "hypothetical_filled_aggressive": 1 if o.filled_aggressive else 0,
@@ -297,9 +305,40 @@ class ShadowFillSimulator:
         except Exception as exc:
             print(f"[shadow-sim] db update failed for {o.order_id}: {exc}", flush=True)
 
-        if o.filled_aggressive and fully and not o.fill_event.is_set():
+        if o.filled_aggressive and not o.fill_event.is_set():
             o.fill_event.set()
+            self._maybe_record_post_fill_mark(o, ts, o.fill_price)
+
+    def _maybe_record_post_fill_mark(
+        self,
+        o: _ShadowOrder,
+        ts: float,
+        mark_price: Optional[float],
+    ) -> None:
+        """Record token-price movement after fill to quantify adverse selection."""
+        if not o.filled_aggressive or o.fill_at is None:
+            return
+        age = max(0.0, float(ts) - float(o.fill_at))
+        fill_price = float(o.fill_price or o.limit_price or 0.0)
+        fields = {}
+        if mark_price is not None and mark_price > 0 and fill_price > 0:
+            mark = round(float(mark_price), 4)
+            delta = round(mark - fill_price, 4)
+            for horizon in POST_FILL_HORIZONS_SEC:
+                if age + EPS < horizon or horizon in o.post_fill_recorded:
+                    continue
+                suffix = str(int(horizon))
+                fields[f"post_fill_mark_{suffix}s"] = mark
+                fields[f"post_fill_delta_{suffix}s"] = delta
+                o.post_fill_recorded.add(horizon)
+        if fields:
+            try:
+                db_shadow.update_attempt(o.order_id, fields)
+            except Exception as exc:
+                print(f"[shadow-sim] post-fill mark write failed for {o.order_id}: {exc}", flush=True)
+        if age >= POST_FILL_MAX_SEC:
             self._orders_by_token.get(o.token_id, set()).discard(o.order_id)
+            self._orders.pop(o.order_id, None)
 
     # ── ClobUserFeed-compatible API ──────────────────────────────────────────
 

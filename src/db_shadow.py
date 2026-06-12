@@ -60,7 +60,15 @@ def _ensure_table() -> None:
             queue_ahead_at_placement REAL,
             queue_cleared_before_fill REAL DEFAULT 0,
             trade_aggressor_side TEXT,
-            direction_rejections INTEGER DEFAULT 0
+            direction_rejections INTEGER DEFAULT 0,
+            post_fill_mark_1s REAL,
+            post_fill_delta_1s REAL,
+            post_fill_mark_3s REAL,
+            post_fill_delta_3s REAL,
+            post_fill_mark_5s REAL,
+            post_fill_delta_5s REAL,
+            post_fill_mark_10s REAL,
+            post_fill_delta_10s REAL
         );
         CREATE INDEX IF NOT EXISTS idx_maker_shadow_slug ON maker_shadow_attempts(market_slug);
         CREATE INDEX IF NOT EXISTS idx_maker_shadow_dispatched ON maker_shadow_attempts(dispatched_at);
@@ -80,6 +88,14 @@ def _ensure_table() -> None:
                 "ALTER TABLE maker_shadow_attempts ADD COLUMN queue_cleared_before_fill REAL DEFAULT 0",
                 "ALTER TABLE maker_shadow_attempts ADD COLUMN trade_aggressor_side TEXT",
                 "ALTER TABLE maker_shadow_attempts ADD COLUMN direction_rejections INTEGER DEFAULT 0",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_1s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_1s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_3s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_3s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_5s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_5s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_10s REAL",
+                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_10s REAL",
             ]
             for stmt in migrations:
                 try:
@@ -187,6 +203,11 @@ _UPDATE_COLS = {
     # Fix 2 audit columns
     "queue_ahead_at_placement", "queue_cleared_before_fill",
     "trade_aggressor_side", "direction_rejections",
+    # Post-fill adverse-selection audit columns
+    "post_fill_mark_1s", "post_fill_delta_1s",
+    "post_fill_mark_3s", "post_fill_delta_3s",
+    "post_fill_mark_5s", "post_fill_delta_5s",
+    "post_fill_mark_10s", "post_fill_delta_10s",
 }
 
 
@@ -448,7 +469,11 @@ def summary_24h() -> dict:
                    COALESCE(SUM(hypothetical_pnl_conservative), 0) AS pnl_cons,
                    COALESCE(AVG(queue_ahead_at_placement), 0) AS avg_queue_ahead,
                    COALESCE(AVG(reprices_count), 0) AS avg_reprices,
-                   COALESCE(SUM(direction_rejections), 0) AS direction_rejections
+                   COALESCE(SUM(direction_rejections), 0) AS direction_rejections,
+                   AVG(post_fill_delta_1s) AS avg_post_fill_delta_1s,
+                   AVG(post_fill_delta_3s) AS avg_post_fill_delta_3s,
+                   AVG(post_fill_delta_5s) AS avg_post_fill_delta_5s,
+                   AVG(post_fill_delta_10s) AS avg_post_fill_delta_10s
                  FROM logical""",
             (cutoff,),
         ).fetchone()
@@ -471,6 +496,10 @@ def summary_24h() -> dict:
             "avg_queue_ahead": 0.0,
             "avg_reprices": 0.0,
             "direction_rejections": 0,
+            "avg_post_fill_delta_1s": None,
+            "avg_post_fill_delta_3s": None,
+            "avg_post_fill_delta_5s": None,
+            "avg_post_fill_delta_10s": None,
         }
 
     total = int(row["total"] or 0)
@@ -494,4 +523,20 @@ def summary_24h() -> dict:
         "avg_queue_ahead": round(float(row["avg_queue_ahead"] or 0.0), 4),
         "avg_reprices": round(float(row["avg_reprices"] or 0.0), 4),
         "direction_rejections": int(row["direction_rejections"] or 0),
+        "avg_post_fill_delta_1s": (
+            round(float(row["avg_post_fill_delta_1s"]), 4)
+            if row["avg_post_fill_delta_1s"] is not None else None
+        ),
+        "avg_post_fill_delta_3s": (
+            round(float(row["avg_post_fill_delta_3s"]), 4)
+            if row["avg_post_fill_delta_3s"] is not None else None
+        ),
+        "avg_post_fill_delta_5s": (
+            round(float(row["avg_post_fill_delta_5s"]), 4)
+            if row["avg_post_fill_delta_5s"] is not None else None
+        ),
+        "avg_post_fill_delta_10s": (
+            round(float(row["avg_post_fill_delta_10s"]), 4)
+            if row["avg_post_fill_delta_10s"] is not None else None
+        ),
     }
