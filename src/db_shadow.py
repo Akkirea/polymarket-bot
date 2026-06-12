@@ -83,19 +83,20 @@ def _ensure_table() -> None:
             # Fix 2 migration: ALTER existing deployments to add the new columns.
             # Postgres supports IF NOT EXISTS; SQLite errors on duplicate so we
             # swallow per-statement failures.
+            add_col = "ADD COLUMN IF NOT EXISTS" if getattr(db, "_USE_PG", False) else "ADD COLUMN"
             migrations = [
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN queue_ahead_at_placement REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN queue_cleared_before_fill REAL DEFAULT 0",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN trade_aggressor_side TEXT",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN direction_rejections INTEGER DEFAULT 0",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_1s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_1s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_3s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_3s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_5s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_5s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_mark_10s REAL",
-                "ALTER TABLE maker_shadow_attempts ADD COLUMN post_fill_delta_10s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} queue_ahead_at_placement REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} queue_cleared_before_fill REAL DEFAULT 0",
+                f"ALTER TABLE maker_shadow_attempts {add_col} trade_aggressor_side TEXT",
+                f"ALTER TABLE maker_shadow_attempts {add_col} direction_rejections INTEGER DEFAULT 0",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_mark_1s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_delta_1s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_mark_3s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_delta_3s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_mark_5s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_delta_5s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_mark_10s REAL",
+                f"ALTER TABLE maker_shadow_attempts {add_col} post_fill_delta_10s REAL",
             ]
             for stmt in migrations:
                 try:
@@ -106,6 +107,10 @@ def _ensure_table() -> None:
                         pass
                 except Exception:
                     # Column already exists (or unsupported syntax) — ignore.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     pass
             _repair_recent_settled_pnl(conn)
         finally:
