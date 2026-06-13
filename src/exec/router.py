@@ -24,6 +24,7 @@ REGIME_MID = "MID"
 REGIME_EARLY = "EARLY"
 
 HARD_KILL_SEC = float(os.getenv("EXEC_HARD_KILL_SEC", "30"))
+HARD_KILL_BUFFER_SEC = float(os.getenv("EXEC_HARD_KILL_BUFFER_SEC", "5"))
 LATE_AGGRESSIVE_SEC = float(os.getenv("EXEC_LATE_AGGRESSIVE_SEC", "45"))
 LATE_MAX_SEC = float(os.getenv("EXEC_LATE_MAX_SEC", "70"))
 MID_MAX_SEC = float(os.getenv("EXEC_MID_MAX_SEC", "120"))
@@ -42,7 +43,7 @@ class DispatchHandle:
 
 
 def _regime_for(seconds_remaining: float) -> str:
-    if seconds_remaining < HARD_KILL_SEC:
+    if seconds_remaining < HARD_KILL_SEC + HARD_KILL_BUFFER_SEC:
         return REGIME_DEAD
     if seconds_remaining < LATE_MAX_SEC:
         return REGIME_LATE
@@ -150,12 +151,21 @@ class ExecutionRouter:
         strategy: Optional[str],
         diff_now_getter: Callable[[str], Optional[float]],
     ) -> Optional[DispatchHandle]:
+        actual_seconds_remaining = max(0.0, float(end_ts) - time.time())
+        if abs(actual_seconds_remaining - float(seconds_remaining)) > 5.0:
+            print(
+                f"[exec-router] sec_rem corrected for {slug}: "
+                f"caller={seconds_remaining:.1f}s actual={actual_seconds_remaining:.1f}s",
+                flush=True,
+            )
+        seconds_remaining = actual_seconds_remaining
         regime = _regime_for(seconds_remaining)
         key = (slug, side)
         if regime == REGIME_DEAD:
             self._log_attempt(
                 slug, side, stake, paper_entry_price, paper_entry_price,
-                f"DEAD regime — sec_rem={seconds_remaining:.1f}s < {HARD_KILL_SEC:.0f}s",
+                f"DEAD regime — sec_rem={seconds_remaining:.1f}s < "
+                f"{HARD_KILL_SEC + HARD_KILL_BUFFER_SEC:.0f}s dispatch minimum",
                 seconds_remaining=seconds_remaining,
                 strategy=strategy,
                 diff_at_entry=diff_at_entry,
