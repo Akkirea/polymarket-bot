@@ -469,7 +469,22 @@ def summary_24h() -> dict:
                    SUM(CASE WHEN hypothetical_filled_conservative=1 THEN 1 ELSE 0 END) AS filled_cons,
                    SUM(CASE WHEN cancel_reason IS NOT NULL THEN 1 ELSE 0 END) AS cancelled,
                    SUM(CASE WHEN settlement_outcome IS NOT NULL THEN 1 ELSE 0 END) AS settled,
-                   SUM(CASE WHEN settlement_outcome IS NOT NULL AND side=settlement_outcome THEN 1 ELSE 0 END) AS won,
+                   SUM(CASE WHEN settlement_outcome IS NOT NULL
+                              AND (hypothetical_filled_aggressive=1 OR hypothetical_filled_conservative=1)
+                            THEN 1 ELSE 0 END) AS filled_settled,
+                   SUM(CASE WHEN settlement_outcome IS NOT NULL
+                              AND (hypothetical_filled_aggressive=1 OR hypothetical_filled_conservative=1)
+                              AND side=settlement_outcome
+                            THEN 1 ELSE 0 END) AS filled_won,
+                   SUM(CASE WHEN settlement_outcome IS NOT NULL
+                              AND hypothetical_filled_aggressive=0
+                              AND hypothetical_filled_conservative=0
+                            THEN 1 ELSE 0 END) AS missed_settled,
+                   SUM(CASE WHEN settlement_outcome IS NOT NULL
+                              AND hypothetical_filled_aggressive=0
+                              AND hypothetical_filled_conservative=0
+                              AND side=settlement_outcome
+                            THEN 1 ELSE 0 END) AS missed_won,
                    COALESCE(SUM(hypothetical_pnl_aggressive), 0) AS pnl_aggr,
                    COALESCE(SUM(hypothetical_pnl_conservative), 0) AS pnl_cons,
                    COALESCE(AVG(queue_ahead_at_placement), 0) AS avg_queue_ahead,
@@ -495,7 +510,12 @@ def summary_24h() -> dict:
             "fill_rate_conservative": 0.0,
             "settled": 0,
             "won": 0,
+            "filled_settled": 0,
+            "filled_won": 0,
             "win_rate": 0.0,
+            "missed_settled": 0,
+            "missed_won": 0,
+            "missed_win_rate": 0.0,
             "hypothetical_pnl_aggressive": 0.0,
             "hypothetical_pnl_conservative": 0.0,
             "avg_queue_ahead": 0.0,
@@ -511,7 +531,10 @@ def summary_24h() -> dict:
     filled_aggr = int(row["filled_aggr"] or 0)
     filled_cons = int(row["filled_cons"] or 0)
     settled = int(row["settled"] or 0)
-    won = int(row["won"] or 0)
+    filled_settled = int(row["filled_settled"] or 0)
+    filled_won = int(row["filled_won"] or 0)
+    missed_settled = int(row["missed_settled"] or 0)
+    missed_won = int(row["missed_won"] or 0)
     return {
         "total": total,
         "open": int(row["open_count"] or 0),
@@ -521,8 +544,13 @@ def summary_24h() -> dict:
         "fill_rate_aggressive": round(filled_aggr / total, 4) if total else 0.0,
         "fill_rate_conservative": round(filled_cons / total, 4) if total else 0.0,
         "settled": settled,
-        "won": won,
-        "win_rate": round(won / settled, 4) if settled else 0.0,
+        "won": filled_won,
+        "filled_settled": filled_settled,
+        "filled_won": filled_won,
+        "win_rate": round(filled_won / filled_settled, 4) if filled_settled else 0.0,
+        "missed_settled": missed_settled,
+        "missed_won": missed_won,
+        "missed_win_rate": round(missed_won / missed_settled, 4) if missed_settled else 0.0,
         "hypothetical_pnl_aggressive": round(float(row["pnl_aggr"] or 0.0), 4),
         "hypothetical_pnl_conservative": round(float(row["pnl_cons"] or 0.0), 4),
         "avg_queue_ahead": round(float(row["avg_queue_ahead"] or 0.0), 4),
