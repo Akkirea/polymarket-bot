@@ -121,6 +121,12 @@ PRE_SIGNAL_CANCEL_DIFF = float(os.getenv("PRE_SIGNAL_CANCEL_DIFF", "13"))
 LAG_FOLLOW_LIVE_ENABLED = os.getenv("LAG_FOLLOW_LIVE_ENABLED", "false").lower() == "true"
 LAG_FOLLOW_LIVE_MAX_PRICE = float(os.getenv("LAG_FOLLOW_LIVE_MAX_PRICE", "0.62"))
 EARLY_SHADOW_WINDOW  = (150, 240)
+EARLY_ACCEL_SHADOW_STRATEGY = "btc5-early-accel-continuation-shadow"
+EARLY_ACCEL_MIN_DIFF = float(os.getenv("EARLY_ACCEL_MIN_DIFF", "25"))
+EARLY_ACCEL_MAX_DIFF = float(os.getenv("EARLY_ACCEL_MAX_DIFF", "55"))
+EARLY_ACCEL_MIN_MOMENTUM_10S = float(os.getenv("EARLY_ACCEL_MIN_MOMENTUM_10S", "15"))
+EARLY_ACCEL_MIN_MOMENTUM_30S = float(os.getenv("EARLY_ACCEL_MIN_MOMENTUM_30S", "25"))
+EARLY_ACCEL_MAX_PRICE = float(os.getenv("EARLY_ACCEL_MAX_PRICE", "0.60"))
 RTDS_PREVCLOSE_LIVE_ENABLED = os.getenv("RTDS_PREVCLOSE_LIVE_ENABLED", "false").lower() == "true"
 HEDGED_SHADOW_WINDOW = (150, 300)
 HEDGED_DOMINANT_MIN  = 0.45
@@ -2404,6 +2410,28 @@ class PaperBot:
 
         # 2) Early momentum: enter before the obvious late signal if price is still tradable.
         early_lo, early_hi = EARLY_SHADOW_WINDOW
+        if early_lo <= seconds_remaining <= early_hi:
+            side = "Up" if diff > 0 else "Down"
+            side_price = _side_price(market, side)
+            abs_diff = abs(diff)
+            signed_momentum_10 = (
+                momentum_10 if side == "Up" else -momentum_10
+            ) if momentum_10 is not None else None
+            signed_momentum_30 = (
+                momentum_30 if side == "Up" else -momentum_30
+            ) if momentum_30 is not None else None
+            accel_ok = (
+                signed_momentum_10 is not None
+                and signed_momentum_30 is not None
+                and signed_momentum_10 >= EARLY_ACCEL_MIN_MOMENTUM_10S
+                and signed_momentum_30 >= EARLY_ACCEL_MIN_MOMENTUM_30S
+                and signed_momentum_10 >= (signed_momentum_30 / 3.0)
+            )
+            still_early = EARLY_ACCEL_MIN_DIFF <= abs_diff <= EARLY_ACCEL_MAX_DIFF
+            tradable = CROWD_MIN <= side_price <= min(EARLY_ACCEL_MAX_PRICE, SHADOW_MAX_FOLLOW_PRICE)
+            if accel_ok and still_early and tradable:
+                record(EARLY_ACCEL_SHADOW_STRATEGY, side)
+
         if early_lo <= seconds_remaining <= early_hi and abs(diff) >= 8.0:
             side = "Up" if diff > 0 else "Down"
             side_price = _side_price(market, side)
