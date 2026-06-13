@@ -85,6 +85,10 @@ MIN_SHADOW_VOLUME    = 500.0   # USDC — minimum volume for strategy research s
 SHADOW_MAX_FOLLOW_PRICE = 0.67
 LOCAL_PREVCLOSE_SHADOW_STRATEGY = "btc5-local-prevclose-shadow"
 RTDS_PREVCLOSE_SHADOW_STRATEGY = "btc5-rtds-prevclose-shadow"
+RTDS_TAKER_SHADOW_STRATEGY = "btc5-rtds-taker-shadow"
+RTDS_TAKER_MIN_DIFF = float(os.getenv("RTDS_TAKER_MIN_DIFF", "25"))
+RTDS_TAKER_MAX_ASK = float(os.getenv("RTDS_TAKER_MAX_ASK", "0.65"))
+RTDS_TAKER_BOOK_MAX_AGE_SEC = float(os.getenv("RTDS_TAKER_BOOK_MAX_AGE_SEC", "5"))
 RTDS_LIVE_FALLBACK_SOURCE = "rtds-live-fallback"
 RTDS_LIVE_FALLBACK_ENABLED = os.getenv("RTDS_LIVE_FALLBACK_ENABLED", "true").lower() == "true"
 MAKER_SHADOW_LOCAL_REFERENCE_ENABLED = os.getenv(
@@ -2347,6 +2351,12 @@ class PaperBot:
             seconds_remaining=seconds_remaining,
             hour_et=hour_et,
         )
+        await self._record_rtds_taker_shadow(
+            market=market,
+            end_ts=end_ts,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+        )
 
         reference_price = self._market_start_prices.get(slug)
         if reference_price is None:
@@ -2675,6 +2685,84 @@ class PaperBot:
             seconds_remaining=seconds_remaining,
             hour_et=hour_et,
             strategy=RTDS_PREVCLOSE_SHADOW_STRATEGY,
+            preserve_reference=True,
+            force_min_stake=True,
+        )
+
+    async def _record_rtds_taker_shadow(
+        self,
+        market: dict,
+        end_ts: float,
+        seconds_remaining: float,
+        hour_et: int,
+    ) -> None:
+        """Shadow-test RTDS continuation using executable CLOB best-ask entry."""
+        slug = market.get("slug", "")
+        if not slug.startswith("btc-updown-5m-"):
+            return
+        if self._research_shadow_exists(slug, RTDS_TAKER_SHADOW_STRATEGY):
+            return
+
+        official_reference = _extract_official_price_to_beat(market)
+        prev_final_reference, _prev_final_source = self._previous_final_reference(market)
+        if official_reference is not None or prev_final_reference is not None:
+            return
+
+        if not (ENTRY_WINDOW_LO <= seconds_remaining <= EARLY_LIVE_WINDOW_HI):
+            return
+
+        reference_price, reference_source = self._rtds_previous_close_reference(market)
+        if reference_price is None:
+            return
+
+        live_price, live_source = await self._get_signal_price()
+        if live_price is None:
+            return
+
+        diff = live_price - reference_price
+        if abs(diff) < RTDS_TAKER_MIN_DIFF:
+            return
+
+        side = "Up" if diff > 0 else "Down"
+        price_10s_ago = self._get_price_n_seconds_ago(10)
+        if price_10s_ago is None:
+            return
+        momentum_10 = live_price - price_10s_ago
+        if side == "Up" and momentum_10 < 0:
+            return
+        if side == "Down" and momentum_10 > 0:
+            return
+
+        try:
+            from .live_clob import token_for_side
+            token_id = token_for_side(market, side)
+        except Exception:
+            return
+
+        self._clob_book_feed.subscribe(token_id)
+        top = self._clob_book_feed.top(token_id, max_age_sec=RTDS_TAKER_BOOK_MAX_AGE_SEC)
+        if top is None or top.ask_price is None:
+            return
+        ask_price = float(top.ask_price)
+        if not (CROWD_MIN <= ask_price <= RTDS_TAKER_MAX_ASK):
+            return
+
+        print(
+            f"[bot] RTDS-TAKER SHADOW: {side} on {slug} "
+            f"ask={ask_price:.3f} diff=${diff:+.2f} 10s=${momentum_10:+.2f} "
+            f"ref=${reference_price:,.2f} ({reference_source}) live={live_source}",
+            flush=True,
+        )
+        self._record_shadow_entry(
+            slug=slug,
+            side=side,
+            entry_price=ask_price,
+            end_ts=end_ts,
+            price_to_beat=reference_price,
+            diff_at_entry=diff,
+            seconds_remaining=seconds_remaining,
+            hour_et=hour_et,
+            strategy=RTDS_TAKER_SHADOW_STRATEGY,
             preserve_reference=True,
             force_min_stake=True,
         )
